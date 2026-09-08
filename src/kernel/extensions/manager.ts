@@ -10,7 +10,8 @@
  *   services⊆provides / mount 白名单）→ 原子提交：事件订阅、hook 处理器、cron 任务、
  *   路由表条目、extensions 表 enabled=1；任一步失败逆序回滚已提交部分（无半活）；
  *   提交后同步服务目录（onServicesChanged）、UI 贡献（onUiChanged → UiRegistry）与
- *   AuthProvider（onAuthProvider）；
+ *   AuthProvider（onAuthProvider）；第三方扩展（isTrustedExtDir false 的目录）首次
+ *   enable 需人工授信（confirmTrust=true → 持久化 trusted_at/trusted_by，此后免确认）。
  * - 停用（disable）：逆序摘除（路由→cron→hook→事件）→ host.unload → enabled=0；幂等；
  * - 自愈（handleWorkerExit）：指数退避重启 worker（restartBackoffMs，默认
  *   [500,1000,2000,4000,8000]）→ 按拓扑重启用原 enabled 扩展 → onWorkerRestart 回调；
@@ -126,6 +127,13 @@ export interface ExtensionManagerDeps {
   hooks: HooksLike;
   /** builtin mount 受信校验（可选；SEC-3 fail-closed：未注入时 builtin/mount 声明一律拒绝） */
   authMounts?: { validateMount?(manifest: ExtensionManifest, dir: string): boolean };
+  /**
+   * 受信第一方扩展目录裁决（可选；生产由 Kernel 接线：dir 位于 repoRoot/extensions 之下）。
+   * 第三方扩展信任闸的输入：返回 false 的目录下的扩展首次 enable 必须人工授信
+   * （confirmTrust=true → 激活并持久化 trusted_at）；未注入时信任闸关闭（视为受信，
+   * 单测 stub 场景向后兼容）。
+   */
+  isTrustedExtDir?: (dir: string) => boolean;
   /** 发现目录（如 [<dataDir>/extensions, <repo>/extensions]） */
   extensionsDirs: string[];
   /** 路由表原子变更回调（路由模块据此重挂） */
@@ -200,6 +208,8 @@ interface RowSnapshot {
   builtin: boolean;
   mount: string | null;
   lastError: string | null;
+  /** 人工授信时间（UTC epoch ms；null = 未授信） */
+  trustedAt: number | null;
 }
 
 /** extensions 表行（DB 读取形状） */
@@ -210,6 +220,7 @@ interface ExtRow {
   builtin: number;
   mount: string | null;
   last_error: string | null;
+  trusted_at: number | null;
 }
 
 /** last_error 摘要规整：HARNESS-xxxx 前缀 + 根因消息 + 截断（面向开发者可定位） */
@@ -351,6 +362,7 @@ export class ExtensionManager {
       'builtin',
       'mount',
       'last_error',
+      'trusted_at',
     );
     for (const row of rows) {
       if (!this.#rowCache.has(row.id)) {
@@ -360,6 +372,7 @@ export class ExtensionManager {
           builtin: Number(row.builtin) === 1,
           mount: row.mount ?? null,
           lastError: row.last_error ?? null,
+          trustedAt: row.trusted_at ?? null,
         });
       }
     }
@@ -453,8 +466,12 @@ export class ExtensionManager {
    * 激活扩展（load → 校验 → 权限复核 → 原子提交）。已激活时幂等 no-op。
    * 熔断态下的人工 enable 是唯一的自动恢复出口：清除熔断与崩溃窗口，并起新 worker
    * （崩溃后的旧 worker 已死，不重启则激活必然超时）。
+   *
+   * 第三方信任闸：目录不受信（isTrustedExtDir false）且未曾授信（trusted_at 为空）时，
+   * 必须显式传入 input.confirmTrust=true 才能激活——首次授信会持久化 trusted_at/trusted_by，
+   * 后续 enable/reload（含内核重启）不再要求确认；受信第一方目录恒免确认。
    */
-  async enable(id: string): Promise<void> {
+  async enable(id: string, input?: { confirmTrust?: boolean }): Promise<void> {
     if (this.#crashLoopTripped) {
       this.#crashLoopTripped = false;
       this.#crashWindow = [];
@@ -474,7 +491,7 @@ export class ExtensionManager {
       this.#spawnBridge();
       this.deps.logger.info({ extId: id }, 'extension manager: bridge unavailable, worker respawned before enable');
     }
-    return this.#withLock(id, () => this.#enableLocked(id));
+    return this.#withLock(id, () => this.#enableLocked(id, input));
   }
 
   /** 停用扩展（逆序摘除 → host.unload → enabled=0）。未激活时幂等 no-op。 */
@@ -622,7 +639,7 @@ export class ExtensionManager {
   // ------------------------------------------------------------------ 激活编排（内部）
 
   /** enable 的锁内实现；错误分阶段保留各自错误码，统一记录 last_error 并强制 enabled=0 */
-  async #enableLocked(id: string): Promise<void> {
+  async #enableLocked(id: string, input?: { confirmTrust?: boolean }): Promise<void> {
     const found = this.#discovered.get(id);
     if (found === undefined) {
       // REL-7：未发现扩展给出可操作指引（运行中新增目录可 rescan 免重启发现）
@@ -642,6 +659,29 @@ export class ExtensionManager {
       throw err('KERNEL_NOT_READY', { detail: { id, cause: 'extension worker is not running' } });
     }
     if (this.#active.has(id)) return; // 幂等
+
+    // 第三方信任闸（产品层人工授信）：目录不受信且 extensions 表行 trusted_at 为空时，
+    // 首次 enable 拒绝激活并返回 EXT_TRUST_REQUIRED（detail 携带声明权限与确认指引）；
+    // confirmTrust=true 视为人工授信——先落库 trusted_at/trusted_by 再继续激活（授信是
+    // 用户对来源的确认，激活后续失败不回滚授信）。已授信扩展后续 enable/reload 不再询问；
+    // 受信第一方目录恒免确认。isTrustedExtDir 未注入时信任闸关闭（视为受信）。
+    if (this.deps.isTrustedExtDir?.(dir) === false) {
+      const trustedAt = this.#rowCache.get(id)?.trustedAt ?? (await this.#getRow(id))?.trustedAt ?? null;
+      if (trustedAt === null) {
+        if (input?.confirmTrust === true) {
+          await this.#updateRow(id, { trustedAt: Date.now(), trustedBy: 'admin' });
+          this.deps.logger.info({ extId: id }, 'extension trust confirmed by admin (trusted_at persisted)');
+        } else {
+          return await this.#failStage(id, manifest, err('EXT_TRUST_REQUIRED', {
+            detail: {
+              id,
+              permissions: [...manifest.permissions],
+              confirmHint: `POST /api/v1/extensions/${id}/enable {"confirmTrust":true}`,
+            },
+          }));
+        }
+      }
+    }
 
     // SEC-3：builtin/mount 声明是随镜像交付的第一方扩展的特权——激活路径统一过受信闸。
     // validateMount 未注入（deps.authMounts 缺失）时一律拒绝（fail-closed），
@@ -1136,6 +1176,7 @@ export class ExtensionManager {
       builtin: Number(row.builtin) === 1,
       mount: row.mount ?? null,
       lastError: row.last_error ?? null,
+      trustedAt: row.trusted_at ?? null,
     };
   }
 
@@ -1164,6 +1205,7 @@ export class ExtensionManager {
       builtin: manifest.builtin,
       mount: manifest.mount ?? null,
       lastError: patch.lastError,
+      trustedAt: null,
     });
   }
 
@@ -1176,6 +1218,8 @@ export class ExtensionManager {
       mount?: string | null;
       enabled?: boolean;
       lastError?: string | null;
+      trustedAt?: number | null;
+      trustedBy?: string | null;
     },
   ): Promise<void> {
     const set: Record<string, unknown> = { updated_at: Date.now() };
@@ -1184,6 +1228,8 @@ export class ExtensionManager {
     if (patch.mount !== undefined) set['mount'] = patch.mount;
     if (patch.enabled !== undefined) set['enabled'] = patch.enabled ? 1 : 0;
     if (patch.lastError !== undefined) set['last_error'] = patch.lastError;
+    if (patch.trustedAt !== undefined) set['trusted_at'] = patch.trustedAt;
+    if (patch.trustedBy !== undefined) set['trusted_by'] = patch.trustedBy;
     await this.deps.db('extensions').where({ id }).update(set);
     const cached = this.#rowCache.get(id);
     if (cached !== undefined) {
@@ -1193,6 +1239,7 @@ export class ExtensionManager {
         builtin: patch.builtin ?? cached.builtin,
         mount: patch.mount !== undefined ? patch.mount : cached.mount,
         lastError: patch.lastError !== undefined ? patch.lastError : cached.lastError,
+        trustedAt: patch.trustedAt !== undefined ? patch.trustedAt : cached.trustedAt,
       });
     }
   }

@@ -38,6 +38,7 @@ import { Migrator } from './storage/migrator.js';
 import { KERNEL_MIGRATIONS } from './storage/kernel-migrations.js';
 import { SettingsService } from './storage/settings.js';
 import { SecretsService } from './storage/secrets.js';
+import { loadOrCreateSecretKey } from './storage/secretkey.js';
 import { createBackup } from './storage/backup.js';
 import { Counters } from './system/info.js';
 import { registerSystemRoutes } from '../api/system.js';
@@ -407,7 +408,8 @@ export class Kernel {
       }
       this.container.instance(CONTAINER_KEYS.db, db);
       this.container.instance(CONTAINER_KEYS.settings, new SettingsService(db));
-      this.container.instance(CONTAINER_KEYS.secrets, new SecretsService(db));
+      const secretKey = await loadOrCreateSecretKey(this.config);
+      this.container.instance(CONTAINER_KEYS.secrets, new SecretsService(db, secretKey));
       const counters = new Counters();
       this.container.instance(CONTAINER_KEYS.counters, counters);
 
@@ -618,6 +620,9 @@ export class Kernel {
         authMounts: {
           validateMount: (_manifest, dir) => isTrustedExtensionDir(dir),
         },
+        // 第三方信任闸：同款目录裁决——repoRoot/extensions 之下的第一方扩展免人工授信，
+        // 其余目录（dataDir/extensions 等）首次 enable 须经 confirmTrust 授信
+        isTrustedExtDir: (dir) => isTrustedExtensionDir(dir),
         // UI 贡献生命周期同步：enable 提交合并片段进 UiRegistry（GET /api/v1/ui 数据源）/
         // disable·崩溃整扩展摘除（remove 对未登记 extId 幂等）
         onUiChanged: (extId, ui) => {

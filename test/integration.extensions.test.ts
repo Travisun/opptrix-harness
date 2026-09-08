@@ -218,10 +218,21 @@ describe('扩展子系统总装配 E2E', () => {
   // -------------------------------------------------------------------------
 
   it(`脚手架扩展 ${TMP_EXT_ID}：enable → /ext/<id>/hello 200 → reload 后仍 200`, async () => {
+    // [ext-trust 工作包最小修复] dataDir/extensions 是第三方目录：首次 enable 被信任闸
+    // 拒绝（403 HARNESS-3012），确认信任后带 confirmTrust 重试才激活
+    const firstEnable = await app.inject({
+      method: 'POST',
+      url: `/api/v1/extensions/${TMP_EXT_ID}/enable`,
+      headers: auth,
+    });
+    expect(firstEnable.statusCode).toBe(403);
+    expect(firstEnable.json()).toMatchObject({ code: 'HARNESS-3012' });
+    expect(firstEnable.json().detail).toMatchObject({ id: TMP_EXT_ID, permissions: expect.anything() });
     const on = await app.inject({
       method: 'POST',
       url: `/api/v1/extensions/${TMP_EXT_ID}/enable`,
       headers: auth,
+      payload: { confirmTrust: true },
     });
     expect(on.statusCode).toBe(200);
 

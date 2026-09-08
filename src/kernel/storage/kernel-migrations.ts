@@ -291,6 +291,23 @@ const m014Deliveries: Migration = {
   },
 };
 
+/** 015 — extensions 信任确认列：第三方扩展首次 enable 需人工授信（产品层信任闸的持久化）。 */
+const m015ExtensionsTrust: Migration = {
+  name: '015_extensions_trust',
+  up: async (knex: Knex): Promise<void> => {
+    await knex.schema.alterTable('extensions', (t) => {
+      t.integer('trusted_at'); // UTC epoch ms；空 = 未曾人工授信
+      t.text('trusted_by'); // 授信主体（当前固定 'admin'）
+    });
+  },
+  down: async (knex: Knex): Promise<void> => {
+    await knex.schema.alterTable('extensions', (t) => {
+      t.dropColumn('trusted_at');
+      t.dropColumn('trusted_by');
+    });
+  },
+};
+
 /** 内核全部迁移（按版本号升序执行；回滚时逆序）。 */
 export const KERNEL_MIGRATIONS: Migration[] = [
   m001Settings,
@@ -307,4 +324,5 @@ export const KERNEL_MIGRATIONS: Migration[] = [
   m012Files,
   m013Tasks,
   m014Deliveries,
+  m015ExtensionsTrust,
 ];

@@ -6,6 +6,9 @@
  */
 import type { Readable } from 'node:stream';
 
+/** 工作区容器网络模式：bridge=默认网桥（可出网）；none=无网络（容器内无任何网络接口路由） */
+export type SandboxNetworkMode = 'bridge' | 'none';
+
 /** 工作区登记记录：一个容器 + 一个持久化家目录 */
 export interface WorkspaceInfo {
   /** 工作区 id（缺省 uuid）；同时是 `<dataDir>/sandbox/` 下的家目录名，故形态受限 */
@@ -14,6 +17,12 @@ export interface WorkspaceInfo {
   containerId: string | null;
   /** 容器镜像 */
   image: string;
+  /**
+   * 容器网络模式（创建时指定，缺省 'bridge'）：与 manifest 的 net:out* 权限联动——
+   * 未申请出网的扩展工作区以 'none' 创建（容器内无法触达任何网络）。
+   * 重启恢复的记录以 'bridge' 占位（网络模式无法从家目录还原，重建由 create 承接）。
+   */
+  networkMode: SandboxNetworkMode;
   /**
    * 生命周期状态：
    * - creating：createWorkspace 过程中的瞬时态（成功即 running，失败落 error）

@@ -9,7 +9,9 @@
  *   恢复为 stopped 记录（containerId=null；旧容器不追溯，重建由用户 create 新工作区承接，
  *   对恢复记录 exec 报 SANDBOX_ERROR 提示重建）；
  * - createWorkspace：家目录 mkdir → createContainer（非 root 用户 1000:1000、家目录 bind、
- *   内存/CPU/PID 上限、CapDrop ALL、no-new-privileges 等加固，NetworkMode 默认 bridge；
+ *   内存/CPU/PID 上限、CapDrop ALL、no-new-privileges 等加固，NetworkMode 由入参
+ *   networkMode 指定（'bridge' | 'none'，缺省 'bridge' 保持现状；net:out 权限联动由
+ *   调用方推导传入）并记录进 WorkspaceInfo；
  *   ReadonlyRootfs=false：家目录经 bind 持久化，容器系统层可写但随容器重建丢失——v1 取舍）
  *   → start → 登记 running；
  * - exec：container.exec → hijack 单流（docker 多路复用帧协议）→ parseDockerStream 解帧
@@ -33,6 +35,7 @@ import type {
   DockerCreateContainerOptions,
   DockerExecInspect,
   SandboxExecResult,
+  SandboxNetworkMode,
   WorkspaceInfo,
 } from './types.js';
 
@@ -153,6 +156,12 @@ export interface SandboxCreateWorkspaceInput {
   id?: string;
   /** 镜像；缺省 config.sandboxImage */
   image?: string;
+  /**
+   * 容器网络模式：'bridge'（缺省，默认网桥可出网）| 'none'（无网络）。
+   * 调用方（扩展网关）按 manifest 的 net:out* 权限推导传入；isolated 一次性执行
+   * 不受此参数影响，恒为 'none'。
+   */
+  networkMode?: SandboxNetworkMode;
 }
 
 /** exec 入参（第二参 cmd 之外的可选项） */
@@ -273,6 +282,13 @@ export class SandboxManager {
     if (this.#workspaces.has(id)) {
       throw err('SANDBOX_ERROR', { message: `workspace "${id}" already exists`, detail: { id } });
     }
+    if (input.networkMode !== undefined && input.networkMode !== 'bridge' && input.networkMode !== 'none') {
+      // 运行时校验兜底（类型面之外的调用方）：非法值绝不透传给 Docker
+      throw err('BAD_REQUEST', {
+        message: `networkMode must be "bridge" or "none" (got ${JSON.stringify(input.networkMode)})`,
+        detail: { networkMode: input.networkMode },
+      });
+    }
     if (this.#workspaces.size >= this.#maxWorkspaces) {
       throw err('SANDBOX_ERROR', {
         message: `workspace limit reached (${this.#maxWorkspaces}) — remove an existing workspace first`,
@@ -280,9 +296,19 @@ export class SandboxManager {
       });
     }
     const image = input.image ?? this.#deps.config.sandboxImage;
+    const networkMode: SandboxNetworkMode = input.networkMode ?? 'bridge';
     const homeDir = join(this.#deps.config.dataDir, 'sandbox', id);
     const now = Date.now();
-    const ws: WorkspaceInfo = { id, containerId: null, image, status: 'creating', homeDir, createdAt: now, lastActiveAt: now };
+    const ws: WorkspaceInfo = {
+      id,
+      containerId: null,
+      image,
+      networkMode,
+      status: 'creating',
+      homeDir,
+      createdAt: now,
+      lastActiveAt: now,
+    };
     this.#workspaces.set(id, ws); // 先登记：并发同 id 创建在此被拦截；失败落 error 可 remove 清理
     try {
       mkdirSync(homeDir, { recursive: true });
@@ -291,7 +317,7 @@ export class SandboxManager {
           image,
           labels: { 'opptrix.workspace': id },
           binds: [`${homeDir}:${SANDBOX_WORKDIR}`],
-          networkMode: 'bridge',
+          networkMode,
         }),
       );
       await container.start();
@@ -581,11 +607,12 @@ export class SandboxManager {
       } catch {
         continue;
       }
-      // 镜像无法从目录还原，用当前配置镜像占位（重建由用户 create 承接，仅作列表展示）
+      // 镜像/网络模式无法从目录还原，用当前配置镜像与 'bridge' 占位（重建由用户 create 承接，仅作列表展示）
       this.#workspaces.set(name, {
         id: name,
         containerId: null,
         image: this.#deps.config.sandboxImage,
+        networkMode: 'bridge',
         status: 'stopped',
         homeDir,
         createdAt: mtimeMs,
@@ -599,7 +626,7 @@ export class SandboxManager {
     image: string;
     labels: Record<string, string>;
     binds: string[];
-    networkMode: string;
+    networkMode: SandboxNetworkMode;
     cmd?: string[];
   }): DockerCreateContainerOptions {
     return {

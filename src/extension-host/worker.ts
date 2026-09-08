@@ -2,10 +2,13 @@
  * worker — 扩展线程入口（由内核以 `new Worker('worker.ts', { execArgv: [] })` 加载）。
  *
  * 职责（全部 HOST_METHODS.* 的线程内实现）：
- * - host.load：createExtVm 装配 VM → 受限 require 执行 manifest.main → 取
- *   module.exports（或 .default）识别 defineExtension → 激活期调用 setup（限时 30s）
- *   → reply { ok: true, contributions: snapshot }；handler Maps 留在本线程内存供
- *   后续 dispatch。失败 → reply { ok: false, err } 并回收 VM 资源。
+ * - host.load：createExtVm 装配 VM → **执行 <extDir>/migrations/*.js 迁移（受限
+ *   require(main) 与 setup 之前；记账表 migrations_log 建在扩展自己的库，经 h.db
+ *   RPC 通路；任一 up 抛错 → 整体激活失败 HARNESS-4001）** → 受限 require 执行
+ *   manifest.main → 取 module.exports（或 .default）识别 defineExtension → 激活期
+ *   调用 setup（限时 30s）→ reply { ok: true, contributions: snapshot,
+ *   migrationsApplied }；handler Maps 留在本线程内存供后续 dispatch。
+ *   失败 → reply { ok: false, err } 并回收 VM 资源。
  * - host.route：找 handler（无 → SERVICE_UNAVAILABLE）→ handler(request) 带
  *   timeoutMs 超时（Promise 竞速；超时回 HARNESS-1002，VM 内继续跑但结果丢弃）→
  *   返回值归一化 { status, headers?, body } → reply。
@@ -19,6 +22,9 @@
  * 主线程导入时（parentPort 为 null，如单测）不挂任何监听器、无副作用。
  */
 import { randomUUID } from 'node:crypto';
+import { readdirSync } from 'node:fs';
+import type { Dirent } from 'node:fs';
+import * as path from 'node:path';
 import { parentPort } from 'node:worker_threads';
 
 import { err, HarnessError } from '../kernel/errors/index.js';
@@ -36,6 +42,7 @@ import {
 import type {
   AuthVerifyHandler,
   ContributionsCollector,
+  HarnessApi,
   RouteHandler,
   RouteRequest,
   TaskContext,
@@ -178,6 +185,185 @@ export function withTimeout<T>(
       },
     );
   });
+}
+
+// ---------------------------------------------------------------------------
+// 扩展迁移（<extDir>/migrations/*.js，host.load 内 setup 之前执行）
+// ---------------------------------------------------------------------------
+
+/** 扩展迁移目录名（相对扩展根目录） */
+export const MIGRATIONS_DIR = 'migrations';
+
+/** 单个迁移文件加载并归一后的形状（up 必填；down 为内核侧 uninstall rollback 预留，v1 不调用） */
+export interface LoadedMigration {
+  /** 文件名（如 "010_create.js"）：记账主键 migrations_log.name，即执行序的可见名 */
+  name: string;
+  /** 迁移体：接收 dbHelper（{ run/all/get }，VM realm 对象），通常 async 并逐条 await */
+  up: (db: unknown) => unknown;
+  /** 降级函数（预留语义）：v1 仅加载与形状校验，绝不调用 */
+  down: ((db: unknown) => unknown) | undefined;
+}
+
+/**
+ * 扫描 <extDir>/migrations/*.js：仅取目录下的普通 .js 文件（子目录与非 .js 一律忽略），
+ * 文件名字典序（Array.prototype.sort 的码元序）即执行序。
+ * 目录不存在 → 返回 []（降级：无迁移即跳过，applied = 0）；其他扫描失败 → DB_MIGRATION_FAILED。
+ */
+export function listMigrationFiles(extDir: string): string[] {
+  const dir = path.join(path.resolve(extDir), MIGRATIONS_DIR);
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException | null)?.code === 'ENOENT') return [];
+    throw err('DB_MIGRATION_FAILED', {
+      message: `cannot scan extension migrations directory "${dir}"`,
+      detail: { dir },
+    });
+  }
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.js'))
+    .map((entry) => entry.name)
+    .sort();
+}
+
+/** 行数组收窄（内核 db.all 应答；非数组/非对象行按空处理） */
+function asRowArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((row): row is Record<string, unknown> => row !== null && typeof row === 'object');
+}
+
+/**
+ * 加载迁移模块（与 main 共用同一受限 require 实例 → 同一 per-load 模块缓存与同一
+ * VM context），归一 module.exports / module.exports.default，并校验 up 为函数。
+ * 任何文件形状非法 → DB_MIGRATION_FAILED（fail-fast：执行任何 up 之前先全部加载）。
+ */
+export function loadMigrations(restrictedRequire: (spec: string) => unknown, files: string[]): LoadedMigration[] {
+  return files.map((name) => {
+    const mod = restrictedRequire(`./${MIGRATIONS_DIR}/${name}`) as
+      | { up?: unknown; down?: unknown; default?: unknown }
+      | null
+      | undefined;
+    const candidate = (mod?.default ?? mod ?? null) as { up?: unknown; down?: unknown } | null;
+    if (candidate === null || typeof candidate.up !== 'function') {
+      throw err('DB_MIGRATION_FAILED', {
+        message:
+          `migration "${name}" must export module.exports = { up(db), down?(db) } ` +
+          '(or via module.exports.default); "up" must be a function',
+        detail: { file: `${MIGRATIONS_DIR}/${name}` },
+      });
+    }
+    return {
+      name,
+      up: candidate.up as (db: unknown) => unknown,
+      down: typeof candidate.down === 'function' ? (candidate.down as (db: unknown) => unknown) : undefined,
+    };
+  });
+}
+
+/** runExtensionMigrations 的依赖集合 */
+export interface MigrationRunnerDeps {
+  extId: string;
+  extDir: string;
+  /** 受限 require（与 main 同一实例：迁移模块进同一 per-load 缓存与 VM context） */
+  restrictedRequire: (spec: string) => unknown;
+  /** realm 桥（SEC-1：递给 up(db) 的 dbHelper 必须建成 VM realm 对象） */
+  bridge: RealmBridge;
+  /**
+   * 扩展 db 门面（harness.db）：记账与迁移语句都经它走内核 db.run/all/get RPC——
+   * 本地单语句预检 + 内核侧 forbidDangerousSql 双保险已内置。
+   */
+  db: HarnessApi['db'];
+}
+
+/**
+ * 执行扩展迁移（正式迁移机制 v1，host.load 内嵌步骤，先于受限 require(main) 与 setup）。
+ *
+ * 流程：
+ * 1. 扫描 <extDir>/migrations/*.js（文件名序即执行序；目录缺失 → 降级返回 0）；
+ * 2. 全部加载并校验形状（同受限 require）；
+ * 3. 幂等创建记账表 `migrations_log(name TEXT PRIMARY KEY, batch INTEGER, applied_at
+ *    INTEGER)`（建在扩展自己的库，经 h.db.run）；
+ * 4. 跳过已记账文件，逐个执行 pending 的 up(dbHelper)，成功即记账
+ *    （batch = max(batch)+1，同一次 load 的全部迁移共享同一批次）。
+ *
+ * 失败语义（v1 如实约定）：**没有事务包裹**——SQLite 语句经 db.run 逐条执行，失败的
+ * 迁移内已执行语句不会回滚，该迁移也不记账；任何迁移抛错/超时（每迁移限时同 setup，
+ * 30s）→ 整体以 HARNESS-4001 DB_MIGRATION_FAILED 失败 → host.load 回执 err、扩展不
+ * 激活、setup 不执行。修复文件后重新 load 即从失败点续跑（已记账的自动跳过）。
+ *
+ * @returns 本次实际执行并记账的迁移数量（供 load 回执 migrationsApplied 与日志）
+ */
+export async function runExtensionMigrations(deps: MigrationRunnerDeps): Promise<number> {
+  const files = listMigrationFiles(deps.extDir);
+  if (files.length === 0) return 0;
+  const migrations = loadMigrations(deps.restrictedRequire, files);
+
+  // 记账：建表/查询/插入全部经 h.db（本地单语句预检 + 内核 forbidDangerousSql 双保险）；
+  // 记账层的 RPC 失败与 up 失败同语义——整体 HARNESS-4001 中止激活
+  const ledger = async (sql: string, params?: unknown[]): Promise<unknown> => {
+    try {
+      return await deps.db.run(sql, params);
+    } catch (cause) {
+      throw err('DB_MIGRATION_FAILED', {
+        message: `migration ledger access failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        detail: { extId: deps.extId, sql },
+      });
+    }
+  };
+
+  try {
+    // 记账表：建在扩展自己的库（IF NOT EXISTS 幂等）
+    await ledger('CREATE TABLE IF NOT EXISTS migrations_log (name TEXT PRIMARY KEY, batch INTEGER NOT NULL, applied_at INTEGER NOT NULL)');
+    const appliedNames = new Set(asRowArray(await deps.db.all('SELECT name FROM migrations_log')).map((row) => String(row['name'])));
+    const pending = migrations.filter((migration) => !appliedNames.has(migration.name));
+    if (pending.length === 0) return 0;
+
+    const maxRow = (await deps.db.get('SELECT MAX(batch) AS max_batch FROM migrations_log')) as
+      | { max_batch?: unknown }
+      | null
+      | undefined;
+    const batch = typeof maxRow?.['max_batch'] === 'number' ? maxRow['max_batch'] + 1 : 1;
+
+    // SEC-1：递给 up(db) 的 dbHelper 建成 VM realm 冻结对象（run/all/get 是 VM realm
+    // async 函数）——迁移代码无法借 dbHelper 触达宿主 Function 构造器
+    const dbHelper = deps.bridge.makeVmObject({
+      run: deps.bridge.toVmAsyncFn((...args: unknown[]) => deps.db.run(String(args[0]), args[1] as unknown[] | undefined)),
+      all: deps.bridge.toVmAsyncFn((...args: unknown[]) => deps.db.all(String(args[0]), args[1] as unknown[] | undefined)),
+      get: deps.bridge.toVmAsyncFn((...args: unknown[]) => deps.db.get(String(args[0]), args[1] as unknown[] | undefined)),
+    });
+
+    let appliedCount = 0;
+    for (const migration of pending) {
+      try {
+        await withTimeout(
+          Promise.resolve().then(() => migration.up(dbHelper)),
+          SETUP_TIMEOUT_MS,
+          `migration "${migration.name}" of extension "${deps.extId}"`,
+          'DB_MIGRATION_FAILED',
+        );
+        await ledger('INSERT INTO migrations_log (name, batch, applied_at) VALUES (?, ?, ?)', [
+          migration.name,
+          batch,
+          Date.now(),
+        ]);
+      } catch (cause) {
+        const reason = HarnessError.wrap(cause, 'DB_MIGRATION_FAILED');
+        throw err('DB_MIGRATION_FAILED', {
+          message:
+            `migration "${migration.name}" failed: ${reason.message}. Activation aborted; ` +
+            'v1 semantics: statements already executed inside the failed migration are NOT rolled back ' +
+            'and the migration is not recorded — fix the file and reload to retry.',
+          detail: { extId: deps.extId, file: `${MIGRATIONS_DIR}/${migration.name}`, batch },
+        });
+      }
+      appliedCount += 1;
+    }
+    return appliedCount;
+  } catch (cause) {
+    if (cause instanceof HarnessError && cause.code === err('DB_MIGRATION_FAILED').code) throw cause;
+    throw HarnessError.wrap(cause, 'DB_MIGRATION_FAILED');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +577,11 @@ function installDefineExtensionGlobal(bridge: RealmBridge, slot: DefineSlot): vo
   });
 }
 
-/** host.load：装配 VM → 受限 require main → 识别 defineExtension → 激活（setup 限时 30s） */
+/**
+ * host.load：装配 VM → 执行 <extDir>/migrations/*.js 迁移（受限 require(main) 与
+ * setup 之前；失败即整体激活失败 HARNESS-4001）→ 受限 require main → 识别
+ * defineExtension → 激活（setup 限时 30s）→ reply { ok, contributions, migrationsApplied }
+ */
 async function handleLoadExt(env: RpcEnvelope, reply: (payload: unknown) => void, fail: (e: unknown) => void): Promise<void> {
   const payload = (env.payload ?? {}) as {
     extId?: unknown;
@@ -429,14 +619,28 @@ async function handleLoadExt(env: RpcEnvelope, reply: (payload: unknown) => void
   const timers = createTimerRegistry();
   const kernelCall = makeKernelCall(extId);
   const collector = createContributionsCollector();
+  const extLogger = makeLogger(extId);
   let vmInstance: ExtVm | null = null;
   const recorded: DefineSlot = { def: undefined };
   try {
-    vmInstance = createExtVm({ extId, logger: makeLogger(extId), kernelCall, timers });
+    vmInstance = createExtVm({ extId, logger: extLogger, kernelCall, timers });
     const bridge = vmInstance.bridge;
     installDefineExtensionGlobal(bridge, recorded);
     const ext: LoadedExtension = { extId, phase, vm: vmInstance, bridge, timers, collector, kernelCall };
     const require = createRestrictedRequire({ extDir, context: vmInstance.context, bridge });
+
+    // h 门面（提前装配）：迁移记账/执行与 setup 共用同一 db 通路（h.db：本地单语句
+    // 预检 + 内核 forbidDangerousSql 双保险）；boot 缺省空冻结对象，rootToken 仅
+    // builtin auth 注入（见上方注入闸）
+    const boot: { rootToken?: string } = rootToken === undefined ? {} : { rootToken };
+    const harness = createHarnessApi({ extId, kernelCall, contributions: collector, timers, activationPhase: () => phase.active, boot });
+
+    // 正式迁移机制：先于受限 require(main) 与 setup 执行；任一迁移失败 → 整体激活失败
+    // （HARNESS-4001），main 不加载、setup 不执行、注册表不入册（走下方统一 catch 回收）
+    const migrationsApplied = await runExtensionMigrations({ extId, extDir, restrictedRequire: require, bridge, db: harness.db });
+    if (migrationsApplied > 0) {
+      extLogger.info({ extId, applied: migrationsApplied }, `applied ${migrationsApplied} extension migration(s) for "${extId}"`);
+    }
 
     // main 归一化为相对形式（manifest.main 常写作 "main.js"）
     const mainSpec = main.startsWith('./') || main.startsWith('../') ? main : `./${main}`;
@@ -458,9 +662,6 @@ async function handleLoadExt(env: RpcEnvelope, reply: (payload: unknown) => void
       });
     }
 
-    // h.boot：缺省空冻结对象；rootToken 仅 builtin auth 注入（见上方注入闸）
-    const boot: { rootToken?: string } = rootToken === undefined ? {} : { rootToken };
-    const harness = createHarnessApi({ extId, kernelCall, contributions: collector, timers, activationPhase: () => phase.active, boot });
     // SEC-1：setup 收到的 h 门面是 VM realm 对象树（exposeHarnessApiInVm），
     // 宿主侧实现留在闭包内——`h.constructor.constructor` 链根除
     const harnessVm = exposeHarnessApiInVm(harness, bridge);
@@ -475,7 +676,7 @@ async function handleLoadExt(env: RpcEnvelope, reply: (payload: unknown) => void
       phase.active = false;
     }
     loaded.set(extId, ext);
-    reply({ ok: true, contributions: collector.snapshot() });
+    reply({ ok: true, contributions: collector.snapshot(), migrationsApplied });
   } catch (e) {
     // 激活失败：回收 VM 定时器，注册表不入册（handlers 随局部变量不可达）
     vmInstance?.cleanup();

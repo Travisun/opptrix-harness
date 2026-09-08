@@ -787,7 +787,12 @@ export function createKernelHandlers(deps: {
       // 之后的 exec 复用同一工作区（家目录随 <dataDir>/sandbox/ 持久化，重启按目录恢复）。
       const workspaceId = `ext-${extId}`;
       if (manager.get(workspaceId) === null) {
-        await manager.createWorkspace({ id: workspaceId });
+        // 网络与权限联动：声明 net:out* → bridge（可出网）；未声明 → none（无网容器）
+        const permissions = extManager().getManifest(extId)?.permissions ?? [];
+        const networkMode = permissions.some((x) => x === 'net:out' || x.startsWith('net:out:'))
+          ? ('bridge' as const)
+          : ('none' as const);
+        await manager.createWorkspace({ id: workspaceId, networkMode });
       }
       return await manager.exec(workspaceId, parsed.data.cmd, {
         ...(parsed.data.timeoutMs !== undefined ? { timeoutMs: parsed.data.timeoutMs } : {}),

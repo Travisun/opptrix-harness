@@ -13,17 +13,20 @@
  * - h.boot.rootToken            内核 load payload 携带的 root 令牌（仅 builtin auth 可见）
  * - h.auth.hashPassword(pw)     内核 scrypt 哈希（kernelCall auth.hashPassword）
  * - h.auth.verifyPassword(pw,h) 内核 scrypt 校验（kernelCall auth.verifyPassword）
+ * - h.auth.hashToken(v)         内核 SHA-256 摘要（kernelCall auth.hashToken，返回 {hash} 64 位 hex）
  * - h.authProvider(fn)          注册 AuthProvider（需 manifest 权限 'auth:provider'）
  *
- * v1 简化（T1 加固项，见 README）：session/api-key 令牌明文存于本扩展独立 SQLite 的
- * token_hash 列（沙箱无摘要原语可用；库文件 0600 由部署保证）。
+ * 令牌脱敏存储（T1 已交付，见 README）：sessions/api_keys 的 token_hash 列存
+ * **令牌的 SHA-256 hex**（生成/校验时经 h.auth.hashToken 现算，明文令牌不落库、
+ * 仅在签发/登录响应中出现一次）。升级兼容：setup 检测到旧版明文残留行（非 64 位
+ * hex）直接清除——旧令牌一次性失效，需重新登录/重签 API Key（README「升级影响」）。
  */
 
 /**
  * @typedef {Object} HarnessApiLike
  * auth 扩展实际使用的 HarnessApi 子集（完整契约见仓库 types/harness.d.ts 与 README）。
  * @property {{ rootToken?: string }} [boot] 内核注入的引导态（rootToken 仅 builtin auth 可见）
- * @property {{ hashPassword(pw: string): Promise<string>, verifyPassword(pw: string, hash: string): Promise<boolean> }} auth 内核密码原语
+ * @property {{ hashPassword(pw: string): Promise<string>, verifyPassword(pw: string, hash: string): Promise<boolean>, hashToken(value: string): Promise<{ hash: string }> }} auth 内核密码/摘要原语
  * @property {(register: (input: { token?: string, headers?: Record<string, unknown> }) => Promise<null | { userId: string, role: string, scopes: string[] }>) => void} authProvider AuthProvider 注册（激活期一次）
  * @property {{ schema(statements: string[]): Promise<void>, get(sql: string, params?: unknown[]): Promise<unknown>, all(sql: string, params?: unknown[]): Promise<unknown>, run(sql: string, params?: unknown[]): Promise<{ changes: number }> }} db
  * @property {{ get(path: string): Promise<unknown> }} config 只读内核配置
@@ -179,57 +182,57 @@ function authScopesOf(text) {
  * 按令牌查身份。token 形如 'ses_<48hex>'（会话）或 'ak_<48hex>'（API Key），
  * 或恰好等于 rootToken（root 直连，同内核 authProxy 语义）。
  *
- * ⚠️ v1 限制：令牌明文比对/存取（沙箱无摘要原语），时序侧信道与静态泄露面见 README「T1 加固」。
+ * 令牌脱敏（T1 已交付）：ses/ak 令牌先经 h.auth.hashToken 现算 SHA-256 hex 再查
+ * token_hash 列——库内无明文令牌，泄露面收敛到「哈希碰库」。root 令牌仅内存
+ * 明文比对（break-glass，从不落库）。
  *
  * @param {HarnessApiLike} h
  * @param {unknown} token
- * @returns {Promise<null | { userId: string, role: string, scopes: string[], username: string | null, tokenType: 'root' | 'session' | 'api-key', token: string }>}
+ * @returns {Promise<null | { userId: string, role: string, scopes: string[], username: string | null, tokenType: 'root' | 'session' | 'api-key', token: string, tokenHash: string }>}
  */
 async function authLookupToken(h, token) {
   if (typeof token !== 'string' || token === '') return null;
   var now = Date.now();
 
-  // root 令牌直连（break-glass；与内核 authProxy 的 root 身份语义一致）
+  // root 令牌直连（break-glass；与内核 authProxy 的 root 身份语义一致；从不落库）
   if (AUTH_ROOT_TOKEN !== undefined && token === AUTH_ROOT_TOKEN) {
-    return { userId: 'root', role: 'root', scopes: ['*'], username: null, tokenType: 'root', token: token };
+    return { userId: 'root', role: 'root', scopes: ['*'], username: null, tokenType: 'root', token: token, tokenHash: '' };
   }
 
-  if (token.indexOf('ses_') === 0) {
-    var ses = await h.db.get(
-      'SELECT s.expires_at AS expires_at, s.user_id AS user_id, u.username AS username, u.role AS role' +
-        ' FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?',
-      [token],
-    );
-    if (!ses || typeof ses !== 'object') return null;
-    if (Number(/** @type {Record<string, unknown>} */ (ses)['expires_at']) <= now) return null;
+  if (token.indexOf('ses_') === 0 || token.indexOf('ak_') === 0) {
+    // 校验时同样先哈希再查表（与写入路径对称；token_hash 列从此名副其实）
+    var hashed = await h.auth.hashToken(token);
+    var tokenHash = String(hashed['hash']);
+    var kind = token.indexOf('ses_') === 0 ? 'session' : 'api-key';
+    var row =
+      kind === 'session'
+        ? await h.db.get(
+            'SELECT s.expires_at AS expires_at, s.user_id AS user_id, u.username AS username, u.role AS role' +
+              ' FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?',
+            [tokenHash],
+          )
+        : await h.db.get(
+            'SELECT k.expires_at AS expires_at, k.revoked AS revoked, k.scopes AS scopes,' +
+              ' k.user_id AS user_id, u.username AS username, u.role AS role' +
+              ' FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.token_hash = ?',
+            [tokenHash],
+          );
+    if (!row || typeof row !== 'object') return null;
+    if (kind === 'session') {
+      if (Number(/** @type {Record<string, unknown>} */ (row)['expires_at']) <= now) return null;
+    } else {
+      if (Number(/** @type {Record<string, unknown>} */ (row)['revoked']) === 1) return null;
+      var expiresAt = authNumOrNull(row, 'expires_at');
+      if (expiresAt !== null && expiresAt <= now) return null;
+    }
     return {
-      userId: authStr(ses, 'user_id'),
-      role: authStr(ses, 'role'),
-      scopes: ['*'],
-      username: authStr(ses, 'username') || null,
-      tokenType: 'session',
+      userId: authStr(row, 'user_id'),
+      role: authStr(row, 'role'),
+      scopes: kind === 'session' ? ['*'] : authScopesOf(/** @type {Record<string, unknown>} */ (row)['scopes']),
+      username: authStr(row, 'username') || null,
+      tokenType: /** @type {'session' | 'api-key'} */ (kind),
       token: token,
-    };
-  }
-
-  if (token.indexOf('ak_') === 0) {
-    var key = await h.db.get(
-      'SELECT k.expires_at AS expires_at, k.revoked AS revoked, k.scopes AS scopes,' +
-        ' k.user_id AS user_id, u.username AS username, u.role AS role' +
-        ' FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.token_hash = ?',
-      [token],
-    );
-    if (!key || typeof key !== 'object') return null;
-    if (Number(/** @type {Record<string, unknown>} */ (key)['revoked']) === 1) return null;
-    var expiresAt = authNumOrNull(key, 'expires_at');
-    if (expiresAt !== null && expiresAt <= now) return null;
-    return {
-      userId: authStr(key, 'user_id'),
-      role: authStr(key, 'role'),
-      scopes: authScopesOf(/** @type {Record<string, unknown>} */ (key)['scopes']),
-      username: authStr(key, 'username') || null,
-      tokenType: 'api-key',
-      token: token,
+      tokenHash: tokenHash,
     };
   }
 
@@ -238,12 +241,18 @@ async function authLookupToken(h, token) {
 
 /**
  * 会话门（logout / change-password / api-keys 管理：明确要求会话，API Key 与 root 令牌不算）。
- * @returns {Promise<null | { userId: string, role: string, username: string | null, sessionToken: string }>}
+ * @returns {Promise<null | { userId: string, role: string, username: string | null, sessionToken: string, sessionTokenHash: string }>}
  */
 async function authRequireSession(h, req) {
   var identity = await authLookupToken(h, authTokenOf(req));
   if (identity === null || identity.tokenType !== 'session') return null;
-  return { userId: identity.userId, role: identity.role, username: identity.username, sessionToken: identity.token };
+  return {
+    userId: identity.userId,
+    role: identity.role,
+    username: identity.username,
+    sessionToken: identity.token,
+    sessionTokenHash: identity.tokenHash,
+  };
 }
 
 /**
@@ -280,10 +289,12 @@ defineExtension(async (h, ctx) => {
   if (!h.db || typeof h.db.schema !== 'function' || typeof h.db.get !== 'function' || typeof h.db.run !== 'function') {
     throw new TypeError('auth extension: HarnessApi.db { schema, get, run } is required; kernel sandbox is too old');
   }
-  if (!h.auth || typeof h.auth.hashPassword !== 'function' || typeof h.auth.verifyPassword !== 'function') {
+  if (!h.auth || typeof h.auth.hashPassword !== 'function' || typeof h.auth.verifyPassword !== 'function' ||
+      typeof h.auth.hashToken !== 'function') {
     throw new TypeError(
-      'auth extension: HarnessApi.auth { hashPassword, verifyPassword } is required ' +
-        '(kernel topics auth.hashPassword / auth.verifyPassword); kernel is too old — upgrade the kernel',
+      'auth extension: HarnessApi.auth { hashPassword, verifyPassword, hashToken } is required ' +
+        '(kernel topics auth.hashPassword / auth.verifyPassword / auth.hashToken); ' +
+        'kernel is too old — upgrade the kernel',
     );
   }
   if (typeof h.authProvider !== 'function') {
@@ -319,6 +330,26 @@ defineExtension(async (h, ctx) => {
       'created_at INTEGER NOT NULL)',
     'CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)',
   ]);
+
+  // ---- 1.5 令牌哈希迁移（T1 升级兼容）：清除旧版明文令牌残留行 --------------
+  // 旧版本把明文令牌（'ses_<48hex>' / 'ak_<48hex>'，含 's'/'k'/'_' 等非 hex 字符）
+  // 存进 token_hash 列；本版起该列只存 SHA-256 hex（恰好 64 位小写 hex）。明文令牌
+  // 无法反向迁移为哈希（需逐行重算——明文已不可得时无从做起），按约定直接清除：
+  // 旧令牌一次性失效，用户需重新登录 / 重签 API Key（README「升级影响」）。
+  var purgedLegacy = 0;
+  var purgedSessions = await h.db.run(
+    "DELETE FROM sessions WHERE LENGTH(token_hash) <> 64 OR token_hash GLOB '*[^0-9a-f]*'",
+  );
+  purgedLegacy += Number((purgedSessions && purgedSessions['changes']) || 0);
+  var purgedKeys = await h.db.run(
+    "DELETE FROM api_keys WHERE LENGTH(token_hash) <> 64 OR token_hash GLOB '*[^0-9a-f]*'",
+  );
+  purgedLegacy += Number((purgedKeys && purgedKeys['changes']) || 0);
+  if (purgedLegacy > 0) {
+    h.log.info('auth: dropped legacy plaintext token rows (holders must re-login / re-issue API keys)', {
+      purged: purgedLegacy,
+    });
+  }
 
   // ---- 2. rootToken 解析 + owner 引导 --------------------------------------
   // 契约优先级：h.boot.rootToken（内核 load payload 注入，主通道）→ ctx.rootToken
@@ -386,10 +417,12 @@ defineExtension(async (h, ctx) => {
     }
     var now = Date.now();
     var token = 'ses_' + authRandomHex(AUTH_TOKEN_BYTES);
+    // 脱敏存储：token_hash 列只存 SHA-256 hex，明文仅在本次响应返回
+    var tokenHash = String((await h.auth.hashToken(token))['hash']);
     var expiresAt = now + AUTH_SESSION_TTL_MS;
     await h.db.run(
       'INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
-      ['ssn_' + authRandomHex(12), authStr(user, 'id'), token, expiresAt, now],
+      ['ssn_' + authRandomHex(12), authStr(user, 'id'), tokenHash, expiresAt, now],
     );
     return {
       token: token,
@@ -402,7 +435,7 @@ defineExtension(async (h, ctx) => {
   h.route('POST', '/auth/logout', async (req) => {
     var session = await authRequireSession(h, req);
     if (session === null) return authUnauthorized('a session token (ses_*) is required');
-    await h.db.run('DELETE FROM sessions WHERE token_hash = ?', [session.sessionToken]);
+    await h.db.run('DELETE FROM sessions WHERE token_hash = ?', [session.sessionTokenHash]);
     return { ok: true };
   }, routeOpts);
 
@@ -440,7 +473,7 @@ defineExtension(async (h, ctx) => {
     // 撤销本人其他会话（保留当前会话），让旧凭据在其他端尽快失效
     var revoked = await h.db.run('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?', [
       session.userId,
-      session.sessionToken,
+      session.sessionTokenHash,
     ]);
     return { ok: true, revokedOtherSessions: Number((revoked && revoked['changes']) || 0) };
   }, routeOpts);
@@ -496,10 +529,12 @@ defineExtension(async (h, ctx) => {
     var now = Date.now();
     var id = 'key_' + authRandomHex(12);
     var token = 'ak_' + authRandomHex(AUTH_TOKEN_BYTES);
+    // 脱敏存储：token_hash 列只存 SHA-256 hex，明文仅在本次响应返回一次，库内不回显
+    var tokenHash = String((await h.auth.hashToken(token))['hash']);
     await h.db.run(
       'INSERT INTO api_keys (id, user_id, name, token_hash, scopes, expires_at, revoked, created_at)' +
         ' VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
-      [id, session.userId, name, token, JSON.stringify(scopes), expiresAt, now],
+      [id, session.userId, name, tokenHash, JSON.stringify(scopes), expiresAt, now],
     );
     return { id: id, name: name, token: token, scopes: scopes, expiresAt: expiresAt, createdAt: now };
   }, routeOpts);

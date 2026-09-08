@@ -6,6 +6,8 @@
  * - createWorkspace：容器加固参数断言（Image/Cmd/User/WorkingDir/Binds/Memory/NanoCpus/
  *   PidsLimit/CapDrop/SecurityOpt/ReadonlyRootfs/NetworkMode=bridge）；id/image 定制；
  *   上限与重复 id 拒绝；
+ * - networkMode（net:out 权限联动的容器网络参数面）：缺省 bridge、'none' 传参、
+ *   WorkspaceInfo 回显（get/list）、isolated 一次性容器恒为 none、非法值 BAD_REQUEST；
  * - exec：正常输出分拣、exitCode 非零不抛、超时 timedOut=true 且 kill 被调、
  *   env/workdir 透传、stopped 自动重启、isolated 一次性容器（NetworkMode none + 用毕强删）；
  * - idle sweep：短 idleStopMs + 时间推进 → stop 被调（容器保留）；未活跃不足不 stop；
@@ -310,6 +312,85 @@ describe('SandboxManager — createWorkspace 容器参数与登记', () => {
     await expect(manager.createWorkspace({ id: 'ws-b' })).rejects.toMatchObject({ code: 'HARNESS-6003' });
     await expect(manager.createWorkspace({ id: 'ws-a' })).rejects.toMatchObject({ code: 'HARNESS-6003' });
     await expect(manager.createWorkspace({ id: '../evil' })).rejects.toMatchObject({ code: 'HARNESS-1008' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// networkMode（net:out 权限联动的容器网络参数面）
+// ---------------------------------------------------------------------------
+
+describe('SandboxManager — createWorkspace networkMode', () => {
+  it('缺省 networkMode → 容器 NetworkMode bridge（现状保持）+ 登记 networkMode bridge', async () => {
+    const { client, manager } = build();
+    await manager.start();
+    const ws = await manager.createWorkspace({});
+
+    const opts = client.createCalls[0] as DockerCreateContainerOptions;
+    expect(opts.HostConfig?.NetworkMode).toBe('bridge');
+    expect(ws.networkMode).toBe('bridge');
+    expect(manager.get(ws.id)?.networkMode).toBe('bridge');
+  });
+
+  it('networkMode "none" 传参 → createContainer HostConfig.NetworkMode none + WorkspaceInfo 回显', async () => {
+    const { client, manager } = build();
+    await manager.start();
+    const ws = await manager.createWorkspace({ id: 'air-gapped', networkMode: 'none' });
+
+    expect(client.createCalls).toHaveLength(1);
+    const opts = client.createCalls[0] as DockerCreateContainerOptions;
+    expect(opts.HostConfig?.NetworkMode).toBe('none');
+    expect(ws.networkMode).toBe('none');
+    expect(manager.get('air-gapped')?.networkMode).toBe('none');
+    // list() 同样回显（net:out 联动在 list 视图可见）
+    const listed = manager.list().find((w) => w.id === 'air-gapped');
+    expect(listed?.networkMode).toBe('none');
+  });
+
+  it('bridge 与 none 工作区并存：list() 各自回显互不串扰', async () => {
+    const { client, manager } = build();
+    await manager.start();
+    await manager.createWorkspace({ id: 'with-net' });
+    await manager.createWorkspace({ id: 'no-net', networkMode: 'none' });
+
+    expect(client.createCalls).toHaveLength(2);
+    expect((client.createCalls[0] as DockerCreateContainerOptions).HostConfig?.NetworkMode).toBe('bridge');
+    expect((client.createCalls[1] as DockerCreateContainerOptions).HostConfig?.NetworkMode).toBe('none');
+    expect(manager.list().map((w) => ({ id: w.id, networkMode: w.networkMode }))).toEqual([
+      { id: 'with-net', networkMode: 'bridge' },
+      { id: 'no-net', networkMode: 'none' },
+    ]);
+  });
+
+  it('isolated 一次性执行恒为 none（即便工作区为 bridge）；none 工作区 exec 不新建容器', async () => {
+    const { client, manager } = build();
+    await manager.start();
+    // bridge 工作区 + isolated：一次性容器仍强制 none（任务级隔离不受工作区参数影响）
+    const bridged = await manager.createWorkspace({ id: 'bridged-ws' });
+    expect(bridged.networkMode).toBe('bridge');
+    client.execOutput = [frame(1, 'iso')];
+    await manager.exec('bridged-ws', ['echo', 'iso'], { isolated: true });
+    const ephemeralOpts = client.createCalls[1] as DockerCreateContainerOptions;
+    expect(ephemeralOpts.HostConfig?.NetworkMode).toBe('none');
+
+    // none 工作区 + isolated：同样 none，加固基线一致
+    await manager.createWorkspace({ id: 'none-ws', networkMode: 'none' });
+    await manager.exec('none-ws', ['echo', 'iso'], { isolated: true });
+    const ephemeralOpts2 = client.createCalls[2] as DockerCreateContainerOptions;
+    expect(ephemeralOpts2.HostConfig?.NetworkMode).toBe('none');
+
+    // none 工作区的普通 exec 复用主容器（NetworkMode none），不新建
+    const callsBefore = client.createCalls.length;
+    await manager.exec('none-ws', ['true']);
+    expect(client.createCalls).toHaveLength(callsBefore);
+  });
+
+  it('非法 networkMode → BAD_REQUEST（fail-closed，未触达 Docker）', async () => {
+    const { client, manager } = build();
+    await manager.start();
+    const evil = { id: 'evil-ws', networkMode: 'host' } as unknown as { id: string; networkMode: 'bridge' | 'none' };
+    await expect(manager.createWorkspace(evil)).rejects.toMatchObject({ code: 'HARNESS-1008' });
+    expect(client.createCalls).toHaveLength(0);
+    expect(manager.list()).toHaveLength(0);
   });
 });
 

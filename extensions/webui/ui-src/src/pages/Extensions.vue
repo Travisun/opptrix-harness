@@ -2,14 +2,19 @@
 /**
  * Extensions — 扩展生命周期管理。三标签：扩展列表（enable/disable/reload/uninstall）、
  * 路由表（/extensions/routes）、服务注册目录（/extensions/registry）。
- * 危险操作（disable/uninstall）先 confirm。
+ * 危险操作（disable/uninstall）先 confirm；第三方扩展首启收到 HARNESS-3012 时
+ * 弹信任确认框（展示 detail.permissions 声明能力 + 警示文案），确认后带
+ * confirmTrust:true 重试完成人工授信。
  */
 import { onBeforeUnmount, onMounted, ref } from 'vue';
 
-import { api, pushToast, type ExtRouteEntry, type ExtSummary } from '../api';
+import { api, pushToast, type ApiError, type ExtRouteEntry, type ExtSummary } from '../api';
 import { connectSse, type SseHandle } from '../sse';
 
 type Tab = 'list' | 'routes' | 'registry';
+
+/** 内核第三方扩展信任闸错误码（EXT_TRUST_REQUIRED → 403） */
+const TRUST_REQUIRED_CODE = 'HARNESS-3012';
 
 const tab = ref<Tab>('list');
 const loading = ref(true);
@@ -41,6 +46,39 @@ async function load(): Promise<void> {
   }
 }
 
+/** 从 EXT_TRUST_REQUIRED 错误体 detail 中安全提取声明权限列表 */
+function permissionsOf(detail: unknown): string[] {
+  if (detail !== null && typeof detail === 'object' && Array.isArray((detail as { permissions?: unknown }).permissions)) {
+    return ((detail as { permissions: unknown[] }).permissions).filter((p): p is string => typeof p === 'string');
+  }
+  return [];
+}
+
+/**
+ * enable：先普通启用；第三方扩展首启被信任闸拒绝（HARNESS-3012）时弹确认框，
+ * 用户确认后带 confirmTrust:true 重试（授信持久化，后续 enable 不再询问）。
+ */
+async function enableExt(id: string): Promise<void> {
+  const path = `/api/v1/extensions/${encodeURIComponent(id)}/enable`;
+  try {
+    await api.post(path, undefined, { silent: true });
+  } catch (e) {
+    const apiErr = e as ApiError;
+    if (apiErr.code !== TRUST_REQUIRED_CODE) {
+      pushToast('error', `[${apiErr.code}] ${apiErr.message}`);
+      return;
+    }
+    const perms = permissionsOf(apiErr.detail);
+    const confirmed = window.confirm(
+      `启用第三方扩展 "${id}" 需要人工确认信任。\n\n` +
+        '该第三方扩展将获得所声明的全部能力，请确认信任来源。\n\n' +
+        `声明权限（${perms.length} 项）：${perms.length > 0 ? perms.join('、') : '（未声明）'}`,
+    );
+    if (!confirmed) return;
+    await api.post(path, { confirmTrust: true });
+  }
+}
+
 async function act(id: string, action: 'enable' | 'disable' | 'reload' | 'uninstall'): Promise<void> {
   if (action === 'disable') {
     if (!window.confirm(`停用扩展 "${id}"？其路由/定时/事件订阅将立即摘除。`)) return;
@@ -50,7 +88,8 @@ async function act(id: string, action: 'enable' | 'disable' | 'reload' | 'uninst
   }
   busyKey.value = `${id}:${action}`;
   try {
-    await api.post(`/api/v1/extensions/${encodeURIComponent(id)}/${action}`);
+    if (action === 'enable') await enableExt(id);
+    else await api.post(`/api/v1/extensions/${encodeURIComponent(id)}/${action}`);
     pushToast('success', `扩展 ${id} ${action} 成功`);
     await load();
   } finally {

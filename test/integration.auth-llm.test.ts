@@ -373,10 +373,20 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
   });
 
   it('权限/boot 隔离：非 auth:provider 扩展 h.auth.hashPassword → FORBIDDEN；h.boot 无 rootToken', async () => {
+    // [ext-trust 工作包最小修复] probe 位于 dataDir/extensions（第三方目录）：
+    // 首次 enable 被信任闸拒绝（403 HARNESS-3012），confirmTrust 重试后激活
+    const trustGate = await app.inject({
+      method: 'POST',
+      url: `/api/v1/extensions/${PROBE_EXT_ID}/enable`,
+      headers: { authorization: `Bearer ${ROOT_TOKEN}` },
+    });
+    expect(trustGate.statusCode).toBe(403);
+    expect(trustGate.json()).toMatchObject({ code: 'HARNESS-3012' });
     const enable = await app.inject({
       method: 'POST',
       url: `/api/v1/extensions/${PROBE_EXT_ID}/enable`,
       headers: { authorization: `Bearer ${ROOT_TOKEN}` },
+      payload: { confirmTrust: true },
     });
     expect(enable.statusCode).toBe(200);
 

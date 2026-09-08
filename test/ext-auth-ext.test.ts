@@ -13,6 +13,7 @@
  * login/logout/me/change-password、users CRUD 与 admin 门、api-key 签发/认证/吊销、
  * root 令牌直连、错误形状（HARNESS-1006/1007/1008/1009/1001）、源码卫生。
  */
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,6 +24,11 @@ import Database from 'better-sqlite3';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import { createPasswordSupport } from '../src/kernel/auth/ext-auth-support.js';
+
+/** 内核 auth.hashToken topic 的同款实现（kernel-handlers.ts：SHA-256 hex）——测试桩与内核逐字对齐 */
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
 
 // ---------------------------------------------------------------------------
 // 桩类型与脚手架
@@ -53,7 +59,11 @@ type SetupFn = (h: AuthHarness, ctx?: { rootToken?: string }) => Promise<void>;
 /** 扩展用到的 HarnessApi 子集（内存桩形状） */
 interface AuthHarness {
   boot?: { rootToken: string };
-  auth: { hashPassword(pw: string): Promise<string>; verifyPassword(pw: string, hash: string): Promise<boolean> };
+  auth: {
+    hashPassword(pw: string): Promise<string>;
+    verifyPassword(pw: string, hash: string): Promise<boolean>;
+    hashToken(value: string): Promise<{ hash: string }>;
+  };
   authProvider(register: ProviderFn): void;
   route(method: string, routePath: string, handler: (ctx: RouteContextLike) => Promise<unknown>, opts?: { auth: string }): void;
   db: {
@@ -108,10 +118,12 @@ function makeHarness(
 ): AuthHarness {
   const h: AuthHarness = {
     ...(opts.bootRootToken === undefined ? {} : { boot: { rootToken: opts.bootRootToken } }),
-    // 沙箱契约名 hashPassword/verifyPassword；内核 topic 层即对本实现的薄封装（同名换皮）
+    // 沙箱契约名 hashPassword/verifyPassword/hashToken；内核 topic 层即对本实现的薄封装（同名换皮）
     auth: {
       hashPassword: (pw: string) => passwords.hash(pw),
       verifyPassword: (pw: string, hash: string) => passwords.verify(pw, hash),
+      // 与内核 kernel-handlers.ts auth.hashToken 同源：SHA-256 → { hash: 64hex }（令牌脱敏存储）
+      hashToken: async (value: string) => ({ hash: sha256Hex(value) }),
     },
     authProvider: (register) => {
       providerSlot.fn = register;
@@ -241,7 +253,9 @@ describe('auth 扩展 · 激活期（setup）', () => {
       const slot: { fn: ProviderFn | null } = { fn: null };
       return { setup, h: makeHarness(new Database(':memory:'), new Map(), slot, { omit }) };
     };
-    await expect(setup(make(['auth']).h)).rejects.toThrow(/HarnessApi\.auth \{ hashPassword, verifyPassword \}/);
+    await expect(setup(make(['auth']).h)).rejects.toThrow(
+      /HarnessApi\.auth \{ hashPassword, verifyPassword, hashToken \}/,
+    );
     await expect(setup(make(['authProvider']).h)).rejects.toThrow(/HarnessApi\.authProvider/);
   });
 
@@ -296,7 +310,7 @@ describe('auth 扩展 · 激活期（setup）', () => {
 });
 
 describe('auth 扩展 · login / 会话', () => {
-  it('login 成功：ses_+48hex 令牌、7 天有效期入库、返回用户三字段', async () => {
+  it('login 成功：ses_+48hex 令牌、7 天有效期入库、返回用户三字段；库内只存 SHA-256 hex（脱敏）', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
     const before = Date.now();
@@ -305,12 +319,47 @@ describe('auth 扩展 · login / 会话', () => {
     expect(res.user).toMatchObject({ username: 'owner', role: 'admin' });
     expect(res.user.id).toMatch(/^usr_/);
     expect(res.expiresAt).toBeGreaterThanOrEqual(before + 7 * 24 * 3600 * 1000 - 1000);
-    const row = b.db.prepare('SELECT expires_at, created_at FROM sessions WHERE token_hash = ?').get(res.token) as {
-      expires_at: number;
-      created_at: number;
-    };
+    // T1 脱敏存储：token_hash 列 = 令牌的 SHA-256 hex，明文令牌不落库
+    const row = b.db
+      .prepare('SELECT token_hash, expires_at, created_at FROM sessions WHERE token_hash = ?')
+      .get(sha256Hex(res.token)) as { token_hash: string; expires_at: number; created_at: number };
+    expect(row).toBeDefined();
+    expect(row.token_hash).toBe(sha256Hex(res.token));
+    expect(row.token_hash).not.toBe(res.token);
+    expect(row.token_hash).toMatch(/^[0-9a-f]{64}$/);
     expect(row.expires_at).toBe(res.expiresAt);
     expect(row.created_at).toBeGreaterThanOrEqual(before);
+    // 以明文令牌直查（旧版明文存储语义）→ 查不到
+    const legacy = b.db.prepare('SELECT id FROM sessions WHERE token_hash = ?').get(res.token);
+    expect(legacy).toBeUndefined();
+  });
+
+  it('令牌哈希迁移：setup 清除旧版明文 token_hash 残留行（sessions + api_keys），64-hex 行保留', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate(); // 首次 boot：建表 + owner 引导（v1 明文版本升级前的库）
+    const now = Date.now();
+    // 模拟升级前残留：直插旧版明文令牌行 + 一行合法 64-hex（新格式，应保留）
+    b.db
+      .prepare('INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run('ssn_plain', 'usr_legacy', 'ses_' + 'a'.repeat(48), now + 1000, now); // 明文（52 字符）→ 清除
+    b.db
+      .prepare('INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run('ssn_hashed', 'usr_legacy', sha256Hex('ses_' + 'b'.repeat(48)), now + 1000, now); // 64-hex → 保留
+    b.db
+      .prepare(
+        'INSERT INTO api_keys (id, user_id, name, token_hash, scopes, expires_at, revoked, created_at)' +
+          ' VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
+      )
+      .run('key_plain', 'usr_legacy', 'old', 'ak_' + 'c'.repeat(48), '["*"]', null, now); // 明文 → 清除
+
+    await b.activate(); // 升级后再次 boot：迁移清理生效（幂等重跑）
+
+    const sesHashes = (b.db.prepare('SELECT token_hash FROM sessions').all() as { token_hash: string }[]).map(
+      (r) => r.token_hash,
+    );
+    expect(sesHashes).toEqual([sha256Hex('ses_' + 'b'.repeat(48))]); // 明文行已清除，合法哈希保留
+    const keyCount = b.db.prepare('SELECT COUNT(*) AS n FROM api_keys').get() as { n: number };
+    expect(keyCount.n).toBe(0); // 明文 api_key 行已清除
   });
 
   it('login 密码错误 / 用户不存在：同为 401 HARNESS-1006，响应完全一致（不泄露存在性）', async () => {

@@ -7,14 +7,17 @@
  * - GET  /api/v1/extensions/registry  服务注册目录 → registry.list()
  * - POST /api/v1/extensions/:id/enable | disable | reload → { ok: true }
  *       失败时 HarnessError 原样状态码透传（EXT_ACTIVATION_FAILED 500 / EXT_DEPENDENCY_MISSING 409 等），
- *       body 统一错误形状 { code, message, detail, retryable }
+ *       body 统一错误形状 { code, message, detail, retryable }；
+ *       enable 接收可选 body { confirmTrust }——第三方扩展首启被拒（403 EXT_TRUST_REQUIRED，
+ *       detail 带 permissions 与 confirmHint）后，确认信任方携带 confirmTrust=true 重试授信
  * - POST /api/v1/extensions/:id/uninstall（?purge=1 连持久化数据一并清除）→ { ok: true }
  * - GET  /api/v1/extensions/:id       单个扩展详情（在 manager.list() 中查找；无 → 404 HARNESS-3004）
  *
  * 约定：
  * - 鉴权：token 经 extractToken（Authorization: Bearer 优先，其次 ?token=）交
  *   deps.checker 校验；失败抛 UNAUTHORIZED → 401；
- * - 入参全部 zod 校验（:id 与 ?purge）；本模块路由不接收 JSON body；
+ * - 入参全部 zod 校验（:id / ?purge / enable body.confirmTrust）；除 enable 的可选
+ *   confirmTrust 外本模块路由不接收 JSON body；
  * - 写操作挂路由级 errorHandler：HarnessError 按自身状态码下发（即使宿主未装
  *   全局 HarnessError 处理器也保持透传语义），其余异常交回全局兜底。
  */
@@ -49,8 +52,8 @@ export interface ExtensionsApiDeps {
   manager: {
     /** 扩展清单（GET / 与 GET /:id 的数据源） */
     list(): ExtSummaryLike[];
-    /** 启用扩展；失败抛 HarnessError（状态码原样透传） */
-    enable(id: string): Promise<void>;
+    /** 启用扩展；input.confirmTrust=true 表示人工授信第三方扩展（信任闸）；失败抛 HarnessError（状态码原样透传） */
+    enable(id: string, input?: { confirmTrust?: boolean }): Promise<void>;
     /** 停用扩展；失败抛 HarnessError（状态码原样透传） */
     disable(id: string): Promise<void>;
     /** 重载扩展；失败抛 HarnessError（状态码原样透传） */
@@ -80,6 +83,11 @@ const idParamSchema = z.object({
 /** POST /api/v1/extensions/:id/uninstall 查询参数（?purge=1 连数据清除） */
 const uninstallQuerySchema = z.object({
   purge: z.enum(['1', 'true']).optional(),
+});
+
+/** POST /api/v1/extensions/:id/enable 请求体（可选；confirmTrust=true 人工授信第三方扩展） */
+const enableBodySchema = z.object({
+  confirmTrust: z.boolean().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -171,10 +179,19 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtensionsAp
     return { ok: true, discovered };
   });
 
-  // POST /api/v1/extensions/:id/enable — 启用扩展
+  // POST /api/v1/extensions/:id/enable — 启用扩展（body 可选 { confirmTrust }：
+  // 第三方扩展首启返回 403 EXT_TRUST_REQUIRED，重试时携带 confirmTrust=true 完成人工授信）
   app.post('/api/v1/extensions/:id/enable', writeOptions, async (request, reply) => {
     await requireAdmin(request);
-    await deps.manager.enable(parseIdParam(request));
+    const id = parseIdParam(request);
+    const parsed = enableBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      throw err('VALIDATION_FAILED', {
+        message: 'body.confirmTrust only accepts a boolean',
+        detail: parsed.error.issues,
+      });
+    }
+    await deps.manager.enable(id, { confirmTrust: parsed.data.confirmTrust });
     reply.code(200);
     return { ok: true };
   });

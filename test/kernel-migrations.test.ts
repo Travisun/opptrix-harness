@@ -28,7 +28,7 @@ const KERNEL_TABLES = [
   'deliveries',
 ] as const;
 
-/** 期望的迁移名（顺序敏感）。 */
+/** 期望的迁移名（顺序敏感）。015_extensions_trust：第三方扩展信任确认列（ext-trust 工作包追加）。 */
 const EXPECTED_MIGRATION_NAMES = [
   '001_settings',
   '002_secrets',
@@ -44,6 +44,7 @@ const EXPECTED_MIGRATION_NAMES = [
   '012_files',
   '013_tasks',
   '014_deliveries',
+  '015_extensions_trust',
 ] as const;
 
 type RawRow = Record<string, unknown>;
