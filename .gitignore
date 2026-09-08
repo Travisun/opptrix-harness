@@ -9,6 +9,7 @@ release/
 extensions/webui/ui-src/node_modules/
 extensions/*/ui/
 !extensions/webui/ui/
+!extensions/doc-demo/ui/
 
 # 工程文档与提示词（不随公开仓库分发）
 .cursor/

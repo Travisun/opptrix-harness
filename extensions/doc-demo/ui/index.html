@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Doc Demo — 文档解析</title>
+    <style>
+      body { font-family: system-ui, -apple-system, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem; color: #1f2328; line-height: 1.6; }
+      code { background: #f6f8fa; border-radius: 6px; padding: 0.1em 0.35em; font-size: 0.9em; }
+      pre { background: #f6f8fa; border-radius: 6px; padding: 0.75rem 1rem; overflow-x: auto; }
+      button { font: inherit; padding: 0.4em 1.2em; border-radius: 6px; border: 1px solid #d0d7de; background: #f6f8fa; }
+    </style>
+  </head>
+  <body>
+    <h1>Doc Demo — 文档解析</h1>
+    <p>
+      上传 <code>text/plain</code> 文件后自动解析行数 / 词数 / 字符数，
+      结果以 <code>doc-parse</code> 卡片发送到 <code>general</code> 频道。
+    </p>
+    <h2>手动解析</h2>
+    <p>调用 <code>POST /ext/doc-demo/parse</code>（鉴权 token 由父页面注入到 <code>?token=</code>）：</p>
+    <pre>fetch('/ext/doc-demo/parse?token=' + token, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ fileId: '&lt;文件 ID&gt;' }),
+}).then((r) =&gt; r.json());
+// =&gt; { "fileId": "…", "lines": 2, "words": 4, "chars": 24 }</pre>
+    <p>示例按钮（v1 静态说明页，无脚本依赖）：</p>
+    <p><button type="button" disabled>解析文件</button></p>
+  </body>
+</html>
