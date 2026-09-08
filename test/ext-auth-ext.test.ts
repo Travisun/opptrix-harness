@@ -63,6 +63,9 @@ interface AuthHarness {
     hashPassword(pw: string): Promise<string>;
     verifyPassword(pw: string, hash: string): Promise<boolean>;
     hashToken(value: string): Promise<{ hash: string }>;
+    totpGenerate(account: string): Promise<{ secret: string; uri: string }>;
+    totpVerify(input: { secret: string; token: string }): Promise<{ ok: boolean; delta: number | null }>;
+    verifyRootToken(token: string): Promise<{ ok: boolean }>;
   };
   authProvider(register: ProviderFn): void;
   route(method: string, routePath: string, handler: (ctx: RouteContextLike) => Promise<unknown>, opts?: { auth: string }): void;
@@ -87,12 +90,18 @@ interface Booted {
   getProvider(): ProviderFn;
   /** 激活扩展（等价内核 load → def.setup(h, ctx)） */
   activate(ctx?: { rootToken?: string }): Promise<void>;
+  /** totpVerify 桩的可编程罐头码表（默认仅 '123456' ok；用例可增删改） */
+  totpOkCodes: string[];
+  /** 在扩展 VM 上下文里执行片段（访问模块级 var，如 AUTH_MEM_TOKENS——过期语义用例用） */
+  runInVm(code: string): unknown;
 }
 
 const passwords = createPasswordSupport();
+/** totpGenerate 桩的固定 secret（桩不真验 TOTP 数学，只按罐头码判定） */
+const TOTP_STUB_SECRET = 'TESTSECRETBASE32';
 
-/** 读取源码并在全新 vm 上下文中执行，返回捕获到的 setup（每用例独立调用，零串扰） */
-function loadSetup(): SetupFn {
+/** 读取源码并在全新 vm 上下文中执行，返回捕获到的 setup 与沙箱（每用例独立调用，零串扰） */
+function loadSetup(): { setup: SetupFn; sandbox: vm.Context } {
   const capture: { setup: SetupFn | null } = { setup: null };
   // 最小沙箱：只注入 defineExtension 与 crypto（无 console/require/process —— 源码误用即抛）
   const sandbox = {
@@ -106,7 +115,7 @@ function loadSetup(): SetupFn {
   if (capture.setup === null) {
     throw new Error('extension source did not call defineExtension');
   }
-  return capture.setup;
+  return { setup: capture.setup, sandbox };
 }
 
 /** HarnessApi 形状的内存桩（fail-fast 用例可抽走 auth / authProvider 字段） */
@@ -114,8 +123,9 @@ function makeHarness(
   db: Database.Database,
   routes: Map<string, RouteDef>,
   providerSlot: { fn: ProviderFn | null },
-  opts: { bootRootToken?: string; configRootToken?: string; omit?: Array<'auth' | 'authProvider'> } = {},
+  opts: { bootRootToken?: string; configRootToken?: string; omit?: Array<'auth' | 'authProvider'>; totpOkCodes?: string[] } = {},
 ): AuthHarness {
+  const okCodes = opts.totpOkCodes ?? ['123456'];
   const h: AuthHarness = {
     ...(opts.bootRootToken === undefined ? {} : { boot: { rootToken: opts.bootRootToken } }),
     // 沙箱契约名 hashPassword/verifyPassword/hashToken；内核 topic 层即对本实现的薄封装（同名换皮）
@@ -124,6 +134,18 @@ function makeHarness(
       verifyPassword: (pw: string, hash: string) => passwords.verify(pw, hash),
       // 与内核 kernel-handlers.ts auth.hashToken 同源：SHA-256 → { hash: 64hex }（令牌脱敏存储）
       hashToken: async (value: string) => ({ hash: sha256Hex(value) }),
+      // 内核 auth.totpGenerate 同形状桩：{ secret, uri }（uri label = account）
+      totpGenerate: async (account: string) => ({
+        secret: TOTP_STUB_SECRET,
+        uri: `otpauth://totp/Opptrix%20Harness:${encodeURIComponent(account)}?secret=${TOTP_STUB_SECRET}&issuer=Opptrix%20Harness`,
+      }),
+      // 可编程 canned：默认 code==='123456' ok；secret 为空一律 false（对齐内核 fail-closed）
+      totpVerify: async (input: { secret: string; token: string }) => ({
+        ok: input.secret !== '' && okCodes.includes(input.token),
+        delta: null,
+      }),
+      // 内核 auth.verifyRootToken 同语义桩：常数时间桩化为本测试常量比对
+      verifyRootToken: async (token: string) => ({ ok: token === ROOT_TOKEN }),
     },
     authProvider: (register) => {
       providerSlot.fn = register;
@@ -151,15 +173,18 @@ function boot(opts: { bootRootToken?: string; configRootToken?: string } = {}): 
   const db = new Database(':memory:');
   const routes = new Map<string, RouteDef>();
   const providerSlot: { fn: ProviderFn | null } = { fn: null };
-  const setup = loadSetup();
+  const totpOkCodes = ['123456'];
+  const { setup, sandbox } = loadSetup();
   return {
     db,
     routes,
+    totpOkCodes,
+    runInVm: (code: string) => vm.runInContext(code, sandbox),
     getProvider: () => {
       if (providerSlot.fn === null) throw new Error('h.authProvider was not registered during setup');
       return providerSlot.fn;
     },
-    activate: (ctx) => setup(makeHarness(db, routes, providerSlot, opts), ctx),
+    activate: (ctx) => setup(makeHarness(db, routes, providerSlot, { ...opts, totpOkCodes }), ctx),
   };
 }
 
@@ -185,7 +210,28 @@ function bearer(token: string): Record<string, string | undefined> {
   return { authorization: `Bearer ${token}` };
 }
 
-/** 便捷登录（owner 默认密码即 ROOT_TOKEN）；意外失败时抛出便于定位 */
+/** 便捷 enroll（默认 canned 码 '123456'）；意外失败时抛出便于定位 */
+async function enroll(
+  b: Booted,
+  enrollToken: string,
+  code = '123456',
+): Promise<{ token: string; expiresAt: number; user: { id: string; username: string; role: string } }> {
+  const res = (await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken, code } })) as {
+    token?: string;
+    expiresAt?: number;
+    user?: { id: string; username: string; role: string };
+  };
+  if (typeof res.token !== 'string' || res.user === undefined) {
+    throw new Error(`enroll unexpectedly failed: ${JSON.stringify(res)}`);
+  }
+  return { token: res.token, expiresAt: res.expiresAt ?? 0, user: res.user };
+}
+
+/**
+ * 便捷登录（owner 默认密码即 ROOT_TOKEN）：自动续走强制 2FA——
+ * enrollmentRequired → POST /2fa/enroll（canned 码）；mfaRequired → POST /auth/login/2fa。
+ * 意外失败时抛出便于定位。
+ */
 async function login(
   b: Booted,
   username: string,
@@ -195,7 +241,24 @@ async function login(
     token?: string;
     user?: { id: string; username: string; role: string };
     expiresAt?: number;
+    mfaRequired?: boolean;
+    mfaToken?: string;
+    enrollmentRequired?: boolean;
+    enrollToken?: string;
   };
+  if (res.enrollmentRequired === true && typeof res.enrollToken === 'string') {
+    const done = await enroll(b, res.enrollToken);
+    return { token: done.token, expiresAt: done.expiresAt, user: done.user };
+  }
+  if (res.mfaRequired === true && typeof res.mfaToken === 'string') {
+    const res2 = (await call(b.routes, 'POST', '/auth/login/2fa', {
+      body: { mfaToken: res.mfaToken, totp: '123456' },
+    })) as { token?: string; user?: { id: string; username: string; role: string }; expiresAt?: number };
+    if (typeof res2.token !== 'string' || res2.user === undefined) {
+      throw new Error(`login/2fa unexpectedly failed: ${JSON.stringify(res2)}`);
+    }
+    return { token: res2.token, expiresAt: res2.expiresAt ?? 0, user: res2.user };
+  }
   if (typeof res.token !== 'string' || res.user === undefined) {
     throw new Error(`login unexpectedly failed: ${JSON.stringify(res)}`);
   }
@@ -224,21 +287,27 @@ describe('auth 扩展 · 激活期（setup）', () => {
     }
   });
 
-  it('注册 authProvider 与全部 11 条路由，且全部声明 auth:"public"', async () => {
+  it('注册 authProvider 与全部 17 条路由，且全部声明 auth:"public"', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
     b.getProvider(); // 未注册会 throw
     const expected = [
       'DELETE /auth/api-keys/:id',
       'DELETE /users/:id',
+      'GET /2fa/setup',
       'GET /auth/api-keys',
       'GET /auth/me',
+      'GET /onboarding/status',
       'GET /users',
       'PATCH /users/:id',
+      'POST /2fa/enroll',
+      'POST /auth/2fa/disable',
       'POST /auth/api-keys',
       'POST /auth/change-password',
       'POST /auth/login',
+      'POST /auth/login/2fa',
       'POST /auth/logout',
+      'POST /onboarding',
       'POST /users',
     ];
     expect([...b.routes.keys()].sort()).toEqual(expected);
@@ -248,13 +317,13 @@ describe('auth 扩展 · 激活期（setup）', () => {
   });
 
   it('契约 fail-fast：缺 h.auth / h.authProvider / h.db → setup 拒绝且报错说清缺什么', async () => {
-    const setup = loadSetup();
+    const { setup } = loadSetup();
     const make = (omit: Array<'auth' | 'authProvider'>) => {
       const slot: { fn: ProviderFn | null } = { fn: null };
       return { setup, h: makeHarness(new Database(':memory:'), new Map(), slot, { omit }) };
     };
     await expect(setup(make(['auth']).h)).rejects.toThrow(
-      /HarnessApi\.auth \{ hashPassword, verifyPassword, hashToken \}/,
+      /HarnessApi\.auth \{ hashPassword, verifyPassword, hashToken, totpGenerate, totpVerify, verifyRootToken \}/,
     );
     await expect(setup(make(['authProvider']).h)).rejects.toThrow(/HarnessApi\.authProvider/);
   });
@@ -738,5 +807,429 @@ describe('auth 扩展 · users 管理（admin 门）', () => {
     expect(await b.getProvider()({ token: bobKey.token })).toBeNull();
     const count = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
     expect(count.n).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Onboarding 引导 + 全员强制 2FA（TOTP）
+// ---------------------------------------------------------------------------
+
+/** 未绑定用户"第一步登录"：断言返回 enrollmentRequired 形状并取出 enr 令牌 */
+async function loginUnbound(
+  b: Booted,
+  username: string,
+  password: string,
+): Promise<{ enrollmentRequired: true; enrollToken: string }> {
+  const res = (await call(b.routes, 'POST', '/auth/login', { body: { username, password } })) as {
+    enrollmentRequired?: boolean;
+    enrollToken?: string;
+    token?: string;
+  };
+  expect(res).toMatchObject({ enrollmentRequired: true });
+  expect(typeof res.enrollToken).toBe('string');
+  expect(res.enrollToken as string).toMatch(/^enr_[0-9a-f]{48}$/);
+  expect(res.token).toBeUndefined(); // 强制 2FA：未绑定绝不签发会话
+  return { enrollmentRequired: true, enrollToken: res.enrollToken as string };
+}
+
+/** 已绑定用户"第一步登录"：断言返回 mfaRequired 形状并取出 mfa 令牌 */
+async function loginMfa(
+  b: Booted,
+  username: string,
+  password: string,
+): Promise<{ mfaRequired: true; mfaToken: string }> {
+  const res = (await call(b.routes, 'POST', '/auth/login', { body: { username, password } })) as {
+    mfaRequired?: boolean;
+    mfaToken?: string;
+    token?: string;
+  };
+  expect(res).toMatchObject({ mfaRequired: true });
+  expect(typeof res.mfaToken).toBe('string');
+  expect(res.mfaToken as string).toMatch(/^mfa_[0-9a-f]{48}$/);
+  expect(res.token).toBeUndefined();
+  return { mfaRequired: true, mfaToken: res.mfaToken as string };
+}
+
+describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
+  it('GET /onboarding/status：users 空表 → true；建号后 → false（幂等可重复查）', async () => {
+    const b = boot(); // 无 rootToken：不引导 owner，users 保持空表
+    await b.activate();
+    expect(await call(b.routes, 'GET', '/onboarding/status')).toEqual({ needsOnboarding: true });
+    await call(b.routes, 'POST', '/onboarding', { body: { rootToken: ROOT_TOKEN, password: 'owner-pass-8' } });
+    expect(await call(b.routes, 'GET', '/onboarding/status')).toEqual({ needsOnboarding: false });
+    expect(await call(b.routes, 'GET', '/onboarding/status')).toEqual({ needsOnboarding: false });
+  });
+
+  it('POST /onboarding：rootToken 错 → 401 HARNESS-1006 "root token verification failed"（users 表零写入）', async () => {
+    const b = boot();
+    await b.activate();
+    const bad = await call(b.routes, 'POST', '/onboarding', {
+      body: { rootToken: 'f'.repeat(63) + 'e', password: 'owner-pass-8' },
+    });
+    expectFail(bad, 401, 'HARNESS-1006');
+    expect(bad).toMatchObject({ body: { message: 'root token verification failed' } });
+    const missing = await call(b.routes, 'POST', '/onboarding', { body: { password: 'owner-pass-8' } });
+    expectFail(missing, 401, 'HARNESS-1006');
+    const count = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
+    expect(count.n).toBe(0);
+  });
+
+  it('POST /onboarding：rootToken 对但短密码/超长用户名 → 400 HARNESS-1009', async () => {
+    const b = boot();
+    await b.activate();
+    expectFail(
+      await call(b.routes, 'POST', '/onboarding', { body: { rootToken: ROOT_TOKEN, password: 'short' } }),
+      400,
+      'HARNESS-1009',
+    );
+    expectFail(
+      await call(b.routes, 'POST', '/onboarding', {
+        body: { rootToken: ROOT_TOKEN, password: 'owner-pass-8', username: 'x'.repeat(101) },
+      }),
+      400,
+      'HARNESS-1009',
+    );
+  });
+
+  it('fresh onboarding 全链：enrollToken → setup 出 uri/secret → enroll 错码 400 → 对码会话 + totp_enabled=1', async () => {
+    const b = boot();
+    await b.activate();
+    const onb = (await call(b.routes, 'POST', '/onboarding', {
+      body: { rootToken: ROOT_TOKEN, password: 'owner-pass-8' }, // username 缺省 → owner
+    })) as { enrollmentRequired: boolean; enrollToken: string };
+    expect(onb.enrollmentRequired).toBe(true);
+
+    // owner 已建：admin 角色、密码为入参 password（而非 rootToken）
+    const owner = b.db
+      .prepare('SELECT id, username, role, password_hash, totp_enabled FROM users')
+      .get() as { id: string; username: string; role: string; password_hash: string; totp_enabled: number };
+    expect(owner).toMatchObject({ username: 'owner', role: 'admin', totp_enabled: 0 });
+    expect(await passwords.verify('owner-pass-8', owner.password_hash)).toBe(true);
+    expect(await passwords.verify(ROOT_TOKEN, owner.password_hash)).toBe(false);
+
+    // setup：enr 门内出 otpauth URI 与 secret（label 带 username），pending secret 暂存内存
+    const setupRes = (await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: onb.enrollToken } })) as {
+      uri: string;
+      secret: string;
+    };
+    expect(setupRes.uri).toContain('otpauth://totp/Opptrix%20Harness:');
+    expect(setupRes.uri).toContain('owner');
+    expect(typeof setupRes.secret).toBe('string');
+    expect(setupRes.secret.length).toBeGreaterThan(0);
+
+    // enroll 错码 → 400 HARNESS-1008 "invalid 2fa code"，且不消费 enr（可重试）、不写库
+    const badCode = await call(b.routes, 'POST', '/2fa/enroll', {
+      body: { enrollToken: onb.enrollToken, code: '000000' },
+    });
+    expectFail(badCode, 400, 'HARNESS-1008');
+    expect(badCode).toMatchObject({ body: { message: 'invalid 2fa code' } });
+    expect(
+      (b.db.prepare('SELECT totp_enabled FROM users WHERE id = ?').get(owner.id) as { totp_enabled: number })
+        .totp_enabled,
+    ).toBe(0);
+
+    // 对码 → 会话 + totp 落库
+    const before = Date.now();
+    const done = (await call(b.routes, 'POST', '/2fa/enroll', {
+      body: { enrollToken: onb.enrollToken, code: '123456' },
+    })) as { token: string; expiresAt: number; user: { id: string; username: string; role: string } };
+    expect(done.token).toMatch(/^ses_[0-9a-f]{48}$/);
+    expect(done.expiresAt).toBeGreaterThanOrEqual(before + 7 * 24 * 3600 * 1000 - 1000);
+    expect(done.user).toMatchObject({ id: owner.id, username: 'owner', role: 'admin' });
+    const row = b.db.prepare('SELECT totp_enabled, totp_secret FROM users WHERE id = ?').get(owner.id) as {
+      totp_enabled: number;
+      totp_secret: string;
+    };
+    expect(row.totp_enabled).toBe(1);
+    expect(row.totp_secret).not.toBeNull();
+    expect(await b.getProvider()({ token: done.token })).toMatchObject({ userId: owner.id, role: 'admin' });
+
+    // enr 单次消费：enroll 成功即焚——再用同一令牌（对码）→ 401
+    const replay = await call(b.routes, 'POST', '/2fa/enroll', {
+      body: { enrollToken: onb.enrollToken, code: '123456' },
+    });
+    expectFail(replay, 401, 'HARNESS-1006');
+  });
+
+  it('onboarding reset 模式：root 令牌重置 owner → 旧密码/旧会话/旧 API Key/2FA 全部失效', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    const first = await login(b, 'owner', ROOT_TOKEN); // helper 自动走绑定流程 → owner 已绑 2FA
+    const key = (await call(b.routes, 'POST', '/auth/api-keys', {
+      headers: bearer(first.token),
+      body: { name: 'pre-reset' },
+    })) as { token: string };
+    expect(await b.getProvider()({ token: key.token })).not.toBeNull();
+
+    const reset = (await call(b.routes, 'POST', '/onboarding', {
+      body: { rootToken: ROOT_TOKEN, password: 'reset-pass-8' },
+    })) as { enrollmentRequired: boolean; enrollToken: string };
+    expect(reset.enrollmentRequired).toBe(true);
+
+    // 旧会话 / 旧 API Key 立即失效；totp 清空
+    expect(await b.getProvider()({ token: first.token })).toBeNull();
+    expect(await b.getProvider()({ token: key.token })).toBeNull();
+    const owner = b.db.prepare('SELECT totp_enabled, totp_secret FROM users').get() as {
+      totp_enabled: number;
+      totp_secret: string | null;
+    };
+    expect(owner.totp_enabled).toBe(0);
+    expect(owner.totp_secret).toBeNull();
+    const sesCount = b.db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number };
+    expect(sesCount.n).toBe(0);
+
+    // 旧密码不可登录；新密码可登录但被强制重新绑定（新 enr → setup → enroll）
+    expectFail(
+      await call(b.routes, 'POST', '/auth/login', { body: { username: 'owner', password: ROOT_TOKEN } }),
+      401,
+      'HARNESS-1006',
+    );
+    const unbound = await loginUnbound(b, 'owner', 'reset-pass-8');
+    const done = await enroll(b, unbound.enrollToken);
+    expect(done.user.username).toBe('owner');
+    expect(await b.getProvider()({ token: done.token })).not.toBeNull();
+  });
+
+  it('login 未绑定 → enrollmentRequired + enr；pending secret 预置：不经 setup 直接 enroll 也可成功', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    const done = await enroll(b, unbound.enrollToken); // 直接触 enroll（跳过 /2fa/setup）
+    expect(done.token).toMatch(/^ses_[0-9a-f]{48}$/);
+    const row = b.db.prepare('SELECT totp_enabled FROM users WHERE username = ?').get('owner') as {
+      totp_enabled: number;
+    };
+    expect(row.totp_enabled).toBe(1);
+  });
+
+  it('login 已绑定未带码 → mfaRequired；POST /auth/login/2fa 错码 401（令牌保留可重试）→ 对码会话', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    await login(b, 'owner', ROOT_TOKEN); // 绑定 2FA
+    const mfa = await loginMfa(b, 'owner', ROOT_TOKEN);
+
+    const bad = await call(b.routes, 'POST', '/auth/login/2fa', {
+      body: { mfaToken: mfa.mfaToken, totp: '000000' },
+    });
+    expectFail(bad, 401, 'HARNESS-1006');
+    expect(bad).toMatchObject({ body: { message: 'invalid 2fa code' } });
+
+    // 错码不消费 mfa 令牌：同令牌重试对码 → 会话
+    const done = (await call(b.routes, 'POST', '/auth/login/2fa', {
+      body: { mfaToken: mfa.mfaToken, totp: '123456' },
+    })) as { token: string; user: { username: string; role: string } };
+    expect(done.token).toMatch(/^ses_[0-9a-f]{48}$/);
+    expect(done.user).toMatchObject({ username: 'owner', role: 'admin' });
+    expect(await b.getProvider()({ token: done.token })).not.toBeNull();
+
+    // mfa 单用途：成功即焚——同一 mfaToken 再换一枚会话 → 401
+    const replay = await call(b.routes, 'POST', '/auth/login/2fa', {
+      body: { mfaToken: mfa.mfaToken, totp: '123456' },
+    });
+    expectFail(replay, 401, 'HARNESS-1006');
+  });
+
+  it('login 已绑定带码：对码直接会话（与 login/2fa 等价）；错码 → 401 "invalid 2fa code"', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    await login(b, 'owner', ROOT_TOKEN);
+
+    const bad = await call(b.routes, 'POST', '/auth/login', {
+      body: { username: 'owner', password: ROOT_TOKEN, totp: '000000' },
+    });
+    expectFail(bad, 401, 'HARNESS-1006');
+    expect(bad).toMatchObject({ body: { message: 'invalid 2fa code' } });
+
+    const ok = (await call(b.routes, 'POST', '/auth/login', {
+      body: { username: 'owner', password: ROOT_TOKEN, totp: '123456' },
+    })) as { token: string; mfaRequired?: boolean; enrollmentRequired?: boolean };
+    expect(ok.token).toMatch(/^ses_[0-9a-f]{48}$/);
+    expect(ok.mfaRequired).toBeUndefined();
+    expect(ok.enrollmentRequired).toBeUndefined();
+  });
+
+  it('enr/mfa 令牌门：未知令牌 → 401 "enrollment/mfa token expired or invalid"；enroll 缺 code → 400 1009', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    const ghost = 'enr_' + '0'.repeat(48);
+    const ghostMfa = 'mfa_' + '0'.repeat(48);
+    const msg = 'enrollment/mfa token expired or invalid';
+
+    const setupRes = await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: ghost } });
+    expectFail(setupRes, 401, 'HARNESS-1006');
+    expect(setupRes).toMatchObject({ body: { message: msg } });
+    const enrollRes = await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken: ghost, code: '123456' } });
+    expectFail(enrollRes, 401, 'HARNESS-1006');
+    expect(enrollRes).toMatchObject({ body: { message: msg } });
+    const mfaRes = await call(b.routes, 'POST', '/auth/login/2fa', { body: { mfaToken: ghostMfa, totp: '123456' } });
+    expectFail(mfaRes, 401, 'HARNESS-1006');
+    expect(mfaRes).toMatchObject({ body: { message: msg } });
+    // 缺 enrollToken / 缺 code：同一令牌门 / 入参形状语义
+    expectFail(await call(b.routes, 'GET', '/2fa/setup', { query: {} }), 401, 'HARNESS-1006');
+
+    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    expectFail(
+      await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken: unbound.enrollToken } }),
+      400,
+      'HARNESS-1009',
+    );
+  });
+
+  it('enr 错码不消费：错码 400 后原令牌重试对码仍可成功', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    expectFail(
+      await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken: unbound.enrollToken, code: '999999' } }),
+      400,
+      'HARNESS-1008',
+    );
+    const done = await enroll(b, unbound.enrollToken); // 原令牌原流程
+    expect(done.token).toMatch(/^ses_[0-9a-f]{48}$/);
+  });
+
+  it('GET /2fa/setup 可重复调用刷新 pending secret（重扫二维码语义），刷新后 enroll 对新 secret 生效', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    const s1 = (await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: unbound.enrollToken } })) as {
+      uri: string;
+      secret: string;
+    };
+    const s2 = (await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: unbound.enrollToken } })) as {
+      uri: string;
+      secret: string;
+    };
+    expect(s2.uri).toContain('owner');
+    expect(typeof s2.secret).toBe('string');
+    expect(s2.secret.length).toBeGreaterThan(0);
+    // 桩下 secret 恒定，但"以最后一次 setup 为准"的语义由 enroll 成功兜底验证
+    expect(s1.uri).toEqual(s2.uri);
+    const done = await enroll(b, unbound.enrollToken);
+    expect(done.token).toMatch(/^ses_[0-9a-f]{48}$/);
+  });
+
+  it('POST /auth/2fa/disable：密码错 401；totp 错码 401；全对 → {ok:true} 清 2FA；再登录强制重绑', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    const ses = await login(b, 'owner', ROOT_TOKEN);
+
+    const badPw = await call(b.routes, 'POST', '/auth/2fa/disable', {
+      headers: bearer(ses.token),
+      body: { password: 'not-the-password', code: '123456' },
+    });
+    expectFail(badPw, 401, 'HARNESS-1006');
+    expect(badPw).toMatchObject({ body: { message: 'invalid credentials' } });
+    const badCode = await call(b.routes, 'POST', '/auth/2fa/disable', {
+      headers: bearer(ses.token),
+      body: { password: ROOT_TOKEN, code: '000000' },
+    });
+    expectFail(badCode, 401, 'HARNESS-1006');
+    expect(badCode).toMatchObject({ body: { message: 'invalid 2fa code' } });
+    // 失败路径不解绑
+    expect(
+      (b.db.prepare('SELECT totp_enabled FROM users WHERE username = ?').get('owner') as { totp_enabled: number })
+        .totp_enabled,
+    ).toBe(1);
+
+    // 匿名 / API Key 不可调用（会话门）
+    expectFail(await call(b.routes, 'POST', '/auth/2fa/disable', { body: { password: ROOT_TOKEN, code: '123456' } }), 401, 'HARNESS-1006');
+
+    const ok = await call(b.routes, 'POST', '/auth/2fa/disable', {
+      headers: bearer(ses.token),
+      body: { password: ROOT_TOKEN, code: '123456' },
+    });
+    expect(ok).toEqual({ ok: true });
+    const row = b.db.prepare('SELECT totp_enabled, totp_secret FROM users WHERE username = ?').get('owner') as {
+      totp_enabled: number;
+      totp_secret: string | null;
+    };
+    expect(row.totp_enabled).toBe(0);
+    expect(row.totp_secret).toBeNull();
+    // 解绑后当前会话仍有效，但再次 disable 幂等 {ok:true}（无需 totp 码）
+    expect(await b.getProvider()({ token: ses.token })).not.toBeNull();
+    expect(
+      await call(b.routes, 'POST', '/auth/2fa/disable', {
+        headers: bearer(ses.token),
+        body: { password: ROOT_TOKEN, code: '000000' },
+      }),
+    ).toEqual({ ok: true });
+    // 下次登录强制重新绑定（与「强制 2FA」一致）
+    await loginUnbound(b, 'owner', ROOT_TOKEN);
+  });
+
+  it('内存令牌过期：expiresAt 翻到过去 → enr/mfa 一律 401 "enrollment/mfa token expired or invalid"', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    // 篡改扩展 VM 内 AUTH_MEM_TOKENS 全部条目为已过期（等价 TTL 流逝；现有测试手法无注入时钟）
+    b.runInVm('AUTH_MEM_TOKENS.forEach(function (v) { v.expiresAt = 0; })');
+    const msg = 'enrollment/mfa token expired or invalid';
+    const setupRes = await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: unbound.enrollToken } });
+    expectFail(setupRes, 401, 'HARNESS-1006');
+    expect(setupRes).toMatchObject({ body: { message: msg } });
+    const enrollRes = await call(b.routes, 'POST', '/2fa/enroll', {
+      body: { enrollToken: unbound.enrollToken, code: '123456' },
+    });
+    expectFail(enrollRes, 401, 'HARNESS-1006');
+    expect(enrollRes).toMatchObject({ body: { message: msg } });
+
+    // mfa 令牌同样受过期语义约束
+    await login(b, 'owner', ROOT_TOKEN); // 重新绑定
+    const mfa = await loginMfa(b, 'owner', ROOT_TOKEN);
+    b.runInVm('AUTH_MEM_TOKENS.forEach(function (v) { v.expiresAt = 0; })');
+    const mfaRes = await call(b.routes, 'POST', '/auth/login/2fa', {
+      body: { mfaToken: mfa.mfaToken, totp: '123456' },
+    });
+    expectFail(mfaRes, 401, 'HARNESS-1006');
+    expect(mfaRes).toMatchObject({ body: { message: msg } });
+  });
+
+  it('canned 可编程：改写罐头码表后，只有新码可过 verify（totpVerify 桩按表判定）', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    b.totpOkCodes.length = 0;
+    b.totpOkCodes.push('654321');
+    // 默认码 '123456' 已不再是合法码
+    expectFail(
+      await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken: unbound.enrollToken, code: '123456' } }),
+      400,
+      'HARNESS-1008',
+    );
+    const done = await enroll(b, unbound.enrollToken, '654321');
+    expect(done.token).toMatch(/^ses_[0-9a-f]{48}$/);
+    // 会话内 disable 也按新罐头码判定
+    expectFail(
+      await call(b.routes, 'POST', '/auth/2fa/disable', {
+        headers: bearer(done.token),
+        body: { password: ROOT_TOKEN, code: '123456' },
+      }),
+      401,
+      'HARNESS-1006',
+    );
+    expect(
+      await call(b.routes, 'POST', '/auth/2fa/disable', {
+        headers: bearer(done.token),
+        body: { password: ROOT_TOKEN, code: '654321' },
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it('源码卫生（2FA 增量）：无 console.* / require( / process.，内存令牌不落库（SQL 行无 enr_/mfa_）', () => {
+    expect(src).not.toMatch(/\bconsole\./);
+    expect(src).not.toMatch(/\brequire\s*\(/);
+    expect(src).not.toMatch(/\bprocess\./);
+    // enr/mfa 只存内存 Map：任何含 SQL 关键字的行都不得出现 enr_/mfa_ 令牌字面量
+    for (const line of src.split('\n')) {
+      if (/INSERT INTO|UPDATE\s|DELETE FROM|SELECT\s/.test(line)) {
+        expect(line).not.toContain('enr_');
+        expect(line).not.toContain('mfa_');
+      }
+    }
+    // users 表携带 TOTP 列（新库直建 + 旧库 ALTER 迁移双通道）
+    expect(src).toContain('totp_secret TEXT');
+    expect(src).toContain('totp_enabled INTEGER DEFAULT 0');
+    expect(src).toContain('PRAGMA table_info(users)');
   });
 });

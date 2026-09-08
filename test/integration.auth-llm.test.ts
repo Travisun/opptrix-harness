@@ -4,7 +4,8 @@
  * 覆盖 auth 内置扩展与 LLM Gateway 的完整接线链路：
  * - builtin 自动启用：boot 后 auth 扩展 enabled=true（manager 首次登记 builtin 行即 enabled）；
  * - rootToken 注入链：Kernel loadBootstrap（仅 builtin auth）→ worker 注入闸 → h.boot/ctx →
- *   auth 扩展 owner 引导 → POST /api/v1/auth/login（owner 密码 = rootToken）→ ses_ 会话；
+ *   auth 扩展 owner 引导 → POST /api/v1/auth/login（owner 密码 = rootToken）→
+ *   强制 2FA：enrollmentRequired → /2fa/setup + /2fa/enroll（真实 otplib TOTP）→ ses_ 会话；
  * - AuthProvider 接线：ses/ak 令牌经 authChecker → AuthProviderRegistry → host.authVerify
  *   → worker 校验（核心断言：GET /api/v1/system/info 用 ses 令牌 200）；
  * - mount 路由：auth 扩展声明的 '/auth/*'、'/users*' 挂载到 /api/v1 前缀；
@@ -31,6 +32,8 @@ import type { FastifyInstance } from 'fastify';
 
 import { CONTAINER_KEYS, Kernel } from '../src/kernel/Kernel.js';
 import { loadConfig } from '../src/kernel/config/index.js';
+// 强制 2FA E2E：enroll 码用 otplib 按 setup 返回的真 secret 现算（内核 totpVerify 同库校验）
+import { generate as totpGenerateCode } from 'otplib';
 
 // ---------------------------------------------------------------------------
 // 环境：真实 Kernel（临时 dataDir、端口 0、静音日志、dev worker、固定 rootToken）
@@ -57,6 +60,43 @@ const mockSeen: { authz: Array<string | undefined>; bodies: unknown[] } = { auth
 let ownerSes = '';
 let akToken = '';
 let bobSes = '';
+/** owner enrollment 时的 TOTP secret（re-enable 用例走"login 带 totp 直登"分支复用） */
+let ownerTotpSecret = '';
+
+/**
+ * 强制 2FA enrollment 全链（真实内核 totpGenerate/totpVerify）：
+ * login → enrollmentRequired → GET /ext/auth/2fa/setup → otplib 现算码 → POST /ext/auth/2fa/enroll → 会话。
+ * 注：/2fa/* 未加入内核 auth-mount 前缀（auth→/api/v1/auth|users），此处走 /ext/{id}/* 通配派发；
+ * mount 前缀接线属内核集成工作包（见 extensions/auth/README.md「集成对齐点」）。
+ */
+async function enrollLogin(username: string, password: string): Promise<{
+  token: string;
+  user: { username: string; role: string };
+  secret: string;
+}> {
+  const first = await app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/login',
+    payload: { username, password },
+  });
+  expect(first.statusCode).toBe(200);
+  const step1 = first.json() as { enrollmentRequired?: boolean; enrollToken?: string; token?: string };
+  expect(step1.enrollmentRequired).toBe(true);
+  expect(step1.token).toBeUndefined(); // 强制 2FA：未绑定不放行会话
+
+  const setup = await app.inject({ method: 'GET', url: `/ext/auth/2fa/setup?enrollToken=${step1.enrollToken}` });
+  expect(setup.statusCode).toBe(200);
+  const { secret } = setup.json() as { uri: string; secret: string };
+
+  const enroll = await app.inject({
+    method: 'POST',
+    url: '/ext/auth/2fa/enroll',
+    payload: { enrollToken: step1.enrollToken, code: await totpGenerateCode({ secret }) },
+  });
+  expect(enroll.statusCode).toBe(200);
+  const body = enroll.json() as { token: string; user: { username: string; role: string } };
+  return { ...body, secret };
+}
 
 beforeAll(async () => {
   dataDir = await mkdtemp(path.join(tmpdir(), 'opptrix-auth-llm-'));
@@ -166,17 +206,12 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(authExt?.mount).toBe('auth');
   });
 
-  it('POST /api/v1/auth/login owner/rootToken → 200 ses_ 令牌（rootToken 注入 → owner 引导生效）', async () => {
-    const res = await app.inject({
-      method: 'POST',
-      url: '/api/v1/auth/login',
-      payload: { username: 'owner', password: ROOT_TOKEN },
-    });
-    expect(res.statusCode).toBe(200);
-    const body = res.json() as { token: string; user: { username: string; role: string } };
+  it('POST /api/v1/auth/login owner/rootToken → 强制 2FA enrollment → ses_ 令牌（rootToken 注入 → owner 引导生效）', async () => {
+    const body = await enrollLogin('owner', ROOT_TOKEN);
     expect(body.token).toMatch(/^ses_[0-9a-f]{48}$/);
     expect(body.user).toMatchObject({ username: 'owner', role: 'admin' });
     ownerSes = body.token;
+    ownerTotpSecret = body.secret;
   });
 
   it('GET /api/v1/auth/me（ses ?token=）→ owner/admin/session（SEC-7：auth mount 派发裁剪 authorization，凭据走 query 通道）', async () => {
@@ -218,7 +253,7 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(res.json()).toMatchObject({ code: 'HARNESS-1006' });
   });
 
-  it('bob（normal）：admin 建号 → login → PUT /api/v1/llm/providers → 403', async () => {
+  it('bob（normal）：admin 建号 → login（强制 2FA 同样 enrollment）→ PUT /api/v1/llm/providers → 403', async () => {
     const created = await app.inject({
       method: 'POST',
       url: `/api/v1/users?token=${ownerSes}`,
@@ -227,13 +262,8 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(created.statusCode).toBe(200);
     expect(created.json()).toMatchObject({ username: 'bob', role: 'normal' });
 
-    const login = await app.inject({
-      method: 'POST',
-      url: '/api/v1/auth/login',
-      payload: { username: 'bob', password: 'bob-pass-8' },
-    });
-    expect(login.statusCode).toBe(200);
-    bobSes = (login.json() as { token: string }).token;
+    const body = await enrollLogin('bob', 'bob-pass-8'); // 强制 2FA 对 normal 用户一视同仁
+    bobSes = body.token;
 
     const put = await app.inject({
       method: 'PUT',
@@ -352,7 +382,7 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(res.json()).toMatchObject({ name: 'opptrix-harness' });
   });
 
-  it('re-enable auth → login 又可用（新会话生效，路由恢复）', async () => {
+  it('re-enable auth → login 又可用（owner 已绑 2FA：带 totp 直登新会话，路由恢复）', async () => {
     const on = await app.inject({
       method: 'POST',
       url: '/api/v1/extensions/auth/enable',
@@ -360,10 +390,23 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     });
     expect(on.statusCode).toBe(200);
 
-    const login = await app.inject({
+    // owner 已绑定 TOTP：不带码 → mfaRequired；带码 → 直接签发会话
+    const noTotp = await app.inject({
       method: 'POST',
       url: '/api/v1/auth/login',
       payload: { username: 'owner', password: ROOT_TOKEN },
+    });
+    expect(noTotp.statusCode).toBe(200);
+    expect(noTotp.json()).toMatchObject({ mfaRequired: true });
+
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      payload: {
+        username: 'owner',
+        password: ROOT_TOKEN,
+        totp: await totpGenerateCode({ secret: ownerTotpSecret }),
+      },
     });
     expect(login.statusCode).toBe(200);
     expect((login.json() as { token: string }).token).toMatch(/^ses_[0-9a-f]{48}$/);

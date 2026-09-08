@@ -38,12 +38,20 @@ declare global {
     rootToken?: string;
   }
 
-  /** 内核密码原语（scrypt，经内核 auth.* topic；调用方 manifest 需声明 'auth:provider' 权限） */
+  /** 内核密码/摘要/TOTP 原语（经内核 auth.* topic；调用方 manifest 需声明 'auth:provider' 权限） */
   interface AuthApi {
     /** 哈希明文密码 → 自描述 scrypt 串（`scrypt$N$r$p$salt_hex$key_hex`，每次新鲜随机盐） */
     hashPassword(password: string): Promise<string>;
     /** 校验明文密码与 hash；hash 格式非法/参数越界一律 false（不抛） */
     verifyPassword(password: string, hash: string): Promise<boolean>;
+    /** 计算任意字符串的 SHA-256 十六进制摘要（令牌脱敏存储等用途）→ { hash: 64 位小写 hex } */
+    hashToken(value: string): Promise<{ hash: string }>;
+    /** 生成 TOTP 密钥：account 进 otpauth URI label（`otpauth://totp/Opptrix%20Harness:<account>`） */
+    totpGenerate(account: string): Promise<{ secret: string; uri: string }>;
+    /** 校验 TOTP 令牌（window ±1）；格式非法一律 ok:false（不抛） */
+    totpVerify(input: { secret: string; token: string }): Promise<{ ok: boolean; delta: number | null }>;
+    /** 常数时间校验内核 root 令牌（break-glass；令牌本身从不落库） */
+    verifyRootToken(token: string): Promise<{ ok: boolean }>;
   }
 
   /**

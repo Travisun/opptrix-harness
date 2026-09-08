@@ -214,7 +214,7 @@ describe('webui 构建产物与部署面（React 产物）', () => {
     expect(theme).toContain("'compact'");
   });
 
-  it('8. 路由注册完整性：router.tsx 含 HashRouter + /login + 全部 11 条主导航 + 兜底', () => {
+  it('8. 路由注册完整性：router.tsx 含 HashRouter + /login + 全部 11 条主导航 + /onboarding + 兜底', () => {
     const router = readFileSync(path.join(UI_SRC, 'router.tsx'), 'utf8');
     expect(router).toContain('HashRouter');
     const routes = [
@@ -230,6 +230,8 @@ describe('webui 构建产物与部署面（React 产物）', () => {
       '/logs',
       '/settings',
       '/update',
+      // ★ W2 onboarding 向导包追加：/onboarding 公开路由（首次初始化向导，不入主导航）
+      '/onboarding',
     ];
     for (const r of routes) {
       expect(router, `route missing: ${r}`).toContain(`path="${r}"`);
@@ -237,9 +239,12 @@ describe('webui 构建产物与部署面（React 产物）', () => {
     // 兜底重定向（未知 hash → 仪表盘），与认证守卫
     expect(router).toContain('path="*"');
     expect(router).toContain('RequireAuth');
-    // 与导航单一数据源对账：NAV_GROUPS 恰好覆盖同一组路径（不含 /login）
+    // ★ W2 onboarding 向导包追加：启动探测网关（needsOnboarding=true 且无 token → 强制 /onboarding）
+    expect(router).toContain('OnboardingGate');
+    expect(router).toContain('/api/v1/auth/onboarding/status');
+    // 与导航单一数据源对账：NAV_GROUPS 恰好覆盖同一组路径（不含 /login，★亦不含引导专用 /onboarding）
     const nav = readFileSync(path.join(UI_SRC, 'lib', 'nav.tsx'), 'utf8');
-    for (const r of routes.filter((r) => r !== '/login')) {
+    for (const r of routes.filter((r) => r !== '/login' && r !== '/onboarding')) {
       expect(nav, `nav missing: ${r}`).toContain(`path: '${r}'`);
     }
   });

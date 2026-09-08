@@ -99,6 +99,8 @@ async function toApiError(res: Response): Promise<ApiError> {
 export interface RequestOptions {
   /** true 时不自动 toast（调用方自行渲染错误态，如登录页） */
   silent?: boolean;
+  /** true 时 401 不清凭据/跳登录（公开 auth 端点的 401 属业务语义：root 令牌错误、动态码错误等） */
+  skipAuthRedirect?: boolean;
   /** 原始 body（对象 → JSON；FormData 原样交由浏览器补 multipart boundary） */
   body?: unknown;
 }
@@ -122,7 +124,7 @@ async function request<T>(method: string, path: string, opts: RequestOptions = {
     if (opts.silent !== true) toast.error(`[${err.code}] ${err.message}`);
     throw err;
   }
-  if (res.status === 401) {
+  if (res.status === 401 && opts.skipAuthRedirect !== true) {
     clearToken();
     gotoLogin();
   }
@@ -158,6 +160,73 @@ export interface LoginResult {
   token: string;
   expiresAt: number;
   user: { id: string; username: string; role: string };
+}
+
+// ---------------------------------------------------------------------------
+// Auth 公开端点（onboarding 向导 / 2FA 绑定 — 与 auth 扩展端点契约逐字对齐；
+// 全部相对根 /api/v1/auth，调用走上面的 request 核心，401 不跳登录）
+// ---------------------------------------------------------------------------
+
+/** 公开 auth 调用公共选项：401 属业务语义（root 令牌错误/动态码错误），错误由调用方呈现 */
+const AUTH_PUBLIC: RequestOptions = { silent: true, skipAuthRedirect: true };
+
+/** GET /api/v1/auth/onboarding/status 响应（公开） */
+export interface OnboardingStatusResult {
+  needsOnboarding: boolean;
+}
+
+/** POST /api/v1/auth/onboarding 成功响应（owner 创建/重置成功 → 进入强制 2FA 绑定） */
+export interface OnboardingEnrollRequired {
+  enrollmentRequired: true;
+  enrollToken: string;
+}
+
+/** GET /api/v1/auth/2fa/setup 响应（uri 供二维码渲染，secret 供手输） */
+export interface TwoFactorSetupResult {
+  uri: string;
+  secret: string;
+}
+
+/** POST /api/v1/auth/2fa/enroll 成功响应（绑定成功并签发会话） */
+export interface TwoFactorEnrollResult {
+  token: string;
+  user: LoginResult['user'];
+}
+
+/** POST /api/v1/auth/login 的三种 200 形状（调用方按 mfaRequired/enrollmentRequired 字段判别） */
+export type LoginResponse =
+  | LoginResult
+  | { mfaRequired: true; mfaToken: string }
+  | { enrollmentRequired: true; enrollToken: string };
+
+/** GET /api/v1/auth/onboarding/status（公开）：系统是否尚未初始化 */
+export function getOnboardingStatus(): Promise<OnboardingStatusResult> {
+  return api.get<OnboardingStatusResult>('/api/v1/auth/onboarding/status', AUTH_PUBLIC);
+}
+
+/** POST /api/v1/auth/onboarding（公开）：root 令牌验证 + 创建/重置 owner 账号 */
+export function postOnboarding(body: {
+  rootToken: string;
+  username: string;
+  password: string;
+}): Promise<OnboardingEnrollRequired> {
+  return api.post<OnboardingEnrollRequired>('/api/v1/auth/onboarding', body, AUTH_PUBLIC);
+}
+
+/** GET /api/v1/auth/2fa/setup?enrollToken=<t>（公开）：取 otpauth uri 与手输 secret */
+export function getTwoFactorSetup(enrollToken: string): Promise<TwoFactorSetupResult> {
+  return api.get<TwoFactorSetupResult>(
+    `/api/v1/auth/2fa/setup?enrollToken=${encodeURIComponent(enrollToken)}`,
+    AUTH_PUBLIC,
+  );
+}
+
+/** POST /api/v1/auth/2fa/enroll（公开）：绑定认证器，成功即签发会话 */
+export function postTwoFactorEnroll(body: {
+  enrollToken: string;
+  code: string;
+}): Promise<TwoFactorEnrollResult> {
+  return api.post<TwoFactorEnrollResult>('/api/v1/auth/2fa/enroll', body, AUTH_PUBLIC);
 }
 
 /** GET /api/v1/auth/me 响应（auth 扩展） */
