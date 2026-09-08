@@ -216,7 +216,7 @@ async function enroll(
   enrollToken: string,
   code = '123456',
 ): Promise<{ token: string; expiresAt: number; user: { id: string; username: string; role: string } }> {
-  const res = (await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken, code } })) as {
+  const res = (await call(b.routes, 'POST', '/auth/2fa/enroll', { body: { enrollToken, code } })) as {
     token?: string;
     expiresAt?: number;
     user?: { id: string; username: string; role: string };
@@ -294,20 +294,20 @@ describe('auth 扩展 · 激活期（setup）', () => {
     const expected = [
       'DELETE /auth/api-keys/:id',
       'DELETE /users/:id',
-      'GET /2fa/setup',
+      'GET /auth/2fa/setup',
       'GET /auth/api-keys',
       'GET /auth/me',
-      'GET /onboarding/status',
+      'GET /auth/onboarding/status',
       'GET /users',
       'PATCH /users/:id',
-      'POST /2fa/enroll',
       'POST /auth/2fa/disable',
+      'POST /auth/2fa/enroll',
       'POST /auth/api-keys',
       'POST /auth/change-password',
       'POST /auth/login',
       'POST /auth/login/2fa',
       'POST /auth/logout',
-      'POST /onboarding',
+      'POST /auth/onboarding',
       'POST /users',
     ];
     expect([...b.routes.keys()].sort()).toEqual(expected);
@@ -854,21 +854,21 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('GET /onboarding/status：users 空表 → true；建号后 → false（幂等可重复查）', async () => {
     const b = boot(); // 无 rootToken：不引导 owner，users 保持空表
     await b.activate();
-    expect(await call(b.routes, 'GET', '/onboarding/status')).toEqual({ needsOnboarding: true });
-    await call(b.routes, 'POST', '/onboarding', { body: { rootToken: ROOT_TOKEN, password: 'owner-pass-8' } });
-    expect(await call(b.routes, 'GET', '/onboarding/status')).toEqual({ needsOnboarding: false });
-    expect(await call(b.routes, 'GET', '/onboarding/status')).toEqual({ needsOnboarding: false });
+    expect(await call(b.routes, 'GET', '/auth/onboarding/status')).toEqual({ needsOnboarding: true });
+    await call(b.routes, 'POST', '/auth/onboarding', { body: { rootToken: ROOT_TOKEN, password: 'owner-pass-8' } });
+    expect(await call(b.routes, 'GET', '/auth/onboarding/status')).toEqual({ needsOnboarding: false });
+    expect(await call(b.routes, 'GET', '/auth/onboarding/status')).toEqual({ needsOnboarding: false });
   });
 
   it('POST /onboarding：rootToken 错 → 401 HARNESS-1006 "root token verification failed"（users 表零写入）', async () => {
     const b = boot();
     await b.activate();
-    const bad = await call(b.routes, 'POST', '/onboarding', {
+    const bad = await call(b.routes, 'POST', '/auth/onboarding', {
       body: { rootToken: 'f'.repeat(63) + 'e', password: 'owner-pass-8' },
     });
     expectFail(bad, 401, 'HARNESS-1006');
     expect(bad).toMatchObject({ body: { message: 'root token verification failed' } });
-    const missing = await call(b.routes, 'POST', '/onboarding', { body: { password: 'owner-pass-8' } });
+    const missing = await call(b.routes, 'POST', '/auth/onboarding', { body: { password: 'owner-pass-8' } });
     expectFail(missing, 401, 'HARNESS-1006');
     const count = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
     expect(count.n).toBe(0);
@@ -878,12 +878,12 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     const b = boot();
     await b.activate();
     expectFail(
-      await call(b.routes, 'POST', '/onboarding', { body: { rootToken: ROOT_TOKEN, password: 'short' } }),
+      await call(b.routes, 'POST', '/auth/onboarding', { body: { rootToken: ROOT_TOKEN, password: 'short' } }),
       400,
       'HARNESS-1009',
     );
     expectFail(
-      await call(b.routes, 'POST', '/onboarding', {
+      await call(b.routes, 'POST', '/auth/onboarding', {
         body: { rootToken: ROOT_TOKEN, password: 'owner-pass-8', username: 'x'.repeat(101) },
       }),
       400,
@@ -894,7 +894,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('fresh onboarding 全链：enrollToken → setup 出 uri/secret → enroll 错码 400 → 对码会话 + totp_enabled=1', async () => {
     const b = boot();
     await b.activate();
-    const onb = (await call(b.routes, 'POST', '/onboarding', {
+    const onb = (await call(b.routes, 'POST', '/auth/onboarding', {
       body: { rootToken: ROOT_TOKEN, password: 'owner-pass-8' }, // username 缺省 → owner
     })) as { enrollmentRequired: boolean; enrollToken: string };
     expect(onb.enrollmentRequired).toBe(true);
@@ -908,7 +908,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expect(await passwords.verify(ROOT_TOKEN, owner.password_hash)).toBe(false);
 
     // setup：enr 门内出 otpauth URI 与 secret（label 带 username），pending secret 暂存内存
-    const setupRes = (await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: onb.enrollToken } })) as {
+    const setupRes = (await call(b.routes, 'GET', '/auth/2fa/setup', { query: { enrollToken: onb.enrollToken } })) as {
       uri: string;
       secret: string;
     };
@@ -918,7 +918,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expect(setupRes.secret.length).toBeGreaterThan(0);
 
     // enroll 错码 → 400 HARNESS-1008 "invalid 2fa code"，且不消费 enr（可重试）、不写库
-    const badCode = await call(b.routes, 'POST', '/2fa/enroll', {
+    const badCode = await call(b.routes, 'POST', '/auth/2fa/enroll', {
       body: { enrollToken: onb.enrollToken, code: '000000' },
     });
     expectFail(badCode, 400, 'HARNESS-1008');
@@ -930,7 +930,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
 
     // 对码 → 会话 + totp 落库
     const before = Date.now();
-    const done = (await call(b.routes, 'POST', '/2fa/enroll', {
+    const done = (await call(b.routes, 'POST', '/auth/2fa/enroll', {
       body: { enrollToken: onb.enrollToken, code: '123456' },
     })) as { token: string; expiresAt: number; user: { id: string; username: string; role: string } };
     expect(done.token).toMatch(/^ses_[0-9a-f]{48}$/);
@@ -945,7 +945,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expect(await b.getProvider()({ token: done.token })).toMatchObject({ userId: owner.id, role: 'admin' });
 
     // enr 单次消费：enroll 成功即焚——再用同一令牌（对码）→ 401
-    const replay = await call(b.routes, 'POST', '/2fa/enroll', {
+    const replay = await call(b.routes, 'POST', '/auth/2fa/enroll', {
       body: { enrollToken: onb.enrollToken, code: '123456' },
     });
     expectFail(replay, 401, 'HARNESS-1006');
@@ -961,7 +961,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     })) as { token: string };
     expect(await b.getProvider()({ token: key.token })).not.toBeNull();
 
-    const reset = (await call(b.routes, 'POST', '/onboarding', {
+    const reset = (await call(b.routes, 'POST', '/auth/onboarding', {
       body: { rootToken: ROOT_TOKEN, password: 'reset-pass-8' },
     })) as { enrollmentRequired: boolean; enrollToken: string };
     expect(reset.enrollmentRequired).toBe(true);
@@ -1055,21 +1055,21 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     const ghostMfa = 'mfa_' + '0'.repeat(48);
     const msg = 'enrollment/mfa token expired or invalid';
 
-    const setupRes = await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: ghost } });
+    const setupRes = await call(b.routes, 'GET', '/auth/2fa/setup', { query: { enrollToken: ghost } });
     expectFail(setupRes, 401, 'HARNESS-1006');
     expect(setupRes).toMatchObject({ body: { message: msg } });
-    const enrollRes = await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken: ghost, code: '123456' } });
+    const enrollRes = await call(b.routes, 'POST', '/auth/2fa/enroll', { body: { enrollToken: ghost, code: '123456' } });
     expectFail(enrollRes, 401, 'HARNESS-1006');
     expect(enrollRes).toMatchObject({ body: { message: msg } });
     const mfaRes = await call(b.routes, 'POST', '/auth/login/2fa', { body: { mfaToken: ghostMfa, totp: '123456' } });
     expectFail(mfaRes, 401, 'HARNESS-1006');
     expect(mfaRes).toMatchObject({ body: { message: msg } });
     // 缺 enrollToken / 缺 code：同一令牌门 / 入参形状语义
-    expectFail(await call(b.routes, 'GET', '/2fa/setup', { query: {} }), 401, 'HARNESS-1006');
+    expectFail(await call(b.routes, 'GET', '/auth/2fa/setup', { query: {} }), 401, 'HARNESS-1006');
 
     const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
     expectFail(
-      await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken: unbound.enrollToken } }),
+      await call(b.routes, 'POST', '/auth/2fa/enroll', { body: { enrollToken: unbound.enrollToken } }),
       400,
       'HARNESS-1009',
     );
@@ -1080,7 +1080,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     await b.activate();
     const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
     expectFail(
-      await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken: unbound.enrollToken, code: '999999' } }),
+      await call(b.routes, 'POST', '/auth/2fa/enroll', { body: { enrollToken: unbound.enrollToken, code: '999999' } }),
       400,
       'HARNESS-1008',
     );
@@ -1092,11 +1092,11 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
     const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
-    const s1 = (await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: unbound.enrollToken } })) as {
+    const s1 = (await call(b.routes, 'GET', '/auth/2fa/setup', { query: { enrollToken: unbound.enrollToken } })) as {
       uri: string;
       secret: string;
     };
-    const s2 = (await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: unbound.enrollToken } })) as {
+    const s2 = (await call(b.routes, 'GET', '/auth/2fa/setup', { query: { enrollToken: unbound.enrollToken } })) as {
       uri: string;
       secret: string;
     };
@@ -1165,10 +1165,10 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     // 篡改扩展 VM 内 AUTH_MEM_TOKENS 全部条目为已过期（等价 TTL 流逝；现有测试手法无注入时钟）
     b.runInVm('AUTH_MEM_TOKENS.forEach(function (v) { v.expiresAt = 0; })');
     const msg = 'enrollment/mfa token expired or invalid';
-    const setupRes = await call(b.routes, 'GET', '/2fa/setup', { query: { enrollToken: unbound.enrollToken } });
+    const setupRes = await call(b.routes, 'GET', '/auth/2fa/setup', { query: { enrollToken: unbound.enrollToken } });
     expectFail(setupRes, 401, 'HARNESS-1006');
     expect(setupRes).toMatchObject({ body: { message: msg } });
-    const enrollRes = await call(b.routes, 'POST', '/2fa/enroll', {
+    const enrollRes = await call(b.routes, 'POST', '/auth/2fa/enroll', {
       body: { enrollToken: unbound.enrollToken, code: '123456' },
     });
     expectFail(enrollRes, 401, 'HARNESS-1006');
@@ -1193,7 +1193,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     b.totpOkCodes.push('654321');
     // 默认码 '123456' 已不再是合法码
     expectFail(
-      await call(b.routes, 'POST', '/2fa/enroll', { body: { enrollToken: unbound.enrollToken, code: '123456' } }),
+      await call(b.routes, 'POST', '/auth/2fa/enroll', { body: { enrollToken: unbound.enrollToken, code: '123456' } }),
       400,
       'HARNESS-1008',
     );

@@ -82,7 +82,7 @@ async function waitFor(what: string, pred: () => Promise<boolean>, timeoutMs = 1
 
 /**
  * 强制 2FA enrollment 全链（真实内核 totpGenerate/totpVerify）：
- * login → enrollmentRequired → GET /ext/auth/2fa/setup → otplib 现算码 → POST /ext/auth/2fa/enroll → 会话。
+ * login → enrollmentRequired → GET /api/v1/auth/2fa/setup → otplib 现算码 → POST /api/v1/auth/2fa/enroll → 会话。
  * 注：/2fa/* 未加入内核 auth-mount 前缀（auth→/api/v1/auth|users），此处走 /ext/{id}/* 通配派发；
  * mount 前缀接线属内核集成工作包（见 extensions/auth/README.md「集成对齐点」）。
  */
@@ -97,13 +97,13 @@ async function enrollLogin(username: string, password: string): Promise<string> 
   expect(step1.enrollmentRequired).toBe(true);
   expect(step1.token).toBeUndefined(); // 强制 2FA：未绑定不放行会话
 
-  const setup = await app.inject({ method: 'GET', url: `/ext/auth/2fa/setup?enrollToken=${step1.enrollToken}` });
+  const setup = await app.inject({ method: 'GET', url: `/api/v1/auth/2fa/setup?enrollToken=${step1.enrollToken}` });
   expect(setup.statusCode).toBe(200);
   const { secret } = setup.json() as { uri: string; secret: string };
 
   const enroll = await app.inject({
     method: 'POST',
-    url: '/ext/auth/2fa/enroll',
+    url: '/api/v1/auth/2fa/enroll',
     payload: { enrollToken: step1.enrollToken, code: await totpGenerateCode({ secret }) },
   });
   expect(enroll.statusCode).toBe(200);
