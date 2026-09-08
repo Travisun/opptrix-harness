@@ -82,6 +82,9 @@ export const KERNEL_TOPICS = {
   httpFetch: 'http.fetch',
   /** SHA-256 摘要（令牌脱敏存储等）：{ value } → { hash }（需 'auth:provider' 权限） */
   authHashToken: 'auth.hashToken',
+  authTotpGenerate: 'auth.totpGenerate',
+  authTotpVerify: 'auth.totpVerify',
+  authVerifyRootToken: 'auth.verifyRootToken',
   /** 密码哈希（内核 scrypt）：{ password } → { hash }（需 'auth:provider' 权限） */
   authHashPassword: 'auth.hashPassword',
   /** 密码校验（内核 scrypt）：{ password, hash } → { ok }（需 'auth:provider' 权限） */

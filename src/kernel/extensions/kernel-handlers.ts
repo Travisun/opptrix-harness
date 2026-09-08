@@ -37,11 +37,12 @@ import type { Knex } from 'knex';
 import { z } from 'zod';
 
 import { HOST_METHODS, KERNEL_TOPICS } from '../../extension-host/protocol.js';
-import { createPasswordSupport } from '../auth/ext-auth-support.js';
+import { createPasswordSupport, safeEqualStrings } from '../auth/ext-auth-support.js';
 import { ChatService } from '../chat/service.js';
 import { configGet } from '../config/index.js';
 import { CONTAINER_KEYS, type Kernel } from '../Kernel.js';
 import { FACADE_CONTAINER_KEYS } from '../Facades.js';
+import { generateSecret as totpGenerateSecret, generate as totpGenerateToken, verify as totpVerifyToken, generateURI as totpGenerateURI } from 'otplib';
 import { lookup } from 'node:dns/promises';
 import { createHash } from 'node:crypto';
 import { err } from '../errors/index.js';
@@ -881,6 +882,46 @@ export function createKernelHandlers(deps: {
         if (v !== null) outHeaders[h] = v;
       }
       return { status: res.status, headers: outHeaders, text };
+    },
+
+    [KERNEL_TOPICS.authTotpGenerate]: async (payload, from) => {
+      const extId = requireExtId(from, KERNEL_TOPICS.authTotpGenerate);
+      requireAuthProviderPermission(extId, KERNEL_TOPICS.authTotpGenerate);
+      const record = asRecord(payload);
+      const account = strField(record, 'account') || 'user';
+      const secret = totpGenerateSecret();
+      const uri = totpGenerateURI({ issuer: 'Opptrix Harness', label: account, secret });
+      return { secret, uri };
+    },
+
+    [KERNEL_TOPICS.authTotpVerify]: async (payload, from) => {
+      const extId = requireExtId(from, KERNEL_TOPICS.authTotpVerify);
+      requireAuthProviderPermission(extId, KERNEL_TOPICS.authTotpVerify);
+      const record = asRecord(payload);
+      const secret = strField(record, 'secret');
+      const token = strField(record, 'token');
+      if (secret === '' || token === '') {
+        throw err('BAD_REQUEST', { message: 'auth.totpVerify requires non-empty "secret" and "token"' });
+      }
+      try {
+        const result = await totpVerifyToken({ token, secret });
+        return { ok: result.valid === true, delta: result.valid === true ? result.delta ?? null : null };
+      } catch {
+        return { ok: false, delta: null };
+      }
+    },
+
+    [KERNEL_TOPICS.authVerifyRootToken]: async (payload, from) => {
+      const extId = requireExtId(from, KERNEL_TOPICS.authVerifyRootToken);
+      requireAuthProviderPermission(extId, KERNEL_TOPICS.authVerifyRootToken);
+      const record = asRecord(payload);
+      const token = strField(record, 'token');
+      const identity = kernel.container.has(CONTAINER_KEYS.authIdentity)
+        ? (kernel.container.resolve(CONTAINER_KEYS.authIdentity) as { token: string })
+        : null;
+      const expected = identity?.token ?? '';
+      const ok = expected !== '' && safeEqualStrings(token, expected);
+      return { ok };
     },
 
     [KERNEL_TOPICS.authHashToken]: async (payload, from) => {
