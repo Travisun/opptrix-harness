@@ -15,7 +15,8 @@
  * 宿主可通过 handleSignal(sig) 委托关停。
  */
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Knex } from 'knex';
@@ -50,7 +51,7 @@ import { CronJobStore } from './cron/store.js';
 import { registerCronRoutes } from '../api/cron.js';
 import { createCoreServices, type CoreServices } from './providers/core-services.js';
 import { ExtensionManager, type ExtRouteTableEntry } from './extensions/manager.js';
-import { ExtRouteRegistry, type ExtDispatchResult } from './extensions/routes.js';
+import { ExtRouteRegistry, sanitizeExtHeaders, type ExtDispatchResult } from './extensions/routes.js';
 import { ExtensionServiceRegistry } from './extensions/registry.js';
 import { createKernelHandlers, type AuthProviderRegistration } from './extensions/kernel-handlers.js';
 import { UiRegistry } from './extensions/ui-registry.js';
@@ -191,6 +192,25 @@ function defaultServerFactory(deps: ServerFactoryDeps): HttpServerLike {
 
 /** builtin auth 扩展 AuthProvider 校验的 RPC 预算（host.authVerify 往返；scrypt/SQLite 查询足够） */
 const AUTH_VERIFY_TIMEOUT_MS = 10_000;
+
+/**
+ * 仓库根目录（与 extension-host/worker-factory.ts 同款推导：本文件向上两级）。
+ * src/kernel/Kernel.ts → 仓库根；dist/kernel/Kernel.js → 仓库根。
+ */
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/**
+ * SEC-3：受信第一方扩展目录（随镜像交付的 repoRoot/extensions）。
+ * builtin / mount 声明仅对该目录下的扩展放行——/tmp 等任意目录自声明
+ * builtin/mount 一律拒绝（rootToken 与 /api/v1 挂载的防线）。
+ */
+const TRUSTED_EXTENSIONS_DIR = join(REPO_ROOT, 'extensions');
+
+/** 目录是否位于受信第一方扩展目录内（resolve 后前缀比对） */
+function isTrustedExtensionDir(dir: string): boolean {
+  const resolved = resolve(dir);
+  return resolved === TRUSTED_EXTENSIONS_DIR || resolved.startsWith(TRUSTED_EXTENSIONS_DIR + sep);
+}
 
 /**
  * builtin mount 'auth' 的路由挂载规则：扩展声明相对路径（'/auth/*'、'/users*'），
@@ -443,6 +463,14 @@ export class Kernel {
       // 自动升级窗口：updateAuto + updateFeed 同时配置才注册内核级 cron 任务
       // （extId=null 即 store 约定的内核任务——cron_jobs.ext_id IS NULL）；触发动作在 #onCronFire
       if (this.config.updateAuto && this.config.updateFeed !== '') {
+        // REL-4：boot 可能多次发生（同库重启/测试）——查 **store**（此刻调度器内存态尚未
+        // 从库水合）摘掉旧的 kernel:auto-update 行，再按新配置重排，防每次 boot 重复插行
+        const staleAutoUpdate = (await cronStore.list({ extId: null })).filter(
+          (job) => job.name === 'kernel:auto-update',
+        );
+        for (const stale of staleAutoUpdate) {
+          await cron.unschedule(stale.id); // store.delete 先行：内存未水合也生效
+        }
         await cron.schedule({
           extId: null,
           name: 'kernel:auto-update',
@@ -451,7 +479,7 @@ export class Kernel {
           payload: { kind: 'auto-update' },
         });
         this.logger.info(
-          { expr: this.config.updateWindow, channel: this.config.updateChannel },
+          { expr: this.config.updateWindow, channel: this.config.updateChannel, superseded: staleAutoUpdate.length },
           'auto-update scheduled on kernel cron',
         );
       }
@@ -585,6 +613,11 @@ export class Kernel {
           if (cmd === 'register') authProviderCallbacks.registerProvider(extId);
           else authProviderCallbacks.unregisterProvider(extId);
         },
+        // SEC-3：builtin/mount 声明的受信闸——仅 repoRoot/extensions（随镜像交付的
+        // 第一方目录）下的扩展放行；其余目录自声明一律拒绝（rootToken / 挂载防线）
+        authMounts: {
+          validateMount: (_manifest, dir) => isTrustedExtensionDir(dir),
+        },
         // UI 贡献生命周期同步：enable 提交合并片段进 UiRegistry（GET /api/v1/ui 数据源）/
         // disable·崩溃整扩展摘除（remove 对未登记 extId 幂等）
         onUiChanged: (extId, ui) => {
@@ -594,9 +627,10 @@ export class Kernel {
           }
           uiRegistry.register(extId, ui);
         },
-        // 引导态注入：仅 builtin auth 扩展携带 rootToken（worker 侧另有注入闸复核）
-        loadBootstrap: (manifest) =>
-          manifest.builtin === true && manifest.mount === 'auth'
+        // 引导态注入：仅 builtin auth 扩展携带 rootToken（worker 侧另有注入闸复核）。
+        // SEC-3：目录不受信时同样不下发（fail-closed，rootToken 不出受信目录）
+        loadBootstrap: (manifest, dir) =>
+          manifest.builtin === true && manifest.mount === 'auth' && isTrustedExtensionDir(dir)
             ? { rootToken: identity.token }
             : undefined,
       });
@@ -794,12 +828,13 @@ export class Kernel {
                   detail: { route: `${entry.method} ${entry.path}`, cause: 'extension worker is not running' },
                 });
               }
-              // 派发信封与 /ext/* 的 buildDispatchRequest 同形状（body 仅解析 POST/PUT/PATCH）
+              // 派发信封与 /ext/* 的 buildDispatchRequest 同形状（body 仅解析 POST/PUT/PATCH）；
+              // SEC-7：headers 白名单裁剪（authorization/cookie 等凭据头不下发给扩展）
               const dispatchRequest = {
                 method: request.method,
                 params,
                 query: (request.query ?? {}) as Record<string, unknown>,
-                headers: request.headers,
+                headers: sanitizeExtHeaders(request.headers as Record<string, string | string[] | undefined>),
                 body:
                   method === 'POST' || method === 'PUT' || method === 'PATCH'
                     ? (request.body ?? null)

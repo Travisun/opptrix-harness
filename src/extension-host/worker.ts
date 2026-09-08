@@ -26,6 +26,7 @@ import type { ErrorCodeName } from '../kernel/errors/index.js';
 
 import { HOST_METHODS, isRpcEnvelope, KERNEL_TOPICS } from './protocol.js';
 import type { RpcEnvelope } from './protocol.js';
+import { exposeHarnessApiInVm } from './sandbox.js';
 import {
   createContributionsCollector,
   createHarnessApi,
@@ -35,15 +36,13 @@ import {
 import type {
   AuthVerifyHandler,
   ContributionsCollector,
-  CronHandler,
   RouteHandler,
   RouteRequest,
-  ServiceHandler,
   TaskContext,
-  TaskHandler,
 } from './sandbox.js';
 import { createExtVm, createTimerRegistry } from './vm-runtime.js';
 import type { ExtVm, KernelCall, SandboxLogger, TimerRegistry } from './vm-runtime.js';
+import type { RealmBridge } from './realm.js';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -55,6 +54,11 @@ const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const SETUP_TIMEOUT_MS = 30_000;
 /** 路由 handler 未声明 timeoutMs 时的缺省超时 */
 const DEFAULT_ROUTE_TIMEOUT_MS = 30_000;
+/**
+ * worker 侧 RPC reply 负载上限（JSON 字节数；与内核 maxRpcPayloadBytes 缺省一致）。
+ * REL-1：reply 方向同样限流——超限改发错误回执，绝不把 8MB+ 数据灌进对端。
+ */
+export const WORKER_MAX_REPLY_BYTES = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // HookAbort 语义
@@ -237,6 +241,11 @@ interface PendingCall {
 }
 const pending = new Map<string, PendingCall>();
 
+/** payload 的 JSON 线大小（字节）；循环/不可序列化结构直接抛错（调用方转拒绝/丢弃） */
+function payloadWireBytes(payload: unknown): number {
+  return Buffer.byteLength(JSON.stringify(payload ?? null));
+}
+
 /** 应答回来：按 id 结算关联表；迟到的应答安全丢弃 */
 function settleReply(env: RpcEnvelope): void {
   const entry = pending.get(env.id);
@@ -244,6 +253,20 @@ function settleReply(env: RpcEnvelope): void {
   clearTimeout(entry.timer);
   pending.delete(env.id);
   if (env.ok === true) {
+    // REL-1：reply 方向负载上限——超限以明确错误拒绝，不把 8MB+ 数据递给调用方
+    let bytes = Number.MAX_SAFE_INTEGER;
+    try {
+      bytes = payloadWireBytes(env.payload);
+    } catch {
+      /* 不可序列化按超限处理 */
+    }
+    if (bytes > WORKER_MAX_REPLY_BYTES) {
+      entry.reject(err('RPC_PAYLOAD_TOO_LARGE', {
+        message: `kernel reply payload too large: ${bytes} bytes exceeds the ${WORKER_MAX_REPLY_BYTES} byte rpc limit`,
+        detail: { topic: env.topic, bytes, max: WORKER_MAX_REPLY_BYTES },
+      }));
+      return;
+    }
     entry.resolve(env.payload);
     return;
   }
@@ -278,6 +301,8 @@ interface LoadedExtension {
   /** 激活期标志（createHarnessApi 的 activationPhase 闸门读这里） */
   phase: { active: boolean };
   vm: ExtVm;
+  /** 宿主 ⇄ VM realm 边界桥（SEC-1：派发进 VM 的数据/回调对象都经它转换） */
+  bridge: RealmBridge;
   timers: TimerRegistry;
   collector: ContributionsCollector;
   kernelCall: KernelCall;
@@ -293,22 +318,6 @@ function findRouteEntry(routeKey: string): { handler: RouteHandler; timeoutMs?: 
   return undefined;
 }
 
-function findCronHandler(name: string): CronHandler | undefined {
-  for (const ext of loaded.values()) {
-    const handler = ext.collector.handlers.crons.get(name);
-    if (handler !== undefined) return handler;
-  }
-  return undefined;
-}
-
-function findTaskHandler(name: string): { ext: LoadedExtension; handler: TaskHandler } | undefined {
-  for (const ext of loaded.values()) {
-    const handler = ext.collector.handlers.tasks.get(name);
-    if (handler !== undefined) return { ext, handler };
-  }
-  return undefined;
-}
-
 interface Repliers {
   reply: (payload: unknown) => void;
   fail: (e: unknown) => void;
@@ -318,10 +327,30 @@ interface Repliers {
 function makeRepliers(env: RpcEnvelope, fromOverride?: string): Repliers {
   if (env.type !== 'call') return { reply: () => {}, fail: () => {} };
   const from = fromOverride ?? env.to;
+  const sendError = (e: unknown): void => {
+    post({ v: 1, id: env.id, type: 'reply', from, to: env.from, topic: env.topic, ok: false, err: serializeError(e) });
+  };
   return {
-    reply: (payload) => post({ v: 1, id: env.id, type: 'reply', from, to: env.from, topic: env.topic, ok: true, payload }),
-    fail: (e: unknown) =>
-      post({ v: 1, id: env.id, type: 'reply', from, to: env.from, topic: env.topic, ok: false, err: serializeError(e) }),
+    reply: (payload) => {
+      // REL-1：reply 方向负载上限——超限改发错误回执 + warn，绝不把 8MB+ 数据灌回内核
+      let bytes = Number.MAX_SAFE_INTEGER;
+      try {
+        bytes = payloadWireBytes(payload);
+      } catch {
+        /* 不可序列化按超限处理 */
+      }
+      if (bytes > WORKER_MAX_REPLY_BYTES) {
+        const e = err('RPC_PAYLOAD_TOO_LARGE', {
+          message: `reply payload too large: ${bytes} bytes exceeds the ${WORKER_MAX_REPLY_BYTES} byte rpc limit`,
+          detail: { topic: env.topic, bytes, max: WORKER_MAX_REPLY_BYTES },
+        });
+        logWorkerError(`reply to "${env.topic}" dropped: payload ${bytes} bytes exceeds rpc limit`, e);
+        sendError(e);
+        return;
+      }
+      post({ v: 1, id: env.id, type: 'reply', from, to: env.from, topic: env.topic, ok: true, payload });
+    },
+    fail: (e: unknown) => sendError(e),
   };
 }
 
@@ -337,9 +366,12 @@ interface DefineSlot {
  * 供 host.load 在 module.exports 未携带定义时兜底识别；同时返回标记对象，
  * 兼容 `module.exports = defineExtension({ setup })` 风格。属性不可写/不可配置，
  * 与 vm-runtime 的全局注入语义一致。
+ *
+ * SEC-1：注入的全局函数经 realm 桥包装成 VM realm 函数；返回给 VM 的标记对象也在
+ * VM realm 内重建——扩展无法借 defineExtension 触达宿主 Function/Object 构造器。
  */
-function installDefineExtensionGlobal(context: ExtVm['context'], slot: DefineSlot): void {
-  const define = (input: unknown): unknown => {
+function installDefineExtensionGlobal(bridge: RealmBridge, slot: DefineSlot): void {
+  const defineHost = (input: unknown): unknown => {
     const candidate = typeof input === 'function' ? { setup: input } : input;
     const setup = (candidate as { setup?: unknown } | null)?.setup;
     if (typeof setup !== 'function') {
@@ -347,10 +379,12 @@ function installDefineExtensionGlobal(context: ExtVm['context'], slot: DefineSlo
     }
     const marked = { __opptrixExtension: true as const, setup };
     slot.def = marked;
-    return marked;
+    // 返回给 VM 的标记对象在 VM realm 内重建（setup 是 VM 函数，原样带入）
+    return bridge.makeVmObject({ __opptrixExtension: true, setup });
   };
-  Object.defineProperty(context, 'defineExtension', {
-    value: define,
+  const defineVm = bridge.toVmPassthroughFn(defineHost);
+  Object.defineProperty(bridge.context, 'defineExtension', {
+    value: defineVm,
     writable: false,
     enumerable: true,
     configurable: false,
@@ -399,9 +433,10 @@ async function handleLoadExt(env: RpcEnvelope, reply: (payload: unknown) => void
   const recorded: DefineSlot = { def: undefined };
   try {
     vmInstance = createExtVm({ extId, logger: makeLogger(extId), kernelCall, timers });
-    installDefineExtensionGlobal(vmInstance.context, recorded);
-    const ext: LoadedExtension = { extId, phase, vm: vmInstance, timers, collector, kernelCall };
-    const require = createRestrictedRequire({ extDir, context: vmInstance.context });
+    const bridge = vmInstance.bridge;
+    installDefineExtensionGlobal(bridge, recorded);
+    const ext: LoadedExtension = { extId, phase, vm: vmInstance, bridge, timers, collector, kernelCall };
+    const require = createRestrictedRequire({ extDir, context: vmInstance.context, bridge });
 
     // main 归一化为相对形式（manifest.main 常写作 "main.js"）
     const mainSpec = main.startsWith('./') || main.startsWith('../') ? main : `./${main}`;
@@ -426,10 +461,16 @@ async function handleLoadExt(env: RpcEnvelope, reply: (payload: unknown) => void
     // h.boot：缺省空冻结对象；rootToken 仅 builtin auth 注入（见上方注入闸）
     const boot: { rootToken?: string } = rootToken === undefined ? {} : { rootToken };
     const harness = createHarnessApi({ extId, kernelCall, contributions: collector, timers, activationPhase: () => phase.active, boot });
+    // SEC-1：setup 收到的 h 门面是 VM realm 对象树（exposeHarnessApiInVm），
+    // 宿主侧实现留在闭包内——`h.constructor.constructor` 链根除
+    const harnessVm = exposeHarnessApiInVm(harness, bridge);
     phase.active = true;
     try {
-      // setup 第二参 ctx：与 h.boot 同源的引导上下文（向后兼容通道，扩展可忽略）
-      await withTimeout(Promise.resolve().then(() => def.setup(harness, { rootToken })), SETUP_TIMEOUT_MS, `setup() of extension "${extId}"`, 'EXT_ACTIVATION_FAILED');
+      // setup 第二参 ctx：与 h.boot 同源的引导上下文（向后兼容通道，扩展可忽略）；
+      // 数据经 toVmValue 转成 VM realm 对象后再递入
+      const setupFn = def.setup as (h: unknown, ctx: unknown) => unknown;
+      const ctxVm = bridge.toVmValue({ rootToken });
+      await withTimeout(Promise.resolve().then(() => setupFn(harnessVm, ctxVm)), SETUP_TIMEOUT_MS, `setup() of extension "${extId}"`, 'EXT_ACTIVATION_FAILED');
     } finally {
       phase.active = false;
     }
@@ -476,10 +517,14 @@ async function handleRouteRequest(env: RpcEnvelope, reply: (payload: unknown) =>
     return;
   }
   const request = payload.request as RouteRequest;
+  // SEC-1：请求信封是宿主 realm 结构（postMessage 产物）——递给 VM handler 前转成 VM realm 值
+  const requestForHandler = targetExt !== undefined
+    ? (targetExt.bridge.toVmValue(request) as RouteRequest)
+    : request;
   let result: unknown;
   try {
     const timeoutMs = entry.timeoutMs ?? DEFAULT_ROUTE_TIMEOUT_MS;
-    result = await withTimeout(Promise.resolve().then(() => entry.handler(request)), timeoutMs, `route handler "${routeKey}"`);
+    result = await withTimeout(Promise.resolve().then(() => entry.handler(requestForHandler)), timeoutMs, `route handler "${routeKey}"`);
   } catch (e) {
     fail(e); // 含 webhook 验签失败（HARNESS-1006 → 401）、handler 抛错、HARNESS-1002 超时
     return;
@@ -504,7 +549,10 @@ async function handleEventDispatch(env: RpcEnvelope, reply: (payload: unknown) =
       for (const { handler } of sorted) {
         delivered += 1;
         try {
-          await Promise.resolve().then(() => handler(payload.payload, meta));
+          // SEC-1：事件负载与 meta 转 VM realm 值后再递入 VM handler
+          await Promise.resolve().then(() =>
+            handler(ext.bridge.toVmValue(payload.payload), ext.bridge.toVmValue(meta) as { name: string; source: string }),
+          );
         } catch (e) {
           // 事件监听器异常与内核 EventBus 同语义：隔离、记日志、继续投递
           void ext.kernelCall(KERNEL_TOPICS.log, {
@@ -534,7 +582,8 @@ async function handleHookApply(env: RpcEnvelope, reply: (payload: unknown) => vo
     const sorted = [...entries].sort((a, b) => b.priority - a.priority);
     for (const { handler } of sorted) {
       try {
-        value = await Promise.resolve().then(() => handler(value, payload.ctx));
+        // SEC-1：hook 值与 ctx 转 VM realm 值后再递入 VM handler（改写结果带回宿主侧继续流转）
+        value = await Promise.resolve().then(() => handler(ext.bridge.toVmValue(value), ext.bridge.toVmValue(payload.ctx)));
       } catch (e) {
         if (isHookAbort(e)) {
           reply({ ok: true, value: e.result, aborted: true });
@@ -548,13 +597,34 @@ async function handleHookApply(env: RpcEnvelope, reply: (payload: unknown) => vo
   reply({ ok: true, value });
 }
 
-/** host.cron：按 name 调用本地登记的 cron handler */
+/**
+ * 信封 to（'ext:<id>'）→ 目标扩展；REL-2：host.call / host.cron / host.task 一律
+ * 按信封归属定位该扩展的作用域，不再跨扩展扫描同名 service/cron/task（防串味）。
+ */
+function targetExtFromEnvelope(env: RpcEnvelope): LoadedExtension | undefined {
+  const toExtId = env.to.startsWith('ext:') ? env.to.slice('ext:'.length) : '';
+  return toExtId !== '' ? loaded.get(toExtId) : undefined;
+}
+
+/** host.cron：按信封 to 定位扩展，调其本地登记的 cron handler */
 async function handleCronFire(env: RpcEnvelope, reply: (payload: unknown) => void, fail: (e: unknown) => void): Promise<void> {
   const payload = (env.payload ?? {}) as { name?: unknown };
   const name = typeof payload.name === 'string' ? payload.name : '';
-  const handler = name === '' ? undefined : findCronHandler(name);
+  // REL-2：只查信封归属扩展的 crons——两个扩展同名 cron 各自命中、互不串味
+  const target = targetExtFromEnvelope(env);
+  if (name === '' || target === undefined) {
+    fail(err('EXT_NOT_FOUND', {
+      message: `cron job "${name}" is not registered for extension "${target?.extId ?? 'unknown'}" in this worker`,
+      detail: { name, extId: target?.extId ?? null },
+    }));
+    return;
+  }
+  const handler = target.collector.handlers.crons.get(name);
   if (handler === undefined) {
-    fail(err('EXT_NOT_FOUND', { message: `cron job "${name}" is not registered in this worker` }));
+    fail(err('EXT_NOT_FOUND', {
+      message: `cron job "${name}" is not registered for extension "${target.extId}" in this worker`,
+      detail: { name, extId: target.extId },
+    }));
     return;
   }
   try {
@@ -565,7 +635,7 @@ async function handleCronFire(env: RpcEnvelope, reply: (payload: unknown) => voi
   }
 }
 
-/** host.call：service.method → 本地 servicesMap 调用，结果原样 reply */
+/** host.call：按信封 to 定位扩展的 servicesMap 调用，结果原样 reply */
 async function handleCallService(env: RpcEnvelope, reply: (payload: unknown) => void, fail: (e: unknown) => void): Promise<void> {
   const payload = (env.payload ?? {}) as { service?: unknown; method?: unknown; args?: unknown };
   const service = typeof payload.service === 'string' ? payload.service : '';
@@ -574,52 +644,78 @@ async function handleCallService(env: RpcEnvelope, reply: (payload: unknown) => 
     fail(err('BAD_REQUEST', { message: 'host.call requires payload { service, method, args }' }));
     return;
   }
+  // REL-2：按信封 to 定位目标扩展——同名 service 不再被其他扩展遮蔽
+  const target = targetExtFromEnvelope(env);
   const key = `${service}.${method}`;
-  let handler: ServiceHandler | undefined;
-  for (const ext of loaded.values()) {
-    const candidate = ext.collector.handlers.services.get(key);
-    if (candidate !== undefined) {
-      handler = candidate;
-      break;
-    }
+  if (target === undefined) {
+    fail(err('RPC_TARGET_NOT_FOUND', {
+      message: `service "${key}" is not exposed by extension "unknown" (no extension in the envelope "to" endpoint is loaded in this worker)`,
+      detail: { service, method, extId: null },
+    }));
+    return;
   }
+  const handler = target.collector.handlers.services.get(key);
   if (handler === undefined) {
-    fail(err('RPC_TARGET_NOT_FOUND', { message: `service "${key}" is not exposed by any loaded extension` }));
+    fail(err('RPC_TARGET_NOT_FOUND', {
+      message: `service "${key}" is not exposed by extension "${target.extId}"`,
+      detail: { service, method, extId: target.extId },
+    }));
     return;
   }
   try {
-    const result = await Promise.resolve().then(() => handler(payload.args));
+    // SEC-1：入参转 VM realm 值后再递入 VM service handler
+    const result = await Promise.resolve().then(() => handler(target.bridge.toVmValue(payload.args)));
     reply(result);
   } catch (e) {
     fail(e);
   }
 }
 
-/** host.task：找到执行器后立即 reply（started），任务体异步执行并自带 task.* 上报 */
+/** host.task：按信封 to 定位扩展的执行器后立即 reply（started），任务体异步执行并自带 task.* 上报 */
 function handleTaskRun(env: RpcEnvelope, reply: (payload: unknown) => void, fail: (e: unknown) => void): void {
   const payload = (env.payload ?? {}) as { taskId?: unknown; name?: unknown; args?: unknown };
   const taskId = typeof payload.taskId === 'string' ? payload.taskId : '';
   const name = typeof payload.name === 'string' ? payload.name : '';
-  const found = name === '' ? undefined : findTaskHandler(name);
-  if (found === undefined) {
-    fail(err('EXT_NOT_FOUND', { message: `task "${name}" is not registered in this worker` }));
+  // REL-2：按信封 to 定位目标扩展——同名 task 不再跨扩展串味
+  const target = targetExtFromEnvelope(env);
+  if (name === '' || target === undefined) {
+    fail(err('EXT_NOT_FOUND', {
+      message: `task "${name}" is not registered for extension "${target?.extId ?? 'unknown'}" in this worker`,
+      detail: { name, extId: target?.extId ?? null },
+    }));
     return;
   }
-  const { ext, handler } = found;
+  const handler = target.collector.handlers.tasks.get(name);
+  if (handler === undefined) {
+    fail(err('EXT_NOT_FOUND', {
+      message: `task "${name}" is not registered for extension "${target.extId}" in this worker`,
+      detail: { name, extId: target.extId },
+    }));
+    return;
+  }
+  const bridge = target.bridge;
   const ctx: TaskContext = {
-    progress: (pct, msg) => ext.kernelCall(KERNEL_TOPICS.taskProgress, { taskId, pct, msg }).then(() => undefined),
-    complete: (result) => ext.kernelCall(KERNEL_TOPICS.taskComplete, { taskId, result }).then(() => undefined),
-    fail: (error) => ext.kernelCall(KERNEL_TOPICS.taskFail, { taskId, error }).then(() => undefined),
+    progress: (pct, msg) => target.kernelCall(KERNEL_TOPICS.taskProgress, { taskId, pct, msg }).then(() => undefined),
+    complete: (result) => target.kernelCall(KERNEL_TOPICS.taskComplete, { taskId, result }).then(() => undefined),
+    fail: (error) => target.kernelCall(KERNEL_TOPICS.taskFail, { taskId, error }).then(() => undefined),
   };
+  // SEC-1：任务上下文对象建在 VM realm（progress/complete/fail 是 VM realm 函数），
+  // args 转 VM realm 值——扩展无法借 ctx.constructor 触达宿主构造器
+  const ctxVm = bridge.makeVmObject({
+    progress: bridge.toVmAsyncFn(((pct: number, msg?: string) => ctx.progress(pct, msg)) as unknown as (...args: unknown[]) => unknown),
+    complete: bridge.toVmAsyncFn(((result?: unknown) => ctx.complete(result)) as unknown as (...args: unknown[]) => unknown),
+    fail: bridge.toVmAsyncFn(((error: unknown) => ctx.fail(error)) as unknown as (...args: unknown[]) => unknown),
+  }) as unknown as TaskContext;
+  const argsVm = bridge.toVmValue(payload.args);
   reply({ ok: true, started: true, taskId });
   // 任务体异步执行：未捕获的失败兜底上报 taskFail，绝不击穿线程
   void Promise.resolve()
-    .then(() => handler(payload.args, ctx))
+    .then(() => handler(argsVm, ctxVm))
     .catch(async (e: unknown) => {
       try {
         await ctx.fail(serializeError(e));
       } catch {
-        void ext.kernelCall(KERNEL_TOPICS.log, {
+        void target.kernelCall(KERNEL_TOPICS.log, {
           level: 'error',
           msg: `task "${name}" (${taskId}) failed and taskFail report also failed: ${e instanceof Error ? e.message : String(e)}`,
           args: [],
@@ -650,9 +746,13 @@ async function handleAuthVerify(env: RpcEnvelope, reply: (payload: unknown) => v
   const headers = (payload.headers !== null && typeof payload.headers === 'object' && !Array.isArray(payload.headers)
     ? payload.headers
     : {}) as Record<string, string | string[] | undefined>;
+  // SEC-1：验证入参转 VM realm 值后再递入 VM authProvider handler
+  const handlerInput = ext !== undefined
+    ? (ext.bridge.toVmValue({ token, headers }) as { token?: string; headers: Record<string, string | string[] | undefined> })
+    : { token, headers };
   try {
     const identity = await withTimeout(
-      Promise.resolve().then(() => handler({ token, headers })),
+      Promise.resolve().then(() => handler(handlerInput)),
       DEFAULT_ROUTE_TIMEOUT_MS,
       'auth provider verify',
     );
@@ -745,4 +845,19 @@ if (parentPort !== null) {
   process.on('unhandledRejection', (reason: unknown) => {
     logWorkerError('unhandled rejection in extension worker', reason);
   });
+  // REL-6：线程级 uncaughtException 兜底——扩展代码漏网的同步异常只记日志不停线程，
+  // 防止单个扩展的致命错误连环触发全扩展熔断（worker 内的 process 监听是线程局部的）
+  process.on('uncaughtException', handleWorkerUncaughtException);
+}
+
+/**
+ * worker 线程的 uncaughtException 兜底（REL-6）：记录日志后继续存活。
+ * 导出供单测直接调用（主线程导入本模块时不注册，避免污染宿主进程）。
+ */
+export function handleWorkerUncaughtException(e: unknown): void {
+  try {
+    logWorkerError('uncaught exception in extension worker (thread stays alive)', e);
+  } catch {
+    /* 兜底的兜底：连日志投递都失败时静默——线程存活优先 */
+  }
 }

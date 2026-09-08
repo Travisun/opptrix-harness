@@ -136,6 +136,9 @@ describe('forbidDangerousSql：单语句与危险关键词防护', () => {
     'DeTaCh DATABASE extra',
     "SELECT load_extension('/lib/evil.so')",
     'SELECT 1; SELECT 2; DROP TABLE t;',
+    // SEC-5：VACUUM INTO 可把整库写到任意路径（跨库逃逸）
+    "VACUUM INTO '/tmp/steal.db'",
+    "vacuum main into 'out.db'",
   ])('拒绝：%j（HARNESS-4002）', (sql) => {
     const e = errOf(() => forbidDangerousSql(sql));
     expect(e.code).toBe('HARNESS-4002');

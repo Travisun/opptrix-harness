@@ -34,6 +34,7 @@ const ALL_ROUTES = [
   { method: 'GET', url: '/api/v1/extensions/routes' },
   { method: 'GET', url: '/api/v1/extensions/registry' },
   { method: 'GET', url: '/api/v1/extensions/doc-demo' },
+  { method: 'POST', url: '/api/v1/extensions/rescan' },
   { method: 'POST', url: '/api/v1/extensions/doc-demo/enable' },
   { method: 'POST', url: '/api/v1/extensions/doc-demo/disable' },
   { method: 'POST', url: '/api/v1/extensions/doc-demo/reload' },
@@ -58,6 +59,7 @@ class ManagerStub implements ManagerLike {
   readonly disableIds: string[] = [];
   readonly reloadIds: string[] = [];
   readonly uninstallCalls: Array<{ id: string; opts?: { purge?: boolean } }> = [];
+  rescanResult: { discovered: string[] } = { discovered: ['late-ext'] };
   enableError: HarnessError | null = null;
   disableError: HarnessError | null = null;
 
@@ -83,6 +85,10 @@ class ManagerStub implements ManagerLike {
 
   async uninstall(id: string, opts?: { purge?: boolean }): Promise<void> {
     this.uninstallCalls.push({ id, opts });
+  }
+
+  async rescan(): Promise<{ discovered: string[] }> {
+    return this.rescanResult;
   }
 
   getRoutes(): unknown[] {
@@ -272,6 +278,21 @@ describe('extensions api — 生命周期写操作', () => {
     expect(res.statusCode).toBe(400);
     expect(res.json().code).toBe('HARNESS-1009');
     expect(manager.uninstallCalls).toEqual([]);
+  });
+});
+
+describe('extensions api — REL-7 rescan（免重启发现新扩展目录）', () => {
+  it('POST /api/v1/extensions/rescan（admin）→ 200 { ok, discovered } 透传 manager.rescan', async () => {
+    const { app, manager } = buildServer();
+    const res = await app.inject({ method: 'POST', url: '/api/v1/extensions/rescan', headers: AUTH_ADMIN });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, discovered: ['late-ext'] });
+  });
+
+  it('POST /api/v1/extensions/rescan（root）→ 200', async () => {
+    const { app } = buildServer();
+    const res = await app.inject({ method: 'POST', url: '/api/v1/extensions/rescan', headers: AUTH_ROOT });
+    expect(res.statusCode).toBe(200);
   });
 });
 

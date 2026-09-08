@@ -18,12 +18,14 @@
  * 注意：本文件经 Node 24 原生 TS 剥离加载（execArgv: []），只能使用可剥离语法。
  */
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import * as path from 'node:path';
 import vm from 'node:vm';
 
 import { err } from '../kernel/errors/index.js';
 
+import { realmBridgeFor } from './realm.js';
+import type { RealmBridge } from './realm.js';
 import { KERNEL_TOPICS } from './protocol.js';
 import type { KernelCall, TimerRegistry } from './vm-runtime.js';
 
@@ -244,12 +246,17 @@ export interface RestrictedRequireOptions {
   extDir: string;
   /** 模块编译执行的 vm 上下文（与扩展 VM 同一 context） */
   context: vm.Context;
+  /** realm 桥（SEC-1：require 包装成 VM realm 函数所需）；缺省取 context 的共享桥 */
+  bridge?: RealmBridge;
 }
 
 const CJS_WRAP_PRE = '(function (exports, require, module, __filename, __dirname) {\n';
 const CJS_WRAP_POST = '\n});';
 
-/** 在指定 context 内编译 CJS 模块代码，返回包装函数 */
+/**
+ * 在指定 context 内编译 CJS 模块代码，返回包装函数。
+ * vm.Script + runInContext：编译产物函数本身就是 VM realm 函数（SEC-1 前提）。
+ */
 function compileCjsModule(code: string, filename: string, context: vm.Context): (...args: unknown[]) => void {
   // 不提供 importModuleDynamically：模块内 import() 在编译期即失败（fail-closed）
   const script = new vm.Script(`${CJS_WRAP_PRE}${code}${CJS_WRAP_POST}`, { filename });
@@ -267,9 +274,20 @@ function compileCjsModule(code: string, filename: string, context: vm.Context): 
  * 读文件后在同一 context 内以 CJS 包装执行，递归 require 同规则，命中缓存直接返回。
  * 拒绝（一律抛 Error(REQUIRE_DENIED)）：绝对路径、内置模块名（'fs' / 'node:fs'）、
  * 非 .js 扩展名、解析后逃逸 extDir 的路径。
+ *
+ * SEC-2（符号链接防击穿）：containment 不能只查逻辑路径——解析路径与扩展目录都过
+ * `fs.realpathSync` 后再比对前缀；realpath 失败（除 ENOENT 按模块缺失处理外）一律拒绝。
+ *
+ * SEC-1（realm 边界）：
+ * - module 对象建在 VM realm（`({ exports: {} })` 于 context 内求值）——模块顶层
+ *   `this` / `module` / `exports` 不再是宿主对象，`this.constructor.constructor`
+ *   只能到达 VM 自有 intrinsics，无法触达宿主 Function；
+ * - require（含递归 require）经 realm 桥包装成 VM realm 函数（恒等返回，
+ *   不拷贝 exports——模块身份与缓存语义保持不变）后传入模块包装器。
  */
 export function createRestrictedRequire(opts: RestrictedRequireOptions): (spec: string) => unknown {
   const extRoot = path.resolve(opts.extDir);
+  const bridge = opts.bridge ?? realmBridgeFor(opts.context);
   const cache = new Map<string, { exports: unknown }>();
 
   const requireFrom = (spec: string, parentDir: string): unknown => {
@@ -280,31 +298,49 @@ export function createRestrictedRequire(opts: RestrictedRequireOptions): (spec: 
     const ext = path.extname(resolved);
     if (ext === '') resolved += '.js';
     else if (ext !== '.js') throw new Error(REQUIRE_DENIED);
-    // 防穿越：解析后必须落在扩展目录内（extRoot 本身不算——那是目录不是模块）
+    // 防穿越（逻辑路径）：解析后必须落在扩展目录内（extRoot 本身不算——那是目录不是模块）
     if (resolved !== extRoot && !resolved.startsWith(extRoot + path.sep)) throw new Error(REQUIRE_DENIED);
 
     const cached = cache.get(resolved);
     if (cached !== undefined) return cached.exports;
 
+    // SEC-2：realpath 双侧比对（symlink 指向目录外文件在此被拒）
+    let realResolved: string;
+    let realExtRoot: string;
+    try {
+      realResolved = realpathSync(resolved);
+      realExtRoot = realpathSync(extRoot);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+        throw new Error(`cannot find module '${spec}' (looked for ${resolved} inside the extension directory)`);
+      }
+      throw new Error(REQUIRE_DENIED);
+    }
+    if (realResolved !== realExtRoot && !realResolved.startsWith(realExtRoot + path.sep)) {
+      throw new Error(REQUIRE_DENIED);
+    }
+
     let code: string;
     try {
-      code = readFileSync(resolved, 'utf8');
+      code = readFileSync(realResolved, 'utf8');
     } catch {
       throw new Error(`cannot find module '${spec}' (looked for ${resolved} inside the extension directory)`);
     }
 
     // 先入缓存再执行：循环依赖拿到部分 exports（对齐 Node CJS 语义）
-    const moduleObj: { exports: unknown } = { exports: {} };
+    // SEC-1：module 对象在 VM realm 内构建
+    const moduleObj = vm.runInContext('({ exports: {} })', opts.context) as { exports: unknown };
     cache.set(resolved, moduleObj);
-    const fn = compileCjsModule(code, resolved, opts.context);
+    const fn = compileCjsModule(code, realResolved, opts.context);
     const dirname = path.dirname(resolved);
-    const localRequire = (s: string): unknown => requireFrom(s, dirname);
-    fn.call(moduleObj.exports, moduleObj.exports, localRequire, moduleObj, resolved, dirname);
+    // SEC-1：递归 require 包成 VM realm 函数（恒等返回，exports 不拷贝）
+    const localRequireVm = bridge.toVmPassthroughFn((s: unknown): unknown => requireFrom(String(s), dirname));
+    fn.call(moduleObj.exports, moduleObj.exports, localRequireVm, moduleObj, resolved, dirname);
     return moduleObj.exports;
   };
 
-  // 扩展主模块的 require 以 extDir 为基准
-  return (spec: string): unknown => requireFrom(spec, extRoot);
+  // 扩展主模块的 require 以 extDir 为基准；同样包装为 VM realm 函数
+  return bridge.toVmPassthroughFn((spec: unknown): unknown => requireFrom(String(spec), extRoot));
 }
 
 // ---------------------------------------------------------------------------
@@ -313,8 +349,8 @@ export function createRestrictedRequire(opts: RestrictedRequireOptions): (spec: 
 
 /** SQLite 字面量（字符串/双引号标识符/反引号标识符/[方括号标识符]），支持转义 */
 const SQL_LITERAL_PATTERN = /'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]/g;
-/** 禁止关键词（大小写不敏感、词边界） */
-const FORBIDDEN_KEYWORD_PATTERN = /\b(?:attach|detach|load_extension)\b/i;
+/** 禁止关键词（大小写不敏感、词边界）：ATTACH / DETACH / load_extension / VACUUM（VACUUM INTO 可跨库逃逸） */
+const FORBIDDEN_KEYWORD_PATTERN = /\b(?:attach|detach|load_extension|vacuum)\b/i;
 
 /**
  * 扩展 SQL 单语句防护：先剥离字面量，再做多语句计数与禁词检查。
@@ -837,4 +873,128 @@ export function createHarnessApi(opts: HarnessApiOptions): HarnessApi {
 
   // 冻结整棵 API 树：扩展无法改写宿主实现
   return Object.freeze(api);
+}
+
+/**
+ * 把宿主侧 {@link HarnessApi} 暴露为 **VM realm 对象树**（SEC-1：h 门面逃逸链根除）。
+ *
+ * - 每个 h.* 方法都经 realm 桥包装成 VM realm 函数：运行类（kernelCall 转发）用
+ *   async 包装（返回 VM realm Promise，结果深拷贝入 VM realm）；注册类/同步方法用
+ *   同步包装；宿主抛出的 Error 转为 VM realm Error。
+ * - 各子对象（log/config/…/boot）在 VM 内构建并冻结——扩展拿到的是 VM realm
+ *   冻结对象，`h.constructor.constructor` 只能到达 VM 自有 intrinsics。
+ * - handler 形参（route/on/hook/expose/task/cron.schedule/authProvider 注册时传入的
+ *   扩展函数）原样透传给宿主侧 api —— collector 捕获的仍是 VM 函数本身。
+ *
+ * @param api 宿主侧实现（createHarnessApi 的返回值）
+ * @param bridge 目标 context 的 realm 桥（createExtVm 产物）
+ */
+export function exposeHarnessApiInVm(api: HarnessApi, bridge: RealmBridge): unknown {
+  // never[] 形参技巧：具体签名 (p: string) => ... 可赋给 (...args: never[]) => unknown，
+  // 包装时再放宽为 unknown[] 形参（运行期参数由 VM 侧原样透传给宿主实现）
+  const syncFn = (fn: (...args: never[]) => unknown): unknown =>
+    bridge.toVmFn(fn as unknown as (...args: unknown[]) => unknown);
+  const asyncFn = (fn: (...args: never[]) => unknown): unknown =>
+    bridge.toVmAsyncFn(fn as unknown as (...args: unknown[]) => unknown);
+
+  return bridge.makeVmObject({
+    log: bridge.makeVmObject({
+      debug: syncFn((msg: unknown, obj?: unknown) => api.log.debug(msg, obj)),
+      info: syncFn((msg: unknown, obj?: unknown) => api.log.info(msg, obj)),
+      warn: syncFn((msg: unknown, obj?: unknown) => api.log.warn(msg, obj)),
+      error: syncFn((msg: unknown, obj?: unknown) => api.log.error(msg, obj)),
+    }),
+    config: bridge.makeVmObject({
+      get: asyncFn((p: string, fallback?: unknown) => api.config.get(p, fallback)),
+    }),
+    storage: bridge.makeVmObject({
+      get: asyncFn((key: string) => api.storage.get(key)),
+      set: asyncFn((key: string, value: unknown) => api.storage.set(key, value)),
+      delete: asyncFn((key: string) => api.storage.delete(key)),
+    }),
+    db: bridge.makeVmObject({
+      all: asyncFn((sql: string, params?: unknown[]) => api.db.all(sql, params)),
+      get: asyncFn((sql: string, params?: unknown[]) => api.db.get(sql, params)),
+      run: asyncFn((sql: string, params?: unknown[]) => api.db.run(sql, params)),
+      schema: asyncFn((statements: string[]) => api.db.schema(statements)),
+    }),
+    notify: bridge.makeVmObject({
+      send: asyncFn((input: unknown) => api.notify.send(input)),
+    }),
+    chat: bridge.makeVmObject({
+      send: asyncFn((input: unknown) => api.chat.send(input)),
+      patch: asyncFn((input: unknown) => api.chat.patch(input)),
+    }),
+    files: bridge.makeVmObject({
+      save: asyncFn((input: unknown) =>
+        api.files.save(input as { origName: string; mime: string; data: string | Uint8Array; visibility?: string; extId?: string }),
+      ),
+      read: asyncFn((id: string) => api.files.read(id)),
+      get: asyncFn((id: string) => api.files.get(id)),
+    }),
+    tasks: bridge.makeVmObject({
+      dispatch: asyncFn((input: unknown) => api.tasks.dispatch(input as { name: string; args?: unknown })),
+      progress: asyncFn((taskId: string, pct: number, msg?: string) => api.tasks.progress(taskId, pct, msg)),
+      complete: asyncFn((taskId: string, result?: unknown) => api.tasks.complete(taskId, result)),
+      fail: asyncFn((taskId: string, error: unknown) => api.tasks.fail(taskId, error)),
+    }),
+    cron: bridge.makeVmObject({
+      schedule: asyncFn(
+        (input: unknown, handler: unknown) =>
+          api.cron.schedule(input as Parameters<HarnessApi['cron']['schedule']>[0], handler as CronHandler),
+      ),
+      unschedule: asyncFn((name: string) => api.cron.unschedule(name)),
+    }),
+    ui: bridge.makeVmObject({
+      register: syncFn((fragment: unknown) => api.ui.register(fragment as Parameters<HarnessApi['ui']['register']>[0])),
+    }),
+    llm: bridge.makeVmObject({
+      chat: asyncFn((input: unknown) => api.llm.chat(input)),
+    }),
+    sandbox: bridge.makeVmObject({
+      exec: asyncFn((input: unknown) => api.sandbox.exec(input)),
+    }),
+    system: bridge.makeVmObject({
+      info: asyncFn(() => api.system.info()),
+      stats: asyncFn(() => api.system.stats()),
+    }),
+    // 引导态：纯数据对象在 VM 内重建（rootToken 为字符串原语）
+    boot: bridge.makeVmObject(api.boot.rootToken !== undefined ? { rootToken: api.boot.rootToken } : {}),
+    auth: bridge.makeVmObject({
+      hashPassword: asyncFn((password: string) => api.auth.hashPassword(password)),
+      verifyPassword: asyncFn((password: string, hash: string) => api.auth.verifyPassword(password, hash)),
+    }),
+    call: asyncFn((targetExtId: string, method: string, args?: unknown) => api.call(targetExtId, method, args)),
+    // ---- 注册类 API（宿主侧捕获 VM 函数进 collector）----
+    route: syncFn(
+      (method: string, path: string, handler: unknown, opts?: RouteOptions) =>
+        api.route(method, path, handler as RouteHandler, opts),
+    ),
+    webhook: syncFn(
+      (path: string, handler: unknown, opts?: WebhookOptions) =>
+        api.webhook(path, handler as RouteHandler, opts),
+    ),
+    on: syncFn(
+      (pattern: string, handler: unknown, opts?: { priority?: number }) =>
+        api.on(pattern, handler as EventHandler, opts),
+    ),
+    hook: syncFn(
+      (name: string, handler: unknown, opts?: { priority?: number }) =>
+        api.hook(name, handler as HookHandler, opts),
+    ),
+    expose: syncFn(
+      (service: string, methods: unknown) =>
+        api.expose(service, methods as Record<string, ServiceHandler>),
+    ),
+    page: syncFn(
+      (path: string, page: unknown) => api.page(path, page as { title: string; entry: string }),
+    ),
+    menu: syncFn((label: string, icon?: string) => api.menu(label, icon)),
+    task: syncFn(
+      (name: string, handler: unknown) => api.task(name, handler as TaskHandler),
+    ),
+    authProvider: syncFn(
+      (handler: unknown) => api.authProvider(handler as AuthVerifyHandler),
+    ),
+  });
 }

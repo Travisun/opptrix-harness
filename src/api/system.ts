@@ -91,7 +91,14 @@ export function registerSystemRoutes(app: FastifyInstance, deps: SystemRoutesDep
   });
 
   app.post('/api/v1/system/backup', { schema: { tags: ['system'] } }, async (request) => {
-    await authenticate(request);
+    const identity = await authenticate(request);
+    // SEC-6：备份导出整库——仅 root/admin 可触发（normal 角色一律 403）
+    if (identity.role !== 'root' && identity.role !== 'admin') {
+      throw err('FORBIDDEN', {
+        message: 'database backup requires role admin or root',
+        detail: { role: identity.role },
+      });
+    }
     if (deps.runDbBackup === undefined) {
       throw err('NOT_IMPLEMENTED', {
         detail:

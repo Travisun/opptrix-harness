@@ -91,7 +91,7 @@ describe('makeExtension', () => {
     expect(indexJs).toContain('defineExtension');
     expect(indexJs).toContain("h.route('GET', '/hello'");
     expect(indexJs).toContain("{ hello: 'world' }");
-    expect(indexJs).toContain('// h.cron(');
+    expect(indexJs).toContain('// h.cron.schedule(');
 
     const readme = await fsp.readFile(path.join(extDir, 'README.md'), 'utf8');
     expect(readme).toContain('h.* API');

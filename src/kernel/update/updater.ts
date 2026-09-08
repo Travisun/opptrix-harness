@@ -19,7 +19,7 @@
  */
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -181,14 +181,21 @@ async function readHistoryFile(releasesDir: string): Promise<UpdateHistoryEntry[
   return parsed.data;
 }
 
-/** 追加一条发布记录（读-改-写；调用方保证 releasesDir 已存在） */
+/**
+ * 追加一条发布记录（读-改-写；调用方保证 releasesDir 已存在）。
+ * REL-5：tmp + rename 原子写——进程在写入中途崩溃不再留下半截 history.json
+ * （损坏的 JSON 会让后续 history()/append 全部失败）。
+ */
 async function appendHistoryFile(
   releasesDir: string,
   entry: UpdateHistoryEntry,
 ): Promise<void> {
   const list = await readHistoryFile(releasesDir);
   list.push(entry);
-  await writeFile(path.join(releasesDir, HISTORY_FILENAME), `${JSON.stringify(list, null, 2)}\n`, 'utf8');
+  const finalPath = path.join(releasesDir, HISTORY_FILENAME);
+  const tmpPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
+  await writeFile(tmpPath, `${JSON.stringify(list, null, 2)}\n`, 'utf8');
+  await rename(tmpPath, finalPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -475,12 +482,18 @@ export class Updater {
       }
 
       // 7) 原子提交 + 发布历史
+      // REL-5：history 追加失败仅 warn——无论如何随后必须 requestRestart()（新 slot
+      // 已 commit，升级已不可逆；让 history 写失败阻塞重启会把内核卡在「在途升级」态）
       await commitNewSlot(config, { newSlot, version: entry.version });
-      await appendHistoryFile(this.releasesDir, {
-        version: entry.version,
-        appliedAt: Date.now(),
-        ok: true,
-      });
+      try {
+        await appendHistoryFile(this.releasesDir, {
+          version: entry.version,
+          appliedAt: Date.now(),
+          ok: true,
+        });
+      } catch (e) {
+        logger.warn({ err: e, slot: newSlot, version: entry.version }, 'updater: release history append failed (restart continues)');
+      }
       await rm(incomingPath, { force: true }).catch(() => {});
       logger.info({ slot: newSlot, version: entry.version }, 'updater: new slot committed, requesting restart');
 

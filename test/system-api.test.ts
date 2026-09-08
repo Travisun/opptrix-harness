@@ -19,8 +19,11 @@ import { createHttpServer } from '../src/kernel/http/server.js';
 import { Counters } from '../src/kernel/system/info.js';
 
 const ROOT_TOKEN = 'test-root-token';
+/** SEC-6：normal 角色令牌（备份 admin 门测试用） */
+const NORMAL_TOKEN = 'test-normal-token';
 
 const AUTHZ: Record<string, string> = { authorization: `Bearer ${ROOT_TOKEN}` };
+const AUTHZ_NORMAL: Record<string, string> = { authorization: `Bearer ${NORMAL_TOKEN}` };
 
 let dataDir = '';
 
@@ -55,6 +58,9 @@ function buildServer(
       registerSystemRoutes(a, {
         config,
         checker: async (input) => {
+          if (input.token === NORMAL_TOKEN) {
+            return { userId: 'bob', role: 'normal', scopes: [] };
+          }
           if (input.token !== ROOT_TOKEN) {
             throw err('UNAUTHORIZED', { detail: 'token rejected by all auth providers' });
           }
@@ -140,6 +146,21 @@ describe('system api — info / doctor / backup / openapi', () => {
     const body = res.json();
     expect(body.code).toBe('HARNESS-9004');
     expect(body.retryable).toBe(false);
+  });
+
+  it('SEC-6：backup 拒绝 normal 角色 → 403 HARNESS-1007 且备份执行器未被触达', async () => {
+    let called = false;
+    const { app } = buildServer({
+      runDbBackup: async () => {
+        called = true;
+        return { path: '/tmp/harness.db.bak', sizeBytes: 1 };
+      },
+    });
+    const res = await app.inject({ method: 'POST', url: '/api/v1/system/backup', headers: AUTHZ_NORMAL });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toMatchObject({ code: 'HARNESS-1007', retryable: false });
+    expect(res.json().message).toContain('admin or root');
+    expect(called).toBe(false);
   });
 
   it('POST /api/v1/system/backup 注入 runDbBackup 后返回 BackupInfo（并收到 config）', async () => {

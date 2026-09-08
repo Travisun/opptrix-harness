@@ -179,8 +179,8 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     ownerSes = body.token;
   });
 
-  it('GET /api/v1/auth/me（ses Bearer）→ owner/admin/session', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/v1/auth/me', headers: { authorization: `Bearer ${ownerSes}` } });
+  it('GET /api/v1/auth/me（ses ?token=）→ owner/admin/session（SEC-7：auth mount 派发裁剪 authorization，凭据走 query 通道）', async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/v1/auth/me?token=${ownerSes}` });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ username: 'owner', role: 'admin', tokenType: 'session' });
   });
@@ -194,8 +194,7 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
   it('POST /api/v1/auth/api-keys → ak_ 令牌；ak 调 GET /api/v1/notifications → 200', async () => {
     const created = await app.inject({
       method: 'POST',
-      url: '/api/v1/auth/api-keys',
-      headers: { authorization: `Bearer ${ownerSes}` },
+      url: `/api/v1/auth/api-keys?token=${ownerSes}`,
       payload: { name: 'ci', scopes: ['*'] },
     });
     expect(created.statusCode).toBe(200);
@@ -222,8 +221,7 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
   it('bob（normal）：admin 建号 → login → PUT /api/v1/llm/providers → 403', async () => {
     const created = await app.inject({
       method: 'POST',
-      url: '/api/v1/users',
-      headers: { authorization: `Bearer ${ownerSes}` },
+      url: `/api/v1/users?token=${ownerSes}`,
       payload: { username: 'bob', password: 'bob-pass-8', role: 'normal' },
     });
     expect(created.statusCode).toBe(200);
@@ -314,7 +312,7 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     );
     const upload = await app.inject({
       method: 'POST',
-      url: '/api/v1/files',
+      url: '/api/v1/files?extId=doc-demo',
       headers: {
         authorization: `Bearer ${ROOT_TOKEN}`,
         'content-type': `multipart/form-data; boundary=${boundary}`,
@@ -370,7 +368,7 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(login.statusCode).toBe(200);
     expect((login.json() as { token: string }).token).toMatch(/^ses_[0-9a-f]{48}$/);
 
-    const me = await app.inject({ method: 'GET', url: '/api/v1/auth/me', headers: { authorization: `Bearer ${ownerSes}` } });
+    const me = await app.inject({ method: 'GET', url: `/api/v1/auth/me?token=${ownerSes}` });
     expect(me.statusCode).toBe(200);
   });
 

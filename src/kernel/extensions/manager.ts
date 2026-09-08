@@ -124,8 +124,8 @@ export interface ExtensionManagerDeps {
   scheduler: SchedulerLike;
   eventBus: EventBusLike;
   hooks: HooksLike;
-  /** builtin mount 白名单校验（可选） */
-  authMounts?: { validateMount?(mount: string): boolean };
+  /** builtin mount 受信校验（可选；SEC-3 fail-closed：未注入时 builtin/mount 声明一律拒绝） */
+  authMounts?: { validateMount?(manifest: ExtensionManifest, dir: string): boolean };
   /** 发现目录（如 [<dataDir>/extensions, <repo>/extensions]） */
   extensionsDirs: string[];
   /** 路由表原子变更回调（路由模块据此重挂） */
@@ -151,10 +151,11 @@ export interface ExtensionManagerDeps {
   onUiChanged?: (extId: string, ui: UiContribution | null) => void;
   /**
    * 激活期 load payload 追加器（可选，集成方按 manifest 决定附加字段）：
-   * 阶段 10 内核仅对 builtin && mount==='auth' 的扩展附加 rootToken
-   * （worker 侧另有注入闸复核；其余扩展不携带任何引导态）。
+   * 阶段 10 内核仅对 builtin && mount==='auth' 且目录受信的扩展附加 rootToken
+   * （worker 侧另有注入闸复核；其余扩展不携带任何引导态）。dir 为扩展目录
+   * （SEC-3：受信目录裁决的输入之一）。
    */
-  loadBootstrap?: (manifest: ExtensionManifest) => Record<string, unknown> | undefined;
+  loadBootstrap?: (manifest: ExtensionManifest, dir: string) => Record<string, unknown> | undefined;
   /** 测试注入：worker 崩溃重启的退避序列（ms） */
   restartBackoffMs?: number[];
 }
@@ -294,6 +295,10 @@ export class ExtensionManager {
   #rowCache = new Map<string, RowSnapshot>();
   /** 当前桥（worker 崩溃重启时整体重建） */
   #bridge: ExtensionBridge | null = null;
+  /** REL-3：当前桥的 worker 是否已退出（exit 后、respawn 前为 true；enable 据此重建桥） */
+  #bridgeDead = false;
+  /** REL-3：#restarting 窗口内到达的 exit 事件排队标志（respawn 完成后补处理一次） */
+  #exitQueued = false;
   /** worker 崩溃时间窗口（epoch ms 滑动窗口） */
   #crashWindow: number[] = [];
   /** 熔断态：置位后不再自动重启，等待人工 enable 清除 */
@@ -459,6 +464,16 @@ export class ExtensionManager {
       this.#spawnBridge();
       this.deps.logger.info({ extId: id }, 'extension manager: crash-loop state cleared by manual enable, worker respawned');
     }
+    // REL-3：桥不可用（worker 已死但 exit 落在 #restarting 窗口被吞 / 桥已停）→
+    // 重建 worker + 桥再走激活——把熔断态重建桥的路径泛化为「桥不可用即重建」。
+    // stop() 之后（#stopping）不重建：关停语义保留，enable 仍被 KERNEL_NOT_READY 拒绝。
+    if (!this.#stopping && (this.#bridge === null || this.#bridge.stopped || this.#bridgeDead)) {
+      const stale = this.#bridge;
+      this.#bridge = null;
+      await stale?.stop();
+      this.#spawnBridge();
+      this.deps.logger.info({ extId: id }, 'extension manager: bridge unavailable, worker respawned before enable');
+    }
     return this.#withLock(id, () => this.#enableLocked(id));
   }
 
@@ -527,7 +542,13 @@ export class ExtensionManager {
    * 4. 否则按指数退避重启 worker → 按拓扑重启用原 enabled 扩展 → onWorkerRestart 回调。
    */
   async handleWorkerExit(): Promise<void> {
-    if (this.#stopping || this.#restarting) return;
+    if (this.#stopping) return;
+    if (this.#restarting) {
+      // REL-3：restarting 窗口内的 exit 不再吞掉——排队，respawn 完成后补处理一次
+      //（否则第二次 exit 对应的死桥无人认领，人工 enable 会永久 EXT_ACTIVATION_FAILED）
+      this.#exitQueued = true;
+      return;
+    }
     this.#restarting = true;
     try {
       const now = Date.now();
@@ -588,6 +609,13 @@ export class ExtensionManager {
       this.deps.onWorkerRestart?.({ attempt, delayMs: delay, reenabled });
     } finally {
       this.#restarting = false;
+      // REL-3：respawn 完成后补处理 restarting 窗口内排队的 exit（合并为一次）
+      if (this.#exitQueued && !this.#stopping) {
+        this.#exitQueued = false;
+        void this.handleWorkerExit().catch((cause) => {
+          this.deps.logger.error({ err: cause }, 'extension manager: queued worker exit replay failed');
+        });
+      }
     }
   }
 
@@ -597,17 +625,39 @@ export class ExtensionManager {
   async #enableLocked(id: string): Promise<void> {
     const found = this.#discovered.get(id);
     if (found === undefined) {
+      // REL-7：未发现扩展给出可操作指引（运行中新增目录可 rescan 免重启发现）
       throw err('EXT_NOT_FOUND', {
-        detail: { id, cause: 'extension is not discovered under extensionsDirs' },
+        message: `extension "${id}" not found — call POST /api/v1/extensions/rescan (admin) to discover new extension directories`,
+        detail: {
+          id,
+          cause: 'extension is not discovered under extensionsDirs',
+          hint: 'call POST /api/v1/extensions/rescan (admin) to discover new extension directories',
+        },
       });
     }
-    const { manifest } = found;
+    const { manifest, dir } = found;
     const bridge = this.#bridge;
     if (bridge === null) {
       // 先于幂等 no-op 判定：stop 后（桥为 null）即使残留 active 态也不可再激活
       throw err('KERNEL_NOT_READY', { detail: { id, cause: 'extension worker is not running' } });
     }
     if (this.#active.has(id)) return; // 幂等
+
+    // SEC-3：builtin/mount 声明是随镜像交付的第一方扩展的特权——激活路径统一过受信闸。
+    // validateMount 未注入（deps.authMounts 缺失）时一律拒绝（fail-closed），
+    // 防 /tmp 等任意目录的 manifest 自声明 builtin/mount 骗取 rootToken 或 /api/v1 挂载。
+    if (manifest.builtin === true || manifest.mount !== undefined) {
+      const validateMount = this.deps.authMounts?.validateMount;
+      const trusted = typeof validateMount === 'function' ? validateMount(manifest, dir) === true : false;
+      if (!trusted) {
+        return await this.#failStage(id, manifest, err('EXT_PERMISSION_DENIED', {
+          message:
+            `extension "${id}" declares builtin/mount which is reserved for trusted first-party extensions ` +
+            '(the extension directory is not a kernel-trusted directory)',
+          detail: { id, reason: 'builtin/mount reserved for trusted first-party extensions' },
+        }));
+      }
+    }
 
     // manifest 层复核：API 兼容 + 权限白名单（发现后的激活前检查）
     try {
@@ -635,7 +685,7 @@ export class ExtensionManager {
         extDir: found.dir,
         mainPath: found.mainPath,
         dataDir: this.deps.config.dataDir,
-        ...(this.deps.loadBootstrap?.(manifest) ?? {}),
+        ...(this.deps.loadBootstrap?.(manifest, found.dir) ?? {}),
       });
     } catch (cause) {
       return await this.#failActivation(id, manifest, cause);
@@ -902,19 +952,15 @@ export class ExtensionManager {
         },
       });
     }
-    const validateMount = this.deps.authMounts?.validateMount;
-    if (manifest.mount !== undefined && validateMount !== undefined && !validateMount(manifest.mount)) {
-      throw err('EXT_PERMISSION_DENIED', {
-        detail: { id, mount: manifest.mount, cause: 'mount is not accepted by the kernel mount whitelist' },
-      });
-    }
+    // mount 白名单已前移至 #enableLocked 的 SEC-3 受信闸（fail-closed，含目录裁决），
+    // 此处不再重复校验（旧签名只看 mount 字符串，可被任意目录的 manifest 自声明绕过）。
   }
 
   // ------------------------------------------------------------------ 发现/拓扑
 
   /** 扫描 extensionsDirs 一级子目录中含 manifest.json 者；validateManifest 失败仅跳过并记日志 */
-  #discover(): void {
-    this.#discovered.clear();
+  #scanDirs(): Map<string, DiscoveredExt> {
+    const found = new Map<string, DiscoveredExt>();
     for (const dir of this.deps.extensionsDirs) {
       if (!existsSync(dir)) continue;
       let entries: import('node:fs').Dirent[];
@@ -932,19 +978,59 @@ export class ExtensionManager {
         try {
           const raw: unknown = JSON.parse(readFileSync(manifestPath, 'utf8'));
           const manifest = validateManifest(raw);
-          if (this.#discovered.has(manifest.id)) {
+          if (found.has(manifest.id)) {
             this.deps.logger.warn(
               { extId: manifest.id, dir: extDir },
               'extension discovery: duplicate id, first occurrence wins',
             );
             continue;
           }
-          this.#discovered.set(manifest.id, { manifest, dir: extDir, mainPath: join(extDir, manifest.main) });
+          found.set(manifest.id, { manifest, dir: extDir, mainPath: join(extDir, manifest.main) });
         } catch (cause) {
           this.deps.logger.error({ err: cause, path: manifestPath }, 'extension discovery: invalid manifest, skipped');
         }
       }
     }
+    return found;
+  }
+
+  /** 全量重扫：清空既有发现态后重建（start 路径用） */
+  #discover(): void {
+    this.#discovered.clear();
+    for (const [id, found] of this.#scanDirs()) {
+      this.#discovered.set(id, found);
+    }
+  }
+
+  /**
+   * REL-7（DX）：运行中重扫扩展目录（免重启发现新目录）。
+   * - 新发现的目录插入 #discovered，并在 extensions 表登记（enabled=0，不自动激活）；
+   * - 已有目录/已有 id 跳过（重复扫描幂等）；
+   * - 返回新增发现的 extId 列表（enable 前无需重启内核）。
+   */
+  async rescan(): Promise<{ discovered: string[] }> {
+    const found = this.#scanDirs();
+    const discovered: string[] = [];
+    for (const [id, foundExt] of found) {
+      if (this.#discovered.has(id)) continue;
+      this.#discovered.set(id, foundExt);
+      const existing = await this.#getRow(id);
+      if (existing === undefined) {
+        await this.#insertRow(id, foundExt.manifest, { enabled: false, lastError: null });
+      } else {
+        // 表里已有行（此前发现后源目录被删又恢复）：刷新声明字段，不改变 enabled
+        await this.#updateRow(id, {
+          version: foundExt.manifest.version,
+          builtin: foundExt.manifest.builtin,
+          mount: foundExt.manifest.mount ?? null,
+        });
+      }
+      discovered.push(id);
+    }
+    if (discovered.length > 0) {
+      this.deps.logger.info({ discovered }, 'extension manager: rescan discovered new extension directories');
+    }
+    return { discovered };
   }
 
   /**
@@ -1006,9 +1092,11 @@ export class ExtensionManager {
       handlers: this.deps.bridgeHandlers,
     });
     bridge.onWorkerExit(() => {
+      this.#bridgeDead = true; // REL-3：exit 后、respawn 前桥不可用（enable 据此重建）
       void this.handleWorkerExit();
     });
     this.#bridge = bridge;
+    this.#bridgeDead = false;
   }
 
   /** 内核侧全部本地摘除（worker 已死路径：不调 unload RPC），路由表清空并通知 */

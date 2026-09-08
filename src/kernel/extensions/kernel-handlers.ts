@@ -172,12 +172,12 @@ function bindingsOf(record: Record<string, unknown>): Knex.RawBinding[] {
 }
 
 /**
- * sandbox.exec 的线格式 payload（workspaceId 缺省 'ext-<extId>'——扩展的持久工作区家目录；
- * workspaceId 形态与 SandboxManager 家目录名约束一致，防目录穿越）。
+ * sandbox.exec 的线格式 payload（SEC-4：workspaceId 不再由调用方指定——工作区归属
+ * 强制为 `ext-<extId>`（扩展的持久工作区家目录），payload 中的 workspaceId 字段被
+ * 内核侧忽略，防止跨扩展读写他人工作区）。
  */
 const sandboxExecPayloadSchema = z.object({
   cmd: z.array(z.string()).min(1).max(128),
-  workspaceId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/).optional(),
   timeoutMs: z.number().int().min(1).max(600_000).optional(),
   isolated: z.boolean().optional(),
   workdir: z.string().min(1).max(1024).optional(),
@@ -444,10 +444,19 @@ export function createKernelHandlers(deps: {
     },
 
     [KERNEL_TOPICS.chatPatch]: async (payload, from) => {
-      requireExtId(from, KERNEL_TOPICS.chatPatch);
+      const extId = requireExtId(from, KERNEL_TOPICS.chatPatch);
       const record = asRecord(payload);
       const id = strField(record, 'id');
       if (id === '') throw err('BAD_REQUEST', { message: 'chat.patch requires a non-empty "id"' });
+      // SEC-4（跨扩展窃取）：扩展无 admin 身份——仅允许改写自己发送的消息。
+      // 归属不匹配（含消息不存在）统一 EXT_NOT_FOUND，不泄露目标消息的存在性。
+      const existing = await chatService().getMessage(id);
+      if (existing === null || existing.senderId !== extId) {
+        throw err('EXT_NOT_FOUND', {
+          message: `chat.patch: message "${id}" not found or not sent by extension "${extId}"`,
+          detail: { id, extId },
+        });
+      }
       return await chatService().patchMessage(id, record['content']);
     },
 
@@ -472,18 +481,34 @@ export function createKernelHandlers(deps: {
     },
 
     [KERNEL_TOPICS.filesRead]: async (payload, from) => {
-      requireExtId(from, KERNEL_TOPICS.filesRead);
+      const extId = requireExtId(from, KERNEL_TOPICS.filesRead);
       const id = strField(asRecord(payload), 'id');
       if (id === '') throw err('BAD_REQUEST', { message: 'files.read requires a non-empty "id"' });
-      const { data } = await fileService().read(id, { allowPrivate: true });
+      const { record, data } = await fileService().read(id, { allowPrivate: true });
+      // SEC-4（跨扩展窃取）：private 文件仅归属扩展可读；归属不匹配统一 EXT_NOT_FOUND
+      //（不泄露存在性）。public 文件保持任意扩展可读。
+      if (record.visibility === 'private' && record.extId !== extId) {
+        throw err('EXT_NOT_FOUND', {
+          message: `file "${id}" not found`,
+          detail: { id, extId },
+        });
+      }
       return data.toString('base64');
     },
 
     [KERNEL_TOPICS.filesGet]: async (payload, from) => {
-      requireExtId(from, KERNEL_TOPICS.filesGet);
+      const extId = requireExtId(from, KERNEL_TOPICS.filesGet);
       const id = strField(asRecord(payload), 'id');
       if (id === '') throw err('BAD_REQUEST', { message: 'files.get requires a non-empty "id"' });
-      return await fileService().get(id);
+      const record = await fileService().get(id);
+      // SEC-4（跨扩展窃取）：与 files.read 同规则——private 仅归属扩展可见
+      if (record.visibility === 'private' && record.extId !== extId) {
+        throw err('EXT_NOT_FOUND', {
+          message: `file "${id}" not found`,
+          detail: { id, extId },
+        });
+      }
+      return record;
     },
 
     // ---------------------------------------------------------------- tasks
@@ -685,10 +710,11 @@ export function createKernelHandlers(deps: {
           detail: parsed.error.issues,
         });
       }
-      // 家目录语义：workspaceId 缺省 'ext-<extId>'（扩展的持久工作区）。
+      // 家目录语义（SEC-4 归属强制）：workspaceId 一律为 `ext-<extId>`（调用方的持久
+      // 工作区），payload.workspaceId 被刻意忽略——扩展不能指定他人工作区（跨扩展窃取）。
       // manager.get 未启用时抛 SANDBOX_DISABLED（透传）；启用且不存在 → 懒创建后执行，
       // 之后的 exec 复用同一工作区（家目录随 <dataDir>/sandbox/ 持久化，重启按目录恢复）。
-      const workspaceId = parsed.data.workspaceId ?? `ext-${extId}`;
+      const workspaceId = `ext-${extId}`;
       if (manager.get(workspaceId) === null) {
         await manager.createWorkspace({ id: workspaceId });
       }

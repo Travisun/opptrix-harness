@@ -40,6 +40,8 @@ let rootToken = '';
 const rootAuth = { authorization: '' };
 /** 会话令牌头（auth 扩展签发的 ses token） */
 const sesAuth = { authorization: '' };
+/** 会话令牌原文（SEC-7 后 auth mount 派发裁剪 authorization，凭据走 ?token= 通道） */
+let sesToken = '';
 
 beforeAll(async () => {
   dataDir = await mkdtemp(path.join(tmpdir(), 'opptrix-final-e2e-'));
@@ -127,8 +129,10 @@ describe('最终回炉 E2E 终验', () => {
     expect(body.token).toMatch(/^ses_/);
     expect(body.user).toMatchObject({ username: 'owner', role: 'admin' });
     sesAuth.authorization = `Bearer ${body.token}`;
+    sesToken = body.token;
 
-    const me = await app.inject({ method: 'GET', url: '/api/v1/auth/me', headers: sesAuth });
+    // SEC-7：auth mount 派发不再透传 authorization——/auth/me 凭据走 ?token= 查询通道
+    const me = await app.inject({ method: 'GET', url: `/api/v1/auth/me?token=${sesToken}` });
     expect(me.statusCode).toBe(200);
     // auth 扩展 /auth/me 契约：扁平身份 { userId, username, role, scopes, tokenType }
     expect(me.json()).toMatchObject({ username: 'owner', role: 'admin', tokenType: 'session' });
@@ -204,7 +208,8 @@ describe('最终回炉 E2E 终验', () => {
     const body = multipartBody('sample.txt', 'text/plain', content);
     const upload = await app.inject({
       method: 'POST',
-      url: '/api/v1/files',
+      // SEC-4：扩展仅可读自己（extId 归属）的 private 文件——以 ?extId=doc-demo 上传归属
+      url: '/api/v1/files?extId=doc-demo',
       headers: { ...sesAuth, ...body.headers },
       payload: body.payload,
     });

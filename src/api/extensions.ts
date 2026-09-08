@@ -57,6 +57,8 @@ export interface ExtensionsApiDeps {
     reload(id: string): Promise<void>;
     /** 卸载扩展；opts.purge=true 时连同持久化数据清除 */
     uninstall(id: string, opts?: { purge?: boolean }): Promise<void>;
+    /** REL-7：重扫扩展目录（新目录插表 enabled=0；返回新增发现的 extId） */
+    rescan(): Promise<{ discovered: string[] }>;
     /** 扩展注册的 HTTP 路由清单（管理台内省用） */
     getRoutes(): unknown[];
   };
@@ -159,6 +161,14 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtensionsAp
   app.get('/api/v1/extensions/registry', routeOptions, async (request) => {
     await requireAdmin(request);
     return deps.registry.list();
+  });
+
+  // POST /api/v1/extensions/rescan — 重扫扩展目录（REL-7；新目录插表 enabled=0，免重启发现）
+  app.post('/api/v1/extensions/rescan', writeOptions, async (request, reply) => {
+    await requireAdmin(request);
+    const { discovered } = await deps.manager.rescan();
+    reply.code(200);
+    return { ok: true, discovered };
   });
 
   // POST /api/v1/extensions/:id/enable — 启用扩展

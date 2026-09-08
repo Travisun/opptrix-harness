@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import pino from 'pino';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Knex } from 'knex';
 
 import { HOST_METHODS, type RpcEnvelope } from '../src/extension-host/protocol.js';
@@ -872,6 +872,8 @@ describe('ExtensionManager', () => {
       contributions: {
         full: contribsOf({ routes: [{ method: 'GET', path: '/a' }], events: [{ pattern: 'e.f' }, { pattern: 'g.h' }] }),
       },
+      // SEC-3：builtin/mount 声明需过受信闸——本用例关注摘要形状，注入受信 stub
+      validateMount: () => true,
     });
     await h.manager.start();
     const summary = h.manager.list().find((s) => s.id === 'full');
@@ -905,5 +907,114 @@ describe('ExtensionManager', () => {
     await expect(h2.manager.enable('a')).rejects.toMatchObject({
       code: err('KERNEL_NOT_READY').code,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SEC-3：builtin/mount 受信闸（fail-closed）
+// ---------------------------------------------------------------------------
+
+describe('SEC-3：builtin/mount 声明的受信闸', () => {
+  it('未注入 authMounts（fail-closed）：自声明 builtin+mount 的扩展 enable → EXT_PERMISSION_DENIED 且 enabled=0', async () => {
+    const h = await buildHarness({
+      dirs: { rogue: manifestOf({ id: 'rogue', builtin: true, mount: 'auth' }) },
+      enabledInDb: ['rogue'],
+      contributions: { rogue: contribsOf() },
+    });
+    await h.manager.start();
+    // start 时按同规则拒绝激活（迁移既有残留行的防线）
+    const summary = h.manager.list().find((s) => s.id === 'rogue');
+    expect(summary?.enabled).toBe(false);
+    expect(summary?.lastError).toContain('HARNESS-3002');
+
+    await expect(h.manager.enable('rogue')).rejects.toMatchObject({
+      code: err('EXT_PERMISSION_DENIED').code,
+      detail: { reason: 'builtin/mount reserved for trusted first-party extensions' },
+    });
+    expect(h.worker.loads).not.toContain('rogue');
+  });
+
+  it('仅 mount 声明（非 builtin）同样过闸；受信 stub 放行后正常激活', async () => {
+    const untrusted = await buildHarness({
+      dirs: { m: manifestOf({ id: 'm', mount: 'auth' }) },
+      enabledInDb: ['m'],
+      contributions: { m: contribsOf() },
+    });
+    await untrusted.manager.start();
+    await expect(untrusted.manager.enable('m')).rejects.toMatchObject({
+      code: err('EXT_PERMISSION_DENIED').code,
+    });
+
+    const trusted = await buildHarness({
+      dirs: { m: manifestOf({ id: 'm', builtin: true, mount: 'auth' }) },
+      enabledInDb: ['m'],
+      contributions: { m: contribsOf() },
+      validateMount: () => true, // 受信目录（Kernel 接线按 repoRoot/extensions 裁决）
+    });
+    await trusted.manager.start();
+    expect(trusted.manager.list().find((s) => s.id === 'm')?.enabled).toBe(true);
+    expect(trusted.worker.loads).toContain('m');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REL-3：#restarting 窗口死桥自愈
+// ---------------------------------------------------------------------------
+
+describe('REL-3：restarting 窗口内的第二次 exit 不再吞掉', () => {
+  it('连续两次 exit（第二次落在 restarting 窗口）→ 排队补处理，enable 仍成功', async () => {
+    const h = await buildHarness({
+      dirs: { a: manifestOf({ id: 'a', permissions: ['http', 'cron', 'events', 'hooks'] }) },
+      enabledInDb: ['a'],
+      contributions: { a: FULL_CONTRIBS },
+      restartBackoffMs: [5, 10, 20],
+    });
+    await h.manager.start();
+    expect(h.worker.loads.length).toBe(1);
+
+    // 第一次 exit 触发自愈；第二次 exit 紧随其后（落在 #restarting 窗口内）
+    h.worker.emitExit(1);
+    h.worker.emitExit(1);
+
+    // 两个自愈周期完成后：worker 至少 3 次 load（初始 + 周期1重启用 + 周期2重启用）
+    await vi.waitFor(() => {
+      expect(h.worker.loads.length).toBeGreaterThanOrEqual(3);
+    }, { timeout: 2_000 });
+
+    // 人工 enable 不再出现死桥 EXT_ACTIVATION_FAILED：幂等 no-op 或重建后激活均成功
+    await expect(h.manager.enable('a')).resolves.toBeUndefined();
+    expect(h.manager.bridge).not.toBeNull();
+    expect(h.manager.getRoutes().some((r) => r.extId === 'a')).toBe(true);
+  }, 10_000);
+});
+
+// ---------------------------------------------------------------------------
+// REL-7：rescan 免重启发现新扩展目录
+// ---------------------------------------------------------------------------
+
+describe('REL-7：manager.rescan() 运行中重扫目录', () => {
+  it('新目录插表 enabled=0 并可立即 enable（免重启）；重复 rescan 幂等', async () => {
+    const h = await buildHarness({
+      dirs: { a: manifestOf({ id: 'a' }) },
+      contributions: { a: contribsOf() },
+    });
+    await h.manager.start();
+
+    // 运行中新增扩展目录（make 场景）
+    mkdirSync(join(h.extDir, 'late'), { recursive: true });
+    writeFileSync(join(h.extDir, 'late', 'manifest.json'), JSON.stringify(manifestOf({ id: 'late', version: '2.0.0' })));
+
+    const first = await h.manager.rescan();
+    expect(first.discovered).toEqual(['late']);
+    const row = h.manager.list().find((s) => s.id === 'late');
+    expect(row?.enabled).toBe(false); // 插表 enabled=0，不自动激活
+    expect(row?.manifest?.version).toBe('2.0.0');
+
+    await h.manager.enable('late'); // 免重启激活
+    expect(h.worker.loads).toContain('late');
+    expect(h.manager.list().find((s) => s.id === 'late')?.enabled).toBe(true);
+
+    const second = await h.manager.rescan();
+    expect(second.discovered).toEqual([]); // 已有目录跳过（幂等）
   });
 });

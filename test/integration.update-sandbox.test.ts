@@ -569,12 +569,14 @@ describe('kernel-handlers sandbox.exec（阶段 11 接管）', () => {
     expect(manager.list().map((w) => w.id)).toEqual(['ext-x']);
   });
 
-  it('显式 workspaceId 按给定 id 懒创建；manager 禁用 → 透传 SANDBOX_DISABLED', async () => {
+  it('payload.workspaceId 被忽略：工作区强制 ext-<extId>（SEC-4 归属）；manager 禁用 → 透传 SANDBOX_DISABLED', async () => {
     const dir = await newDir('handler-mixed');
     const manager = await makeManager(dir);
     const handlers = makeHandlers(manager, () => ['sandbox'], dir);
+    // SEC-4：调用方自带的 workspaceId（'custom-ws'）被刻意忽略——扩展不能指定他人工作区
     await handlers[KERNEL_TOPICS.sandboxExec]({ cmd: ['ls'], workspaceId: 'custom-ws' }, 'y');
-    expect(manager.get('custom-ws')).not.toBeNull();
+    expect(manager.get('ext-y')).not.toBeNull();
+    expect(manager.get('custom-ws')).toBeNull();
 
     // 禁用（client null + 配置关）：SANDBOX_DISABLED 原样透传
     const disabledDir = await newDir('handler-disabled');
@@ -652,6 +654,39 @@ describe('自动升级 cron（kernel:auto-update）', () => {
       await shutdownKernel(booted.kernel);
     }
   }, 30_000);
+
+  it('REL-4：同一 dataDir 连续两次 boot → kernel:auto-update 恰 1 行（先摘旧再重排）', async () => {
+    const dir = await newDir('auto-update-reboot');
+    const overrides = {
+      updaterOverride: {
+        check: vi.fn(async () => ({ currentVersion: null, available: null, feedOk: false })),
+        apply: vi.fn(async () => ({ ok: true, slot: 'slot-b' as const, version: '9.9.9' })),
+        history: vi.fn(async () => []),
+      },
+    };
+    const configOverrides = {
+      updateAuto: true,
+      updateFeed: 'http://127.0.0.1:9/feed.json',
+      updateWindow: '0 4 * * *',
+    };
+    const first = await bootKernel(dir, overrides, configOverrides);
+    try {
+      const cron1 = first.kernel.container.resolve<CronScheduler>(FACADE_CONTAINER_KEYS.cronScheduler);
+      expect(cron1.list().filter((j) => j.name === 'kernel:auto-update')).toHaveLength(1);
+    } finally {
+      await shutdownKernel(first.kernel);
+    }
+
+    // 第二次 boot（同 dataDir）：REL-4 先摘旧行再重排，表内不重复
+    const second = await bootKernel(dir, overrides, configOverrides);
+    try {
+      const cron2 = second.kernel.container.resolve<CronScheduler>(FACADE_CONTAINER_KEYS.cronScheduler);
+      const jobs = cron2.list().filter((j) => j.name === 'kernel:auto-update');
+      expect(jobs).toHaveLength(1);
+    } finally {
+      await shutdownKernel(second.kernel);
+    }
+  }, 60_000);
 });
 
 afterAll(async () => {

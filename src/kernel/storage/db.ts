@@ -202,15 +202,16 @@ export async function dbFileSize(file: string): Promise<number> {
  */
 const SQL_LITERAL_PATTERN = /'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]/g;
 
-/** 禁止的关键词（大小写不敏感、词边界）：ATTACH / DETACH / load_extension */
-const FORBIDDEN_KEYWORD_PATTERN = /\b(?:attach|detach|load_extension)\b/i;
+/** 禁止关键词（大小写不敏感、词边界）：ATTACH / DETACH / load_extension / VACUUM（VACUUM INTO 可跨库逃逸） */
+const FORBIDDEN_KEYWORD_PATTERN = /\b(?:attach|detach|load_extension|vacuum)\b/i;
 
 /**
  * 扩展 SQL 单语句防护（供 `h.db.raw` 等入口在执行前调用）。
  *
  * 规则（先剥离字符串/标识符字面量，再校验，避免字面量内容误伤）：
  * 1. 多语句：剥离字面量后按分号计数，多于 1 个即拒绝（允许单个结尾分号）
- * 2. 危险关键词：ATTACH / DETACH / load_extension，大小写不敏感、要求词边界
+ * 2. 危险关键词：ATTACH / DETACH / load_extension / VACUUM，大小写不敏感、要求词边界
+ *   （VACUUM 可带 INTO <db> 子句把整库写到任意路径——SEC-5 逃逸；内核备份走 db.raw 不经此函数）
  *
  * 注意：校验是保守的——出现在 SQL 注释中的关键词同样会被拒绝（fail-closed）；
  * 多语句中"仅 1 个分号且末尾还有内容"的写法由 better-sqlite3 自身的
@@ -237,7 +238,7 @@ export function forbidDangerousSql(sql: string): void {
     throw err('DB_STATEMENT_FORBIDDEN', {
       message:
         `sql rejected: "${keyword}" is not allowed. ` +
-        'ATTACH/DETACH/load_extension can escape the per-extension database sandbox.',
+        'ATTACH/DETACH/load_extension/VACUUM can escape the per-extension database sandbox.',
       detail: { reason: 'forbidden-keyword', keyword, excerpt: excerpt(stripped) },
     });
   }

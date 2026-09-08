@@ -292,8 +292,28 @@ export class ExtensionBridge {
       }
       this.#pending.delete(msg.id);
       clearTimeout(pending.timer);
-      if (msg.ok === true) pending.resolve(msg.payload);
-      else pending.reject(reviveWireError(msg.err));
+      if (msg.ok === true) {
+        // REL-1：reply 方向负载上限——超限以明确错误拒绝调用方，不把 8MB+ 数据递回去
+        let bytes = Number.MAX_SAFE_INTEGER;
+        try {
+          bytes = payloadBytes(msg.payload);
+        } catch {
+          /* 不可序列化按超限拒绝 */
+        }
+        if (bytes > this.#deps.maxPayloadBytes) {
+          this.#deps.logger.warn(
+            { id: msg.id, topic: msg.topic, bytes, max: this.#deps.maxPayloadBytes },
+            'bridge: rejected oversized reply payload from worker',
+          );
+          pending.reject(err('RPC_PAYLOAD_TOO_LARGE', {
+            detail: { topic: msg.topic, bytes, max: this.#deps.maxPayloadBytes },
+          }));
+          return;
+        }
+        pending.resolve(msg.payload);
+        return;
+      }
+      pending.reject(reviveWireError(msg.err));
       return;
     }
     if (msg.type === 'call') {
@@ -351,6 +371,28 @@ export class ExtensionBridge {
   /** 向 worker 回执（桥已 stop 时静默丢弃——停桥后不再往 worker 写任何消息） */
   #postReply(call: RpcEnvelope, ok: boolean, payload: unknown, error: RpcEnvelope['err']): void {
     if (this.#stopped) return;
+    // REL-1：host→worker 的回执同样限流——handler 结果超限时改发错误回执（worker 侧
+    // 调用方收到明确的 RPC_PAYLOAD_TOO_LARGE，而不是 8MB+ 数据或超时挂死）
+    if (ok) {
+      let bytes = Number.MAX_SAFE_INTEGER;
+      try {
+        bytes = payloadBytes(payload);
+      } catch {
+        /* 不可序列化按超限处理 */
+      }
+      if (bytes > this.#deps.maxPayloadBytes) {
+        this.#deps.logger.warn(
+          { id: call.id, topic: call.topic, bytes, max: this.#deps.maxPayloadBytes },
+          'bridge: reply to worker dropped (payload too large)',
+        );
+        ok = false;
+        error = {
+          code: err('RPC_PAYLOAD_TOO_LARGE').code,
+          message: 'rpc payload too large',
+          detail: { from: endpointToId(call.from), topic: call.topic, bytes, max: this.#deps.maxPayloadBytes },
+        };
+      }
+    }
     const envelope: RpcEnvelope = {
       v: 1,
       id: call.id,

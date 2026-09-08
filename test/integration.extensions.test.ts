@@ -14,6 +14,7 @@
  * 不受 dist 产物是否新鲜影响（确定性）。
  */
 import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -35,6 +36,13 @@ import { UiRegistry } from '../src/kernel/extensions/ui-registry.js';
 import { Counters } from '../src/kernel/system/info.js';
 import { openSqlite } from '../src/kernel/storage/db.js';
 import { err } from '../src/kernel/errors/index.js';
+import { HOST_METHODS } from '../src/extension-host/protocol.js';
+import { ExtensionManager } from '../src/kernel/extensions/manager.js';
+import { createWorkerFactory } from '../src/extension-host/worker-factory.js';
+import { EventBus } from '../src/kernel/events/bus.js';
+import { HookManager } from '../src/kernel/hooks/manager.js';
+import { KERNEL_MIGRATIONS } from '../src/kernel/storage/kernel-migrations.js';
+import { Migrator } from '../src/kernel/storage/migrator.js';
 
 // ---------------------------------------------------------------------------
 // 环境：真实 Kernel（临时 dataDir、端口 0、静音日志、dev worker）
@@ -284,6 +292,7 @@ describe('kernel-handlers 单元', () => {
   let notifySend: ReturnType<typeof vi.fn>;
   let chatSend: ReturnType<typeof vi.fn>;
   let chatPatch: ReturnType<typeof vi.fn>;
+  let chatGetMessage: ReturnType<typeof vi.fn>;
   let filesStore: ReturnType<typeof vi.fn>;
   let filesRead: ReturnType<typeof vi.fn>;
   let filesGet: ReturnType<typeof vi.fn>;
@@ -322,9 +331,11 @@ describe('kernel-handlers 单元', () => {
     notifySend = vi.fn(async (input: unknown) => ({ id: 'n1', input }));
     chatSend = vi.fn(async (input: unknown) => ({ blocked: false, input }));
     chatPatch = vi.fn(async (id: string, content: unknown) => ({ id, content }));
+    // SEC-4 归属判定数据源：缺省 m1 归 EXT_A（本人消息）；用例可 mockResolvedValueOnce 覆盖
+    chatGetMessage = vi.fn(async (id: string) => ({ id, senderId: EXT_A, content: { text: 'orig' } }));
     filesStore = vi.fn(async (input: { data: Buffer }) => ({ id: 'f1', size: input.data.byteLength }));
-    filesRead = vi.fn(async () => ({ record: { id: 'f1' }, data: Buffer.from('binary-data') }));
-    filesGet = vi.fn(async () => ({ id: 'f1', origName: 'a.txt' }));
+    filesRead = vi.fn(async () => ({ record: { id: 'f1', visibility: 'private', extId: EXT_A }, data: Buffer.from('binary-data') }));
+    filesGet = vi.fn(async () => ({ id: 'f1', origName: 'a.txt', visibility: 'private', extId: EXT_A }));
     taskDispatch = vi.fn(async (input: unknown) => ({ id: 't1', input }));
     taskGet = vi.fn(async (id: string) => ({ id, extId: EXT_A }));
     taskProgress = vi.fn();
@@ -335,7 +346,7 @@ describe('kernel-handlers 单元', () => {
     const container = makeStubContainer({
       [CONTAINER_KEYS.db]: kernelDb,
       [CONTAINER_KEYS.notify]: { send: notifySend },
-      [CONTAINER_KEYS.chat]: { sendMessage: chatSend, patchMessage: chatPatch },
+      [CONTAINER_KEYS.chat]: { sendMessage: chatSend, patchMessage: chatPatch, getMessage: chatGetMessage },
       [CONTAINER_KEYS.files]: { store: filesStore, read: filesRead, get: filesGet },
       [CONTAINER_KEYS.tasks]: {
         dispatch: taskDispatch,
@@ -466,6 +477,17 @@ describe('kernel-handlers 单元', () => {
 
     await h('chat.patch')({ id: 'm1', content: 'edited' }, EXT_A);
     expect(chatPatch).toHaveBeenCalledWith('m1', 'edited');
+
+    // SEC-4：chat.patch 归属校验——他人消息/不存在消息统一 EXT_NOT_FOUND（不泄露存在性）
+    chatGetMessage.mockResolvedValueOnce({ id: 'm2', senderId: 'ext-b', content: { text: 'x' } });
+    await expect(h('chat.patch')({ id: 'm2', content: 'hijack' }, EXT_A)).rejects.toMatchObject({
+      code: err('EXT_NOT_FOUND').code,
+    });
+    expect(chatPatch).not.toHaveBeenCalledWith('m2', 'hijack');
+    chatGetMessage.mockResolvedValueOnce(null);
+    await expect(h('chat.patch')({ id: 'missing', content: 'x' }, EXT_A)).rejects.toMatchObject({
+      code: err('EXT_NOT_FOUND').code,
+    });
   });
 
   it('files.save（base64 解码 + extId 归属）/ read（base64 返回）/ get', async () => {
@@ -477,7 +499,15 @@ describe('kernel-handlers 单元', () => {
     expect(filesStore).toHaveBeenCalledWith(expect.objectContaining({ extId: EXT_A, origName: 'a.txt' }));
 
     await expect(h('files.read')({ id: 'f1' }, EXT_A)).resolves.toBe(Buffer.from('binary-data').toString('base64'));
-    await expect(h('files.get')({ id: 'f1' }, EXT_A)).resolves.toEqual({ id: 'f1', origName: 'a.txt' });
+    await expect(h('files.get')({ id: 'f1' }, EXT_A)).resolves.toEqual({ id: 'f1', origName: 'a.txt', visibility: 'private', extId: EXT_A });
+
+    // SEC-4：他人 private 文件统一 EXT_NOT_FOUND（不泄露存在性）；public 文件任意扩展可读
+    filesRead.mockResolvedValueOnce({ record: { id: 'f2', visibility: 'private', extId: 'ext-b' }, data: Buffer.from('secret') });
+    await expect(h('files.read')({ id: 'f2' }, EXT_A)).rejects.toMatchObject({ code: err('EXT_NOT_FOUND').code });
+    filesGet.mockResolvedValueOnce({ id: 'f2', visibility: 'private', extId: null });
+    await expect(h('files.get')({ id: 'f2' }, EXT_A)).rejects.toMatchObject({ code: err('EXT_NOT_FOUND').code });
+    filesRead.mockResolvedValueOnce({ record: { id: 'f3', visibility: 'public', extId: 'ext-b' }, data: Buffer.from('pub') });
+    await expect(h('files.read')({ id: 'f3' }, EXT_A)).resolves.toBe(Buffer.from('pub').toString('base64'));
   });
 
   it('tasks.dispatch 记录 extId；task.progress/complete/fail 校验归属后转发', async () => {
@@ -561,6 +591,132 @@ describe('kernel-handlers 单元', () => {
     expect(stats.pid).toBeTypeOf('number');
     expect(stats.memory.rss).toBeGreaterThan(0);
   });
+});
+
+// #############################################################################
+// REL-2：host.call / host.cron 按信封 to 归属定位（真 worker；同名不串味）
+// #############################################################################
+
+describe('REL-2：两个扩展同名 service/cron 各自命中、互不串味', () => {
+  const logger = pino({ level: 'silent' });
+  let root = '';
+  let manager: ExtensionManager;
+  const cronScheduled: unknown[] = [];
+  /** worker→kernel log 转发捕获：[{ who }]（cron handler 用 who 标识自身） */
+  const cronRuns: Array<{ who: string }> = [];
+
+  function makeExt(id: string): void {
+    const dir = path.join(root, 'extensions', id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path.join(dir, 'manifest.json'),
+      JSON.stringify({ id, api: 1, version: '1.0.0', main: 'index.js', permissions: ['cron'], provides: ['dup'] }),
+    );
+    writeFileSync(
+      path.join(dir, 'index.js'),
+      [
+        `'use strict';`,
+        `defineExtension(async (h) => {`,
+        `  h.expose('dup', { ping: async () => '${id}' });`,
+        `  await h.cron.schedule({ name: 'dup', expr: '0 0 31 2 *' }, async () => {`,
+        `    await h.log.info('cron-ran', { who: '${id}' });`,
+        `  });`,
+        `});`,
+        ``,
+      ].join('\n'),
+    );
+  }
+
+  beforeAll(async () => {
+    root = await mkdtemp(path.join(tmpdir(), 'opptrix-rel2-'));
+    makeExt('svc-a');
+    makeExt('svc-b');
+    const db = await openSqlite(path.join(root, 'kernel.sqlite'));
+    await new Migrator(db, { migrations: KERNEL_MIGRATIONS }).latest();
+    manager = new ExtensionManager({
+      config: {
+        ...loadConfig({ NODE_ENV: 'test', HARNESS_LOG_LEVEL: 'error', HARNESS_DATA_DIR: root }),
+        env: 'test',
+        dataDir: root,
+      },
+      db,
+      logger,
+      workerFactory: createWorkerFactory(logger),
+      bridgeHandlers: {
+        'cron.schedule': async (payload) => {
+          cronScheduled.push(payload);
+          return { id: `cron-${cronScheduled.length}` };
+        },
+        'cron.unschedule': async () => ({ ok: true }),
+        log: async (payload) => {
+          const record = (payload ?? {}) as { msg?: string; args?: Array<{ who?: string }> };
+          if (record.msg === 'cron-ran') {
+            const who = record.args?.[0]?.who;
+            if (typeof who === 'string') cronRuns.push({ who });
+          }
+          return { ok: true };
+        },
+      },
+      scheduler: {
+        schedule: async (input) => {
+          cronScheduled.push(input);
+          return { id: `cron-${cronScheduled.length}` };
+        },
+        unschedule: async () => true,
+        list: () => [],
+      },
+      eventBus: new EventBus({ logger }),
+      hooks: new HookManager({ logger }),
+      extensionsDirs: [path.join(root, 'extensions')],
+    });
+    await manager.start();
+    await manager.enable('svc-a');
+    await manager.enable('svc-b');
+  }, 60_000);
+
+  afterAll(async () => {
+    await manager?.stop();
+    if (root !== '') await rm(root, { recursive: true, force: true });
+  });
+
+  it('host.call：同名 dup.ping 按信封 to 各自命中', async () => {
+    const bridge = manager.bridge;
+    expect(bridge).not.toBeNull();
+    const pingA = await bridge?.callToWorker('svc-a', HOST_METHODS.callService, {
+      service: 'dup',
+      method: 'ping',
+      args: {},
+    });
+    const pingB = await bridge?.callToWorker('svc-b', HOST_METHODS.callService, {
+      service: 'dup',
+      method: 'ping',
+      args: {},
+    });
+    expect(pingA).toBe('svc-a');
+    expect(pingB).toBe('svc-b');
+  });
+
+  it('host.call：目标扩展未暴露该方法 → 明确 RPC_TARGET_NOT_FOUND（不回落到其他扩展）', async () => {
+    const bridge = manager.bridge;
+    await expect(
+      bridge?.callToWorker('svc-a', HOST_METHODS.callService, { service: 'dup', method: 'missing', args: {} }),
+    ).rejects.toMatchObject({ code: err('RPC_TARGET_NOT_FOUND').code });
+  });
+
+  it('host.cron：同名 cron 按信封 to 触发各自的 handler', async () => {
+    const bridge = manager.bridge;
+    const firedA = (await bridge?.callToWorker('svc-a', HOST_METHODS.cronFire, { name: 'dup' })) as { ok?: boolean };
+    expect(firedA).toMatchObject({ ok: true, fired: 'dup' });
+    await vi.waitFor(() => {
+      expect(cronRuns.some((r) => r.who === 'svc-a')).toBe(true);
+    });
+
+    const firedB = (await bridge?.callToWorker('svc-b', HOST_METHODS.cronFire, { name: 'dup' })) as { ok?: boolean };
+    expect(firedB).toMatchObject({ ok: true, fired: 'dup' });
+    await vi.waitFor(() => {
+      expect(cronRuns.some((r) => r.who === 'svc-b')).toBe(true);
+    });
+  }, 30_000);
 });
 
 // #############################################################################

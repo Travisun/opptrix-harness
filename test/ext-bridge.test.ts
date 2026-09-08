@@ -372,4 +372,48 @@ describe('ExtensionBridge', () => {
     replyOk(worker, sentCall(worker, 1), 'fine');
     await expect(next).resolves.toBe('fine');
   });
+
+  // -------------------------------------------------------------- REL-1：reply 方向限流
+
+  it('REL-1：worker 回执负载超限 → 调用方收到明确 RPC_PAYLOAD_TOO_LARGE 而非 8MB+ 数据', async () => {
+    const { worker, bridge } = makeBridge({ maxPayloadBytes: 64 });
+    const pending = bridge.callToWorker('a', 'host.route', { n: 1 });
+    const call = sentCall(worker, 0);
+    // 替 worker 回一个远超上限的成功应答
+    worker.emitMessage({
+      v: 1,
+      id: call.id,
+      from: call.to,
+      to: 'kernel',
+      type: 'reply',
+      topic: call.topic,
+      ok: true,
+      payload: { blob: 'x'.repeat(1024) },
+    });
+    await expect(pending).rejects.toMatchObject({ code: err('RPC_PAYLOAD_TOO_LARGE').code });
+  });
+
+  it('REL-1：host→worker 回执（handler 结果）超限 → 改发错误回执而非灌大数据', async () => {
+    const { worker, bridge } = makeBridge({
+      maxPayloadBytes: 64,
+      handlers: {
+        'kv.get': async () => ({ blob: 'x'.repeat(1024) }),
+      },
+    });
+    worker.emitMessage({
+      v: 1,
+      id: 'w-rel1',
+      from: 'ext:a',
+      to: 'kernel',
+      type: 'call',
+      topic: 'kv.get',
+      payload: { key: 'k' },
+    });
+    await flush();
+    const reply = worker.sent[0] as RpcEnvelope;
+    expect(reply.type).toBe('reply');
+    expect(reply.ok).toBe(false);
+    expect(reply.err?.code).toBe(err('RPC_PAYLOAD_TOO_LARGE').code);
+    expect(JSON.stringify(reply).length).toBeLessThan(1024); // 超限数据没有出站
+  });
 });

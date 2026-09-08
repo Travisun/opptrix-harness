@@ -10,7 +10,7 @@
  */
 import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -437,6 +437,29 @@ describe('Updater.apply', () => {
       await expect(stat(path.join(dataDir, 'releases', 'incoming.tar.gz'))).rejects.toMatchObject({ code: 'ENOENT' });
       await expect(stat(path.join(dataDir, 'releases', '.preflight-data'))).rejects.toMatchObject({ code: 'ENOENT' });
       expect(spy.calls).toHaveLength(0); // 成功通知延迟到重启后的 settlePendingUpdate
+    } finally {
+      await server.close();
+    }
+  }, 30_000);
+
+  it('REL-5：history 写失败（history.json 是目录）→ 仅 warn，requestRestart 仍被调', async () => {
+    const { server } = await makeReleaseServer(MAIN_JS_OK);
+    try {
+      await seedVersion('1.0.0');
+      await commitNewSlot(slotsCfg, { newSlot: 'slot-a', version: '1.0.0' }).catch(() => {});
+      // 使 history 追加必然失败：history.json 是目录（readFile → EISDIR → INTERNAL）
+      const releasesDir = path.join(dataDir, 'releases');
+      await mkdir(releasesDir, { recursive: true });
+      await mkdir(path.join(releasesDir, 'history.json'));
+      const restarts: number[] = [];
+      const updater = makeUpdater({ feedUrl: `${server.baseUrl}/feed`, restarts });
+
+      const result = await updater.apply();
+      // 提交不可逆：history 失败不阻断重启，也不改变成功结果
+      expect(result).toEqual({ ok: true, slot: 'slot-b', version: '2.0.0' });
+      const state = await readSlots(slotsCfg);
+      expect(state.current).toBe('slot-b');
+      expect(restarts).toHaveLength(1); // REL-5 核心：无论如何 requestRestart 被调用
     } finally {
       await server.close();
     }

@@ -6,8 +6,17 @@
  *   setTimeout / setInterval / clearTimeout / clearInterval（受控登记表，
  *   cleanup() 全清）、queueMicrotask、structuredClone、TextEncoder / TextDecoder、
  *   URL、crypto.getRandomValues(+randomUUID，globalThis.crypto 子集)；
+ * - **SEC-1 realm 加固**：凡递入 VM 的宿主函数一律经 realm.ts 的桥包装成 VM realm
+ *   函数，凡暴露对象一律建成 VM realm 对象——扩展代码 `x.constructor.constructor(...)`
+ * 无法再触达宿主 Function 构造器（四条实测逃逸链的根因修复在本文件与 realm.ts）：
+ *   · console 各方法、定时器包装器、queueMicrotask、structuredClone、
+ *     TextEncoder/TextDecoder/URL/crypto 的可调用成员全部是 VM realm 函数；
+ *   · 定时器句柄改为 VM 侧数字令牌（宿主 Timeout 对象不再进入 VM）；
+ *   · structuredClone 即 VM 内编译的深拷贝器（输出 VM realm 对象）；
+ *   · TextEncoder/TextDecoder/URL 为 VM 内编译的委托类（编译产物即 VM realm 类，
+ *     编码结果经深拷贝入 VM realm）。
  * - 所有全局绑定不可写、不可配置（严格模式改写抛 TypeError，宽松模式静默无效）；
- *   自建对象（console / crypto / 定时器包装器等）额外 Object.freeze；
+ *   自建对象（console / crypto / 定时器包装器等）在 VM 侧 Object.freeze；
  * - 刻意不注入：process / require / Buffer / performance —— 受限 require 由
  *   sandbox.ts 装配，模块在宿主侧编译进本 context；宿主自身禁止 console.*。
  * - 定时器 / 微任务回调异常一律 try/catch + kernelCall log error 转发，
@@ -19,6 +28,8 @@
 import { randomUUID, webcrypto } from 'node:crypto';
 import vm from 'node:vm';
 
+import { realmBridgeFor } from './realm.js';
+import type { RealmBridge } from './realm.js';
 import { KERNEL_TOPICS } from './protocol.js';
 
 // ---------------------------------------------------------------------------
@@ -86,9 +97,11 @@ export interface VmRuntimeDeps {
   timers?: TimerRegistry;
 }
 
-/** 装配产物：context 供 sandbox/worker 继续装配；cleanup 清全部受控定时器 */
+/** 装配产物：context 供 sandbox/worker 继续装配；bridge 供宿主向 VM 递函数/数据；cleanup 清全部受控定时器 */
 export interface ExtVm {
   context: vm.Context;
+  /** 宿主 ⇄ VM realm 边界包装工厂（SEC-1：宿主函数/数据经它包装后才能进 VM） */
+  readonly bridge: RealmBridge;
   cleanup(): void;
 }
 
@@ -125,31 +138,6 @@ function truncateLogArg(arg: unknown): string {
     }
   }
   return text.length <= LOG_MAX_ARG_CHARS ? text : text.slice(0, LOG_MAX_ARG_CHARS);
-}
-
-/**
- * 构造 VM 内 console（冻结）：info/warn/error/debug 全部转发到
- * kernelCall(KERNEL_TOPICS.log, { level, msg, args })；scope（ext:<id>）
- * 由内核侧按信封 from 处理，这里不重复携带。
- * kernelCall 失败降级 deps.logger，绝不向 VM 抛错。
- */
-function makeConsole(deps: VmRuntimeDeps): unknown {
-  const forward = (level: string) => (msg: unknown, ...rest: unknown[]): void => {
-    const payload = {
-      level,
-      msg: typeof msg === 'string' ? msg : truncateLogArg(msg),
-      args: rest.slice(0, LOG_MAX_ARGS).map(truncateLogArg),
-    };
-    deps.kernelCall(KERNEL_TOPICS.log, payload, LOG_RPC_TIMEOUT_MS).catch(() => {
-      deps.logger.error({ extId: deps.extId, level }, 'sandbox console forward failed');
-    });
-  };
-  return Object.freeze({
-    debug: forward('debug'),
-    info: forward('info'),
-    warn: forward('warn'),
-    error: forward('error'),
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -190,35 +178,6 @@ function normalizeDelay(delay: unknown): number {
   return n > MAX_TIMER_DELAY_MS ? 1 : n;
 }
 
-/** 构造 VM 内 setTimeout/setInterval（冻结、登记表受控、回调异常防护） */
-function makeScheduleTimer(deps: VmRuntimeDeps, timers: TimerRegistry, interval: boolean): unknown {
-  return Object.freeze((callback: unknown, delay?: unknown, ...args: unknown[]): NodeJS.Timeout => {
-    if (typeof callback !== 'function') {
-      throw new TypeError('setTimeout/setInterval: callback must be a function (string code is not allowed in the sandbox)');
-    }
-    const ms = normalizeDelay(delay);
-    const invoke = (): unknown => (callback as (...a: unknown[]) => unknown)(...args);
-    const timer = interval
-      ? setInterval(() => guardCallback(deps, 'setInterval', invoke), ms)
-      : setTimeout(() => {
-          timers.untrack(timer);
-          guardCallback(deps, 'setTimeout', invoke);
-        }, ms);
-    timers.track(timer);
-    return timer;
-  });
-}
-
-/** 构造 VM 内 clearTimeout/clearInterval（冻结；顺手从登记表摘除，未知对象安全） */
-function makeClearTimer(timers: TimerRegistry, interval: boolean): unknown {
-  return Object.freeze((timer: unknown): void => {
-    if (timer === null || (typeof timer !== 'object' && typeof timer !== 'function')) return;
-    if (interval) clearInterval(timer as NodeJS.Timeout);
-    else clearTimeout(timer as NodeJS.Timeout);
-    timers.untrack(timer as NodeJS.Timeout);
-  });
-}
-
 // ---------------------------------------------------------------------------
 // 全局注入
 // ---------------------------------------------------------------------------
@@ -232,61 +191,239 @@ function defineGlobal(target: Record<string, unknown>, name: string, value: unkn
 }
 
 /**
+ * 装配受控定时器（SEC-1：句柄是 VM 侧数字令牌，宿主 Timeout 对象不进 VM；
+ * 包装函数本身是 VM realm 函数）。返回 id → 实际定时器的宿主侧映射。
+ */
+function installTimers(
+  deps: VmRuntimeDeps,
+  timers: TimerRegistry,
+  bridge: RealmBridge,
+  sandbox: Record<string, unknown>,
+): void {
+  let nextId = 1;
+  const timerById = new Map<number, NodeJS.Timeout>();
+
+  const schedule = (callback: unknown, delay: unknown, args: unknown[], interval: boolean): number => {
+    if (typeof callback !== 'function') {
+      throw new TypeError('setTimeout/setInterval: callback must be a function (string code is not allowed in the sandbox)');
+    }
+    const ms = normalizeDelay(delay);
+    const id = nextId++;
+    const invoke = (): unknown => (callback as (...a: unknown[]) => unknown)(...args);
+    const timer = interval
+      ? setInterval(() => guardCallback(deps, 'setInterval', invoke), ms)
+      : setTimeout(() => {
+          timerById.delete(id);
+          timers.untrack(timer);
+          guardCallback(deps, 'setTimeout', invoke);
+        }, ms);
+    timerById.set(id, timer);
+    timers.track(timer);
+    return id;
+  };
+
+  const clear = (token: unknown, interval: boolean): void => {
+    const id = typeof token === 'number' ? token : Number(token);
+    if (!Number.isInteger(id) || id <= 0) return;
+    const timer = timerById.get(id);
+    if (timer === undefined) return;
+    timerById.delete(id);
+    timers.untrack(timer);
+    if (interval) clearInterval(timer);
+    else clearTimeout(timer);
+  };
+
+  defineGlobal(sandbox, 'setTimeout', bridge.toVmFn((callback: unknown, delay?: unknown, ...args: unknown[]) => schedule(callback, delay, args, false)));
+  defineGlobal(sandbox, 'setInterval', bridge.toVmFn((callback: unknown, delay?: unknown, ...args: unknown[]) => schedule(callback, delay, args, true)));
+  defineGlobal(sandbox, 'clearTimeout', bridge.toVmFn((token: unknown) => clear(token, false)));
+  defineGlobal(sandbox, 'clearInterval', bridge.toVmFn((token: unknown) => clear(token, true)));
+}
+
+/**
  * 装配扩展专属 VM 上下文。
  *
- * 注入面（全部不可改写；自建对象冻结）见文件头注释；未注入的宿主能力
- * （process/require/Buffer/performance 等）在 context 内为 undefined。
+ * 注入面（全部不可改写；自建对象 VM 侧冻结；全部成员为 VM realm 函数/类）见文件头注释；
+ * 未注入的宿主能力（process/require/Buffer/performance 等）在 context 内为 undefined。
  */
 export function createExtVm(deps: VmRuntimeDeps): ExtVm {
   const timers = deps.timers ?? createTimerRegistry();
   const sandbox: Record<string, unknown> = {};
   const context = vm.createContext(sandbox);
+  const bridge = realmBridgeFor(context);
 
   // 诊断标记（只读；便于内核侧日志/调试定位 context 归属）
   defineGlobal(sandbox, '__opptrixExtId', deps.extId);
 
-  // console：受控转发（冻结对象 + 冻结方法绑定）
-  defineGlobal(sandbox, 'console', makeConsole(deps));
+  // console：受控转发（VM realm 冻结对象 + VM realm 方法绑定；SEC-1 console 链根除）
+  defineGlobal(
+    sandbox,
+    'console',
+    bridge.makeVmObject({
+      debug: bridge.toVmFn((msg: unknown, ...rest: unknown[]): void => {
+        const payload = {
+          level: 'debug',
+          msg: typeof msg === 'string' ? msg : truncateLogArg(msg),
+          args: rest.slice(0, LOG_MAX_ARGS).map(truncateLogArg),
+        };
+        deps.kernelCall(KERNEL_TOPICS.log, payload, LOG_RPC_TIMEOUT_MS).catch(() => {
+          deps.logger.error({ extId: deps.extId, level: 'debug' }, 'sandbox console forward failed');
+        });
+      }),
+      info: bridge.toVmFn((msg: unknown, ...rest: unknown[]): void => {
+        const payload = {
+          level: 'info',
+          msg: typeof msg === 'string' ? msg : truncateLogArg(msg),
+          args: rest.slice(0, LOG_MAX_ARGS).map(truncateLogArg),
+        };
+        deps.kernelCall(KERNEL_TOPICS.log, payload, LOG_RPC_TIMEOUT_MS).catch(() => {
+          deps.logger.error({ extId: deps.extId, level: 'info' }, 'sandbox console forward failed');
+        });
+      }),
+      warn: bridge.toVmFn((msg: unknown, ...rest: unknown[]): void => {
+        const payload = {
+          level: 'warn',
+          msg: typeof msg === 'string' ? msg : truncateLogArg(msg),
+          args: rest.slice(0, LOG_MAX_ARGS).map(truncateLogArg),
+        };
+        deps.kernelCall(KERNEL_TOPICS.log, payload, LOG_RPC_TIMEOUT_MS).catch(() => {
+          deps.logger.error({ extId: deps.extId, level: 'warn' }, 'sandbox console forward failed');
+        });
+      }),
+      error: bridge.toVmFn((msg: unknown, ...rest: unknown[]): void => {
+        const payload = {
+          level: 'error',
+          msg: typeof msg === 'string' ? msg : truncateLogArg(msg),
+          args: rest.slice(0, LOG_MAX_ARGS).map(truncateLogArg),
+        };
+        deps.kernelCall(KERNEL_TOPICS.log, payload, LOG_RPC_TIMEOUT_MS).catch(() => {
+          deps.logger.error({ extId: deps.extId, level: 'error' }, 'sandbox console forward failed');
+        });
+      }),
+    }),
+  );
 
-  // 定时器：受控登记表，cleanup() 全清
-  defineGlobal(sandbox, 'setTimeout', makeScheduleTimer(deps, timers, false));
-  defineGlobal(sandbox, 'setInterval', makeScheduleTimer(deps, timers, true));
-  defineGlobal(sandbox, 'clearTimeout', makeClearTimer(timers, false));
-  defineGlobal(sandbox, 'clearInterval', makeClearTimer(timers, true));
+  // 定时器：受控登记表（数字令牌句柄），cleanup() 全清
+  installTimers(deps, timers, bridge, sandbox);
 
   // 微任务：同样加防护（queueMicrotask 回调抛出会成为宿主未捕获异常）
-  defineGlobal(sandbox, 'queueMicrotask', Object.freeze((callback: unknown): void => {
-    if (typeof callback !== 'function') {
-      throw new TypeError('queueMicrotask: callback must be a function');
-    }
-    queueMicrotask(() => guardCallback(deps, 'microtask', callback as () => unknown));
-  }));
+  defineGlobal(
+    sandbox,
+    'queueMicrotask',
+    bridge.toVmFn((callback: unknown): void => {
+      if (typeof callback !== 'function') {
+        throw new TypeError('queueMicrotask: callback must be a function');
+      }
+      queueMicrotask(() => guardCallback(deps, 'microtask', callback as () => unknown));
+    }),
+  );
 
-  // 结构化数据与编码：以子类/包装函数冻结 shim，避免冻结共享宿主构造器污染宿主 realm
-  defineGlobal(sandbox, 'structuredClone', Object.freeze(
-    (value: unknown, options?: { transfer?: ArrayBuffer[] }): unknown => structuredClone(value, options),
-  ));
-  class TextEncoderShim extends TextEncoder {}
-  Object.freeze(TextEncoderShim);
-  defineGlobal(sandbox, 'TextEncoder', TextEncoderShim);
-  class TextDecoderShim extends TextDecoder {}
-  Object.freeze(TextDecoderShim);
-  defineGlobal(sandbox, 'TextDecoder', TextDecoderShim);
-  class UrlShim extends URL {}
-  Object.freeze(UrlShim);
-  defineGlobal(sandbox, 'URL', UrlShim);
+  // structuredClone：VM 内编译的深拷贝器本体（SEC-1：必须是 VM realm 函数原身，
+  // 不能用宿主侧箭头包装——否则 .constructor.constructor 重新打开逃逸链）
+  defineGlobal(sandbox, 'structuredClone', bridge.vmToVmValue as unknown);
 
-  // crypto 子集：getRandomValues（对齐 globalThis.crypto 语义，含 65536 上限）+ randomUUID
+  // TextEncoder / TextDecoder：VM 内编译的委托类（类本体即 VM realm；
+  // encode 结果经深拷贝入 VM realm，VM 代码无法触达宿主构造器）
+  const hostTextEncoder = new TextEncoder();
+  const hostTextDecoder = new TextDecoder();
+  const makeEncoderClass = vm.runInContext(
+    String.raw`(host) => class TextEncoder {
+      encode(input) { return host.encode(input === undefined ? '' : String(input)); }
+      get encoding() { return 'utf-8'; }
+      encodeInto() { throw new Error('TextEncoder.encodeInto is not supported in the sandbox'); }
+    }`,
+    context,
+  ) as (host: { encode(input: string): unknown }) => unknown;
+  defineGlobal(sandbox, 'TextEncoder', makeEncoderClass({ encode: (input: string) => bridge.toVmValue(hostTextEncoder.encode(input)) }));
+
+  const makeDecoderClass = vm.runInContext(
+    String.raw`(host) => class TextDecoder {
+      get encoding() { return host.encoding; }
+      decode(input, options) { return host.decode(input, options); }
+    }`,
+    context,
+  ) as (host: {
+    encoding: string;
+    decode(input: unknown, options?: { stream?: boolean }): string;
+  }) => unknown;
+  defineGlobal(
+    sandbox,
+    'TextDecoder',
+    makeDecoderClass({
+      encoding: 'utf-8',
+      decode: (input: unknown, options?: { stream?: boolean }): string =>
+        hostTextDecoder.decode(input as unknown as Uint8Array, options),
+    }),
+  );
+
+  // URL：VM 内编译的委托类（只读访问器 + 常用方法；不暴露宿主 URL 实例）
+  const makeUrlClass = vm.runInContext(
+    String.raw`(host, toVm) => class URL {
+      #u;
+      constructor(input, base) {
+        this.#u = base === undefined ? host.parse(String(input)) : host.parse(String(input), String(base));
+      }
+      get href() { return this.#u.href; }
+      get origin() { return this.#u.origin; }
+      get protocol() { return this.#u.protocol; }
+      get username() { return this.#u.username; }
+      get password() { return this.#u.password; }
+      get host() { return this.#u.host; }
+      get hostname() { return this.#u.hostname; }
+      get port() { return this.#u.port; }
+      get pathname() { return this.#u.pathname; }
+      get search() { return this.#u.search; }
+      get hash() { return this.#u.hash; }
+      get searchParams() {
+        const out = {};
+        for (const [k, v] of this.#u.searchParams.entries()) out[k] = v;
+        return toVm(out);
+      }
+      toString() { return this.#u.toString(); }
+      toJSON() { return this.#u.toJSON(); }
+      static canParse(input, base) {
+        return base === undefined ? host.canParse(String(input)) : host.canParse(String(input), String(base));
+      }
+    }`,
+    context,
+  ) as (host: {
+    parse(input: string, base?: string): URL;
+    canParse(input: string, base?: string): boolean;
+  }, toVm: (v: unknown) => unknown) => unknown;
+  defineGlobal(
+    sandbox,
+    'URL',
+    makeUrlClass(
+      {
+        parse: (input: string, base?: string): URL => new URL(input, base),
+        canParse: (input: string, base?: string): boolean =>
+          base === undefined
+            ? URL.canParse(input)
+            : URL.canParse(input, base),
+      },
+      (v: unknown): unknown => bridge.toVmValue(v),
+    ),
+  );
+
+  // crypto 子集：getRandomValues（恒等返回传入的同一 VM 侧视图）+ randomUUID；
+  // 对象本体在 VM 内构建并冻结（SEC-1：不递宿主对象）
   const getRandomValues = webcrypto.getRandomValues.bind(webcrypto);
-  const randomUUID = (): string => randomUUID();
-  defineGlobal(sandbox, 'crypto', Object.freeze({
-    getRandomValues: (array: ArrayBufferView): ArrayBufferView =>
-      getRandomValues(array as unknown as Parameters<typeof getRandomValues>[0]) as ArrayBufferView,
-    randomUUID,
-  }));
+  defineGlobal(
+    sandbox,
+    'crypto',
+    bridge.makeVmObject({
+      getRandomValues: bridge.toVmPassthroughFn(
+        ((array: ArrayBufferView): ArrayBufferView => {
+          getRandomValues(array as unknown as Parameters<typeof getRandomValues>[0]);
+          return array;
+        }) as unknown as (...args: unknown[]) => unknown,
+      ),
+      randomUUID: bridge.toVmFn((): string => randomUUID()),
+    }),
+  );
 
   return {
     context,
+    bridge,
     cleanup: () => timers.clearAll(),
   };
 }

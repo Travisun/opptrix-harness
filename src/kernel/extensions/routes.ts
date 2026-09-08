@@ -117,6 +117,35 @@ const DRAIN_POLL_INTERVAL_MS = 100;
 /** drain 有界等待上限（ms）；超时继续换表 */
 const DRAIN_MAX_WAIT_MS = 5_000;
 
+/**
+ * SEC-7：下发扩展 handler 的请求头白名单（小写）。
+ * authorization / cookie 及其余未列名头部一律剔除——扩展路由是第三方代码，
+ * 全量透传会把调用方的凭据泄露给扩展（auth mount 的 provider 校验由内核完成）。
+ */
+const EXT_HEADER_ALLOWLIST: ReadonlySet<string> = new Set([
+  'content-type',
+  'content-length',
+  'user-agent',
+  'accept',
+  'x-requested-with',
+  'x-harness-signature',
+  'x-harness-timestamp',
+]);
+
+/**
+ * SEC-7：按白名单裁剪请求头（保留原键的大小写形式；仅小写比较）。
+ * 内核→扩展方向的所有请求头下发（/ext/* 通配与 builtin auth mount）统一走这里。
+ */
+export function sanitizeExtHeaders(
+  headers: Record<string, string | string[] | undefined>,
+): Record<string, string | string[] | undefined> {
+  const out: Record<string, string | string[] | undefined> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (EXT_HEADER_ALLOWLIST.has(name.toLowerCase())) out[name] = value;
+  }
+  return out;
+}
+
 /** extId 作为 URL 段与表键：仅允许字母数字与 . _ - */
 const EXT_ID_SCHEMA = z.string().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
 
@@ -243,7 +272,8 @@ function buildDispatchRequest(
     method,
     params,
     query: (request.query ?? {}) as Record<string, unknown>,
-    headers: request.headers,
+    // SEC-7：白名单裁剪（authorization/cookie 等凭据头不下发给扩展）
+    headers: sanitizeExtHeaders(request.headers as Record<string, string | string[] | undefined>),
     body,
     ...(rawBody !== undefined ? { rawBody } : {}),
     requestId: String(request.id),

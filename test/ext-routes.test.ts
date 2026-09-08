@@ -130,7 +130,7 @@ async function waitFor(pred: () => boolean, what: string, timeoutMs = 3_000): Pr
 // ---------------------------------------------------------------------------
 
 describe('ExtRouteRegistry（真实 fastify + 通配兜底路由）', () => {
-  it('1. 公开路由直达 dispatcher：method/params/query/headers/body/rawBody/requestId 透传', async () => {
+  it('1. 公开路由直达 dispatcher：method/params/query/body/rawBody/requestId 透传；headers 白名单裁剪（SEC-7）', async () => {
     const { app, dispatcher } = buildHarness({
       defaultTimeoutMs: 4_321,
       routes: [r({ path: '/hello' })],
@@ -139,7 +139,7 @@ describe('ExtRouteRegistry（真实 fastify + 通配兜底路由）', () => {
     const res = await app.inject({
       method: 'GET',
       url: '/ext/demo/hello?a=1&b=two',
-      headers: { 'x-probe': 'abc' },
+      headers: { 'x-probe': 'abc', 'x-harness-signature': 'sig-1', authorization: 'Bearer sekrit' },
     });
 
     expect(res.statusCode).toBe(200);
@@ -151,7 +151,11 @@ describe('ExtRouteRegistry（真实 fastify + 通配兜底路由）', () => {
     expect(call.request.method).toBe('GET');
     expect(call.request.params).toEqual({});
     expect(call.request.query).toEqual({ a: '1', b: 'two' });
-    expect(call.request.headers['x-probe']).toBe('abc');
+    // SEC-7：白名单内头部透传，未列名/凭据头（x-probe/authorization/cookie）一律剔除
+    expect(call.request.headers['x-harness-signature']).toBe('sig-1');
+    expect(call.request.headers['x-probe']).toBeUndefined();
+    expect(call.request.headers['authorization']).toBeUndefined();
+    expect(call.request.headers['cookie']).toBeUndefined();
     expect(call.request.body).toBeNull(); // GET 不解析 body
     expect(call.request.rawBody).toBeUndefined();
     expect(typeof call.request.requestId).toBe('string');
