@@ -152,7 +152,7 @@ describe('SEC-4 kernel-handlers 归属校验', () => {
       [CONTAINER_KEYS.counters]: new Counters(),
       [CONTAINER_KEYS.uiRegistry]: { register: vi.fn() },
       [CONTAINER_KEYS.extRegistrySvc]: new ExtensionServiceRegistry({ dispatcher: { callService: vi.fn() }, logger }),
-      [CONTAINER_KEYS.extManager]: { getManifest: () => ({ permissions: ['sandbox'] }) },
+      [CONTAINER_KEYS.extManager]: { getManifest: () => ({ permissions: ['sandbox', 'files:read', 'chat:write', 'storage', 'db', 'tasks', 'cron', 'notify:send', 'llm', 'ui'] }) },
       [CONTAINER_KEYS.sandbox]: sandboxManager,
       [FACADE_CONTAINER_KEYS.cronScheduler]: { schedule: vi.fn(), unschedule: vi.fn(), list: () => [] },
     }));

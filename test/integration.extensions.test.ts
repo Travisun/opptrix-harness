@@ -372,7 +372,7 @@ describe('kernel-handlers 单元', () => {
       // getManifest 仅返回权限清单（host.call 权限门的数据源）
       [CONTAINER_KEYS.extManager]: {
         getManifest: (id: string) =>
-          id === EXT_A ? { permissions: ['rpc:call', 'rpc:call:target-ext'] } : { permissions: [] },
+          id === EXT_A ? { permissions: ['rpc:call', 'rpc:call:target-ext', 'storage', 'db', 'chat:write', 'files:read', 'files:write', 'tasks', 'cron', 'notify:send', 'llm', 'ui'] } : { permissions: [] },
       },
     });
 

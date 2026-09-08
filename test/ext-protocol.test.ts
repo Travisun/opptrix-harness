@@ -195,6 +195,8 @@ describe('HOST_METHODS / KERNEL_TOPICS 契约', () => {
       llmChat: 'llm.chat',
       sandboxExec: 'sandbox.exec',
       systemInfo: 'system.info',
+  httpFetch: 'http.fetch',
+  authHashToken: 'auth.hashToken',
       systemStats: 'system.stats',
       authHashPassword: 'auth.hashPassword',
       authVerifyPassword: 'auth.verifyPassword',

@@ -78,6 +78,10 @@ export const KERNEL_TOPICS = {
   sandboxExec: 'sandbox.exec',
   systemInfo: 'system.info',
   systemStats: 'system.stats',
+  /** 出站 HTTP（内核 fetch 代理 + SSRF 防护）：需 manifest 声明 net:out / net:out:<host> */
+  httpFetch: 'http.fetch',
+  /** SHA-256 摘要（令牌脱敏存储等）：{ value } → { hash }（需 'auth:provider' 权限） */
+  authHashToken: 'auth.hashToken',
   /** 密码哈希（内核 scrypt）：{ password } → { hash }（需 'auth:provider' 权限） */
   authHashPassword: 'auth.hashPassword',
   /** 密码校验（内核 scrypt）：{ password, hash } → { ok }（需 'auth:provider' 权限） */

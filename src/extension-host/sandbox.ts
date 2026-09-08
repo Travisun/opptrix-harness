@@ -453,9 +453,19 @@ export interface HarnessApi {
    * 内核密码原语（scrypt，经 auth.hashPassword / auth.verifyPassword topic）。
    * 调用方 manifest 必须声明 'auth:provider' 权限（缺 → 内核侧 FORBIDDEN）。
    */
+  /** 受权限门管控的出站 HTTP（manifest 需声明 net:out 或 net:out:<host>） */
+  http: {
+    fetch(url: string, init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number }): Promise<{
+      status: number;
+      headers: Record<string, string>;
+      text: string;
+    }>;
+  };
   auth: {
     /** 哈希明文密码 → 自描述 scrypt 串（`scrypt$N$r$p$salt$key`，每次新鲜随机盐） */
     hashPassword(password: string): Promise<string>;
+    /** 计算任意字符串的 SHA-256 十六进制摘要（令牌脱敏存储等用途） */
+    hashToken(value: string): Promise<{ hash: string }>;
     /** 校验明文密码与 hash；hash 格式非法/参数越界一律 false（不抛） */
     verifyPassword(password: string, hash: string): Promise<boolean>;
   };
@@ -760,9 +770,45 @@ export function createHarnessApi(opts: HarnessApiOptions): HarnessApi {
       }
       return reply['ok'];
     },
+    hashToken: async (value: string): Promise<{ hash: string }> => {
+      const reply = (await callKernel(KERNEL_TOPICS.authHashToken, { value })) as {
+        hash?: unknown;
+      } | null;
+      if (reply === null || typeof reply !== 'object' || typeof reply['hash'] !== 'string') {
+        throw new TypeError('auth.hashToken: kernel reply is missing the "hash" string');
+      }
+      return reply as { hash: string };
+    },
+  });
+
+  const http = Object.freeze({
+    fetch: async (
+      url: string,
+      init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number },
+    ): Promise<{ status: number; headers: Record<string, string>; text: string }> => {
+      if (typeof url !== 'string' || url === '') {
+        throw new TypeError('http.fetch: url is required');
+      }
+      const reply = (await callKernel(KERNEL_TOPICS.httpFetch, {
+        url,
+        method: init?.method,
+        headers: init?.headers,
+        body: init?.body,
+        timeoutMs: init?.timeoutMs,
+      })) as { status?: unknown; headers?: unknown; text?: unknown } | null;
+      if (reply === null || typeof reply !== 'object' || typeof reply['status'] !== 'number') {
+        throw new TypeError('http.fetch: kernel reply is missing the "status" number');
+      }
+      return {
+        status: reply['status'] as number,
+        headers: (reply['headers'] ?? {}) as Record<string, string>,
+        text: typeof reply['text'] === 'string' ? reply['text'] : '',
+      };
+    },
   });
 
   const api: HarnessApi = {
+    http,
     log,
     config,
     storage,
@@ -960,9 +1006,16 @@ export function exposeHarnessApiInVm(api: HarnessApi, bridge: RealmBridge): unkn
     }),
     // 引导态：纯数据对象在 VM 内重建（rootToken 为字符串原语）
     boot: bridge.makeVmObject(api.boot.rootToken !== undefined ? { rootToken: api.boot.rootToken } : {}),
+    http: bridge.makeVmObject({
+      fetch: asyncFn(
+        (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number }) =>
+          api.http.fetch(url, init),
+      ),
+    }),
     auth: bridge.makeVmObject({
       hashPassword: asyncFn((password: string) => api.auth.hashPassword(password)),
       verifyPassword: asyncFn((password: string, hash: string) => api.auth.verifyPassword(password, hash)),
+      hashToken: asyncFn((value: string) => api.auth.hashToken(value)),
     }),
     call: asyncFn((targetExtId: string, method: string, args?: unknown) => api.call(targetExtId, method, args)),
     // ---- 注册类 API（宿主侧捕获 VM 函数进 collector）----

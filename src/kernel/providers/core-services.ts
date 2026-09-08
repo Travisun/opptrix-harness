@@ -19,6 +19,7 @@
  *   emit(eventBus) / publish(sseHub) / logger
  */
 import { join } from 'node:path';
+import { HOST_METHODS } from '../../extension-host/protocol.js';
 
 import type { FastifyInstance } from 'fastify';
 import type { Knex } from 'knex';
@@ -240,6 +241,25 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     publish,
     logger,
     defaultTimeoutMs: CORE_TASK_TIMEOUT_MS,
+    // 扩展任务执行器：非内置任务改派给扩展线程（host.taskRun），进度/完成经 task.* topic 回流
+    externalExecutor:
+      kernel === undefined
+        ? undefined
+        : (extId: string, taskId: string, name: string, args: unknown) => {
+            const manager = kernel.container.resolve<import('../../kernel/extensions/manager.js').ExtensionManager>(
+              CONTAINER_KEYS.extManager,
+            );
+            const bridge = manager.bridge;
+            if (bridge === null) {
+              throw new Error('extension bridge is not available (worker restarting)');
+            }
+            return bridge.callToWorker(
+              extId,
+              HOST_METHODS.taskRun,
+              { taskId, name, args },
+              600_000,
+            ).then(() => undefined);
+          },
   });
   pool = new TaskWorkerPool({
     size: config.taskWorkers,

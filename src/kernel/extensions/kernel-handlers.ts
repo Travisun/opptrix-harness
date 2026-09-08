@@ -42,6 +42,8 @@ import { ChatService } from '../chat/service.js';
 import { configGet } from '../config/index.js';
 import { CONTAINER_KEYS, type Kernel } from '../Kernel.js';
 import { FACADE_CONTAINER_KEYS } from '../Facades.js';
+import { lookup } from 'node:dns/promises';
+import { createHash } from 'node:crypto';
 import { err } from '../errors/index.js';
 import { FileService } from '../files/index.js';
 import type { LlmGateway } from '../llm/gateway.js';
@@ -213,6 +215,36 @@ export interface AuthProviderRegistration {
  *   由集成接线层注入以打通 AuthProviderRegistry）
  * @returns 交给 ExtensionManager.deps.bridgeHandlers 的处理器表
  */
+/** 出站目标是否为私网/环回地址（SSRF 防护） */
+function isPrivateIp(ip: string): boolean {
+  if (ip === '::1' || ip === '::' || ip.startsWith('fc') || ip.startsWith('fd') || ip.startsWith('fe80')) return true;
+  const parts = ip.split('.').map((x) => Number(x));
+  if (parts.length !== 4 || parts.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false;
+  const a = parts[0]!;
+  const b = parts[1]!;
+  return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/** manifest 权限是否允许访问该主机：net:out:<host> 精确匹配，或 net:out（仅公网） */
+function netOutAllowed(permissions: string[], hostname: string, resolvedIps: string[]): { allowed: boolean; reason?: string } {
+  const lower = hostname.toLowerCase();
+  const exact = permissions.find((p) => p.startsWith('net:out:'));
+  if (exact !== undefined) {
+    const allowedHost = exact.slice('net:out:'.length).toLowerCase();
+    return lower === allowedHost
+      ? { allowed: true }
+      : { allowed: false, reason: `host "${hostname}" does not match net:out permission "${allowedHost}"` };
+  }
+  if (!permissions.includes('net:out')) {
+    return { allowed: false, reason: `requires "net:out" or "net:out:${lower}" permission in manifest.permissions` };
+  }
+  const privateHit = resolvedIps.find((ip) => isPrivateIp(ip));
+  return privateHit === undefined
+    ? { allowed: true }
+    : { allowed: false, reason: `net:out blocks private/reserved address "${privateHit}" (use an explicit net:out:${lower} permission to override)` };
+}
+
 export function createKernelHandlers(deps: {
   kernel: Kernel;
   auth?: AuthProviderRegistration;
@@ -278,6 +310,45 @@ export function createKernelHandlers(deps: {
         detail: { topic, extId, requiredPermission: SANDBOX_PERMISSION },
       });
     }
+  };
+
+  /**
+   * 细粒度权限运行时复核（fail-closed）：topic → 所需 manifest 权限。
+   * 高危能力（auth:provider / sandbox / rpc:call）另有专门闸；未列入矩阵的 topic
+   * （log/config/system/ui 等低敏面）不做运行时复核。
+   */
+  const requirePermission = (extId: string, topic: string, permission: string): void => {
+    const permissions = extManager().getManifest(extId)?.permissions ?? [];
+    if (!permissions.includes(permission)) {
+      throw err('FORBIDDEN', {
+        message: `kernel service "${topic}" requires the "${permission}" permission in the extension manifest (add it to manifest.permissions)`,
+        detail: { topic, extId, requiredPermission: permission },
+      });
+    }
+  };
+
+  const TOPIC_PERMISSIONS: Record<string, string> = {
+    [KERNEL_TOPICS.storageGet]: 'storage',
+    [KERNEL_TOPICS.storageSet]: 'storage',
+    [KERNEL_TOPICS.storageDelete]: 'storage',
+    [KERNEL_TOPICS.dbAll]: 'db',
+    [KERNEL_TOPICS.dbGet]: 'db',
+    [KERNEL_TOPICS.dbRun]: 'db',
+    [KERNEL_TOPICS.dbSchema]: 'db',
+    [KERNEL_TOPICS.notifySend]: 'notify:send',
+    [KERNEL_TOPICS.chatSend]: 'chat:write',
+    [KERNEL_TOPICS.chatPatch]: 'chat:write',
+    [KERNEL_TOPICS.filesSave]: 'files:write',
+    [KERNEL_TOPICS.filesRead]: 'files:read',
+    [KERNEL_TOPICS.filesGet]: 'files:read',
+    [KERNEL_TOPICS.tasksDispatch]: 'tasks',
+    [KERNEL_TOPICS.taskProgress]: 'tasks',
+    [KERNEL_TOPICS.taskComplete]: 'tasks',
+    [KERNEL_TOPICS.taskFail]: 'tasks',
+    [KERNEL_TOPICS.cronSchedule]: 'cron',
+    [KERNEL_TOPICS.cronUnschedule]: 'cron',
+    [KERNEL_TOPICS.llmChat]: 'llm',
+    [KERNEL_TOPICS.uiRegister]: 'ui',
   };
 
   /** 扩展私有 KV：行 → 反序列化值（损坏/缺失一律 null） */
@@ -762,9 +833,73 @@ export function createKernelHandlers(deps: {
         loadavg: os.loadavg().map((v) => Number(v.toFixed(3))),
       };
     },
+    [KERNEL_TOPICS.httpFetch]: async (payload, from) => {
+      const extId = requireExtId(from, KERNEL_TOPICS.httpFetch);
+      const record = asRecord(payload);
+      const url = strField(record, 'url');
+      if (url === '') throw err('BAD_REQUEST', { message: 'http.fetch requires a non-empty "url"' });
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        throw err('BAD_REQUEST', { message: `http.fetch: invalid url "${url.slice(0, 120)}"` });
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw err('BAD_REQUEST', { message: `http.fetch: only http/https is supported (got ${parsed.protocol})` });
+      }
+      const hostname = parsed.hostname.toLowerCase();
+      const permissions = extManager().getManifest(extId)?.permissions ?? [];
+      let resolved: { address: string }[] = [];
+      try {
+        resolved = (await lookup(hostname, { all: true })) as { address: string }[];
+      } catch {
+        throw err('BAD_REQUEST', { message: `http.fetch: cannot resolve host "${hostname}"` });
+      }
+      const gate = netOutAllowed(permissions, hostname, resolved.map((r) => r.address));
+      if (!gate.allowed) {
+        throw err('FORBIDDEN', { message: `http.fetch: ${gate.reason ?? 'blocked'}`, detail: { url: url.slice(0, 200), extId } });
+      }
+      const timeoutMs = typeof record['timeoutMs'] === 'number' ? Math.min(Math.max(record['timeoutMs'] as number, 1000), 60_000) : 30_000;
+      const method = typeof record['method'] === 'string' ? record['method'] : 'GET';
+      const headers = (record['headers'] ?? {}) as Record<string, string>;
+      const body = typeof record['body'] === 'string' ? record['body'] : undefined;
+      const res = await fetch(parsed, {
+        method,
+        headers,
+        body: method === 'GET' || method === 'HEAD' ? undefined : body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const text = (await res.text()).slice(0, 8 * 1024 * 1024);
+      const outHeaders: Record<string, string> = {};
+      for (const h of ['content-type', 'content-length', 'x-request-id']) {
+        const v = res.headers.get(h);
+        if (v !== null) outHeaders[h] = v;
+      }
+      return { status: res.status, headers: outHeaders, text };
+    },
+
+    [KERNEL_TOPICS.authHashToken]: async (payload, from) => {
+      const extId = requireExtId(from, KERNEL_TOPICS.authHashToken);
+      requireAuthProviderPermission(extId, KERNEL_TOPICS.authHashToken);
+      const record = asRecord(payload);
+      const value = strField(record, 'value');
+      if (value === '') throw err('BAD_REQUEST', { message: 'auth.hashToken requires a non-empty "value"' });
+      return { hash: createHash('sha256').update(value).digest('hex') };
+    },
   };
 
   /** 任务归属校验：任务存在且属于调用方扩展（否则 FORBIDDEN） */
+  // 细粒度权限运行时复核：对矩阵内的 topic 统一包裹权限闸（fail-closed）
+  for (const [topic, permission] of Object.entries(TOPIC_PERMISSIONS)) {
+    const inner = handlers[topic];
+    if (inner === undefined) continue;
+    handlers[topic] = async (payload, from) => {
+      const extId = requireExtId(from, topic);
+      requirePermission(extId, topic, permission);
+      return inner(payload, from);
+    };
+  }
+
   async function requireOwnedTask(taskId: string, extId: string): Promise<void> {
     if (taskId === '') throw err('BAD_REQUEST', { message: 'task.* requires a non-empty "taskId"' });
     const record = await taskManager().get(taskId);

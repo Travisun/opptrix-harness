@@ -41,7 +41,15 @@ export interface TaskManagerDeps {
   logger: import('pino').Logger;
   /** 任务超时（毫秒），默认 {@link DEFAULT_TASK_TIMEOUT_MS}；sweep 每 30s 扫一次 */
   defaultTimeoutMs?: number;
+  /**
+   * 外部执行器：name 非内置（非 'echo'）且任务带 extId 时改派给该扩展的执行环境
+   * （集成层经桥派发 host.taskRun；进度/完成经 task.* topic 回流本管理器）。
+   * 未注入时非 echo 任务按池语义判失败。
+   */
+  externalExecutor?: (extId: string, taskId: string, name: string, args: unknown) => Promise<void>;
 }
+
+const ECHO_TASK_NAME = 'echo';
 
 /** dispatch 入参 */
 export interface TaskDispatchInput {
@@ -137,11 +145,20 @@ export class TaskManager {
       args: input.args,
     });
     this.#runningTasks.set(id, { cancelled: false });
-    // pool.run 契约上永不 reject；此处兜底（契约破坏时任务仍能落 failed，不产生 unhandled rejection）
-    void this.#deps.pool.run(id, input.name, input.args).catch((e: unknown) => {
-      this.#deps.logger.error({ err: e, taskId: id }, '[tasks] pool.run rejected (contract violation)');
-      this.onFailed(id, e instanceof Error ? e.message : String(e));
-    });
+    const execute = (): void => {
+      // pool.run / externalExecutor 契约上永不 reject；此处兜底（契约破坏时任务仍能落 failed，不产生 unhandled rejection）
+      void Promise.resolve()
+        .then(() =>
+          input.name !== ECHO_TASK_NAME && typeof input.extId === 'string' && input.extId !== '' && this.#deps.externalExecutor !== undefined
+            ? this.#deps.externalExecutor(input.extId, id, input.name, input.args)
+            : this.#deps.pool.run(id, input.name, input.args),
+        )
+        .catch((e: unknown) => {
+          this.#deps.logger.error({ err: e, taskId: id }, '[tasks] executor rejected (contract violation)');
+          this.onFailed(id, e instanceof Error ? e.message : String(e));
+        });
+    };
+    execute();
     return record;
   }
 
