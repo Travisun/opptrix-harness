@@ -1,0 +1,20 @@
+node_modules/
+dist/
+data/
+*.log
+.env
+.DS_Store
+coverage/
+release/
+extensions/webui/ui-src/node_modules/
+extensions/*/ui/
+!extensions/webui/ui/
+
+# 工程文档与提示词（不随公开仓库分发）
+.cursor/
+.zcode/
+.claude/
+.agents/
+docs/
+AGENTS.md
+ENGINEERING.md

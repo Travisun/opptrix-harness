@@ -1,0 +1,29 @@
+{
+  "id": "doc-demo",
+  "api": 1,
+  "version": "1.0.0",
+  "main": "index.js",
+  "permissions": [
+    "http",
+    "events",
+    "chat:write",
+    "files:read",
+    "notify:send"
+  ],
+  "provides": [
+    "parse"
+  ],
+  "displayName": "Doc Demo",
+  "ui": {
+    "menu": {
+      "label": "Doc Demo"
+    },
+    "pages": [
+      {
+        "path": "/",
+        "title": "Doc Demo",
+        "entry": "ui/index.html"
+      }
+    ]
+  }
+}

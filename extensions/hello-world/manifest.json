@@ -1,0 +1,12 @@
+{
+  "id": "hello-world",
+  "api": 1,
+  "version": "1.0.0",
+  "main": "index.js",
+  "permissions": ["http", "cron", "storage", "ui", "events"],
+  "displayName": "Hello World",
+  "ui": {
+    "menu": { "label": "Hello World" },
+    "pages": [{ "path": "/", "title": "Hello", "entry": "index.html" }]
+  }
+}

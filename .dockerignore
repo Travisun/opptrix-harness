@@ -1,0 +1,10 @@
+# docker/Dockerfile 构建上下文排除清单（上下文 = 仓库根）。
+# dist/node_modules 必须排除：镜像内由 npm ci + npm run build 全新产出。
+node_modules
+dist
+data
+*.log
+.git
+test
+coverage
+extensions/*/ui-src

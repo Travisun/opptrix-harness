@@ -1,0 +1,61 @@
+# =============================================================================
+# docker/docker-compose.yml — Opptrix Harness OS 本地/单机编排
+#
+# 首次运行步骤（首启无需播种 releases/slots：无任何 slot 时 bootstrap.mjs 自动
+#   回退镜像内嵌副本 /app/dist/main.js，开箱即启）：
+#   1) cp .env.example .env          # 按需修改（令牌/日志级别/沙箱开关等）
+#   2) docker build -t opptrix-sandbox:latest -f docker/Dockerfile.sandbox docker/
+#        # 沙箱基础镜像（HARNESS_SANDBOX_ENABLED=1 时内核经 docker socket 拉起，
+#        #   镜像名取 HARNESS_SANDBOX_IMAGE，默认 opptrix-sandbox:latest；
+#        #   需要挂载 docker.sock 或设置 HARNESS_DOCKER_HOST）
+#   3) docker compose -f docker/docker-compose.yml up -d --build
+#   4) 取 break-glass root token：
+#        # HARNESS_PERSIST_ROOT_TOKEN=1 时首 boot 生成并持久化到数据卷：
+#        docker compose -f docker/docker-compose.yml exec opptrix cat /data/root-token
+#        # 否则从首启日志读取（只打印一次）：
+#        docker compose -f docker/docker-compose.yml logs opptrix | grep -i token
+#
+# 说明：
+# - env_file/volumes 的相对路径均相对本文件所在目录（docker/），故仓库根写作 ../。
+# - ../extensions 挂载进 /data/extensions：宿主直接改扩展代码即可热验证（开发用）。
+# - mailhog 为可选 profile（--profile mail），用于本地 SMTP 调试：
+#   SMTP localhost:1025，Web UI http://localhost:8025。
+# =============================================================================
+
+services:
+  opptrix:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: opptrix-harness:latest
+    ports:
+      - "3000:3000"
+    env_file:
+      # 仓库根 .env（首次运行先 cp .env.example .env；缺失不致命，走默认值）
+      - path: ../.env
+        required: false
+    volumes:
+      - opptrix-data:/data
+      - ../extensions:/data/extensions # 宿主开发挂载：第一方/示例扩展
+    restart: unless-stopped
+    healthcheck: # 与 docker/Dockerfile 的 HEALTHCHECK 一致
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # 可选邮件调试服务：docker compose -f docker/docker-compose.yml --profile mail up -d
+  # 容器内 SMTP 指向 mailhog:1025（.env 配 SMTP 走通知渠道 target 配置（smtp.host 指向 mailhog 主机名） / PORT=1025）
+  mailhog:
+    image: mailhog/mailhog:latest
+    profiles: ["mail"]
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+volumes:
+  opptrix-data:
+
+# 沙箱基镜像不入编排：由内核 sandbox 模块按 HARNESS_SANDBOX_IMAGE 运行时拉起。
+# 构建命令（一次性）：docker build -t opptrix-sandbox:latest -f docker/Dockerfile.sandbox docker/

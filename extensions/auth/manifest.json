@@ -1,0 +1,10 @@
+{
+  "id": "auth",
+  "api": 1,
+  "version": "1.0.0",
+  "main": "index.js",
+  "displayName": "Auth",
+  "permissions": ["auth:provider", "http", "db", "storage"],
+  "builtin": true,
+  "mount": "auth"
+}

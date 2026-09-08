@@ -1,0 +1,125 @@
+/**
+ * 全局暗色主题（内联 CSS 变量，仿内核应急页 #0f1115 底色）。
+ * 无第三方 UI 库——所有组件用 scoped 样式 + 以下变量。
+ */
+:root {
+  --bg: #0f1115;
+  --bg-raised: #161a22;
+  --bg-hover: #1d2230;
+  --border: #262c3a;
+  --text: #e6e8ee;
+  --text-dim: #9aa3b2;
+  --text-faint: #5c6575;
+  --accent: #4f8cff;
+  --accent-soft: rgba(79, 140, 255, 0.16);
+  --ok: #3fb96f;
+  --warn: #d9a13b;
+  --err: #e0564f;
+  --radius: 8px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  margin: 0;
+  min-height: 100vh;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+
+h1, h2, h3 { font-weight: 600; }
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+button:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { background: #3f7bef; }
+button.danger { border-color: var(--err); color: var(--err); background: transparent; }
+button.danger:hover:not(:disabled) { background: rgba(224, 86, 79, 0.12); }
+button.ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
+button.ghost:hover:not(:disabled) { color: var(--text); border-color: var(--border); background: var(--bg-hover); }
+
+input, select, textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  min-width: 0;
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+input::placeholder, textarea::placeholder { color: var(--text-faint); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th, td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+th { color: var(--text-dim); font-weight: 500; }
+tbody tr:hover { background: var(--bg-hover); }
+
+code, pre { font-family: var(--mono); font-size: 12.5px; }
+pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  overflow: auto;
+  margin: 0;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.badge.ok { color: var(--ok); border-color: var(--ok); }
+.badge.err { color: var(--err); border-color: var(--err); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.badge.accent { color: var(--accent); border-color: var(--accent); }
+
+/* 通用三态 */
+.state {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-dim);
+}
+.state.error { color: var(--err); }
+
+.spin {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--text-faint);
+  border-top-color: var(--text);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: -2px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }

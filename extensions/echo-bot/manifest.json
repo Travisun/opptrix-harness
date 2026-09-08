@@ -1,0 +1,11 @@
+{
+  "id": "echo-bot",
+  "api": 1,
+  "version": "1.0.0",
+  "main": "index.js",
+  "permissions": [
+    "events",
+    "chat:write"
+  ],
+  "displayName": "Echo Bot"
+}

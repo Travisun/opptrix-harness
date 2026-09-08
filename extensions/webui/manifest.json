@@ -1,0 +1,14 @@
+{
+  "id": "webui",
+  "api": 1,
+  "version": "1.0.0",
+  "main": "index.js",
+  "displayName": "Web Console",
+  "permissions": ["http", "ui", "storage"],
+  "builtin": true,
+  "mount": "ui",
+  "ui": {
+    "menu": { "label": "Console" },
+    "pages": [{ "path": "/", "title": "Console", "entry": "index.html" }]
+  }
+}
