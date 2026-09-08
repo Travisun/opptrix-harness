@@ -111,7 +111,7 @@ defineExtension(async (h) => {
   h.route('GET', '/hello', async () => ({ hello: 'world' }), { auth: 'public' });
 
   // 定时任务示例（默认注释；取消注释即启用。5 段 cron，内核默认时区）：
-  // h.cron('*/5 * * * *', 'tick', async () => {
+  // h.cron.schedule({ name: 'tick', expr: '*/5 * * * *' }, async () => {
   //   h.log.info('tick from ${id}');
   // });
 });
@@ -139,7 +139,7 @@ function scaffoldReadme(id: string): string {
 | \`h.on(event, handler, opts?)\` | 订阅内核事件（'.' 分段，支持 \`*\`/\`**\`） |
 | \`h.hook(point, handler)\` | 注册 hook 埋点处理器 |
 | \`h.expose(method, handler)\` / \`h.call(target, payload?)\` | Registry RPC 注册/跨扩展调用 |
-| \`h.cron(expr, name, handler)\` | 定时任务（5 段 cron） |
+| \`h.cron.schedule({ name, expr }, handler)\` | 定时任务（5 段 cron） |
 | \`h.notify(input)\` | 发送通知（inbox/webhook/email/console 渠道） |
 | \`h.chat.send(input)\` | 聊天出站消息 |
 | \`h.files\` / \`h.tasks\` | 文件存储 / CPU 密集长任务 |

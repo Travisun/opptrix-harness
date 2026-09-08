@@ -67,6 +67,9 @@ docker compose -f docker/docker-compose.yml exec opptrix cat /data/root-token
 ```bash
 npm run harness -- make:extension my-ext      # 脚手架
 npm run harness -- validate extensions/my-ext # 校验
+# 内核启动后新建的扩展需先重扫目录再启用（admin 令牌）：
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:3000/api/v1/extensions/rescan
 # 在管理台「扩展」页启用 my-ext，或：
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:3000/api/v1/extensions/my-ext/enable
@@ -113,7 +116,7 @@ module.exports = defineExtension({
 });
 ```
 
-全部能力经权限声明后可用：`h.route / h.on / h.hook / h.cron / h.notify / h.chat / h.files / h.tasks / h.db / h.llm / h.sandbox / h.storage / h.ui / h.expose / h.call`。
+能力面由 `manifest.permissions` 声明（fail-closed）：`h.route / h.on / h.hook / h.cron.schedule / h.notify / h.chat / h.files / h.tasks / h.db / h.llm / h.sandbox / h.storage / h.ui / h.expose / h.call`；`auth:provider` / `sandbox` / `rpc:call` 等高危能力在运行时逐调用强制，其余细粒度复核在路线图中。
 
 ## 命令
 

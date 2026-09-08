@@ -11,7 +11,7 @@ extensions/*/ui/
 !extensions/webui/ui/
 !extensions/doc-demo/ui/
 
-# 工程文档与提示词（不随公开仓库分发）
+# 内部工程文档与 AI 协作配置（不随公开仓库分发）
 .cursor/
 .zcode/
 .claude/

@@ -1,6 +1,6 @@
 # ARCHITECTURE.md — Opptrix Harness OS 架构
 
-> 面向贡献者的架构文档。工程约束见 [ENGINEERING.md](./ENGINEERING.md)（最高约束），协作协议与术语见 [AGENTS.md](./AGENTS.md)，依赖决策的单一事实来源见 [docs/dependencies.md](./docs/dependencies.md)。本文所有表述以代码为准，均给出文件锚点。
+> 面向贡献者的架构文档。工程约束见仓库内 ENGINEERING.md（未随公开仓库分发；最高约束），协作协议与术语见仓库内 AGENTS.md（未随公开仓库分发），依赖决策的单一事实来源见仓库内 docs/dependencies.md（未随公开仓库分发）。本文所有表述以代码为准，均给出文件锚点。
 
 ## 1. 总览与进程模型
 
@@ -159,7 +159,7 @@ POST /api/v1/files（multipart, ≤ maxUploadBytes）
 
 ## 6. 依赖决策（Package-First）
 
-完整决策表见 **[docs/dependencies.md](./docs/dependencies.md)**：每个引入的依赖登记一行「包名 / 用途角色 / 自研例外理由」。核心依赖速览：
+完整决策表见仓库内 docs/dependencies.md（未随公开仓库分发）：每个引入的依赖登记一行「包名 / 用途角色 / 自研例外理由」。核心依赖速览：
 
 | 包 | 角色 |
 | --- | --- |
@@ -196,14 +196,14 @@ POST /api/v1/files（multipart, ≤ maxUploadBytes）
 
 ### ADR-004 扩展 UI 合同：声明式贡献 + 静态资产挂载
 
-- **状态**：已实施内核侧（`extensions/manifest.ts` uiSchema、`ui-registry.ts`、`assets.ts`）；宿主渲染器（webui）已作为内置扩展交付（Vue3 SPA，构建产物随镜像）。
+- **状态**：已实施内核侧（`extensions/manifest.ts` uiSchema、`ui-registry.ts`、`assets.ts`）；宿主渲染器 webui 已作为内置扩展交付（Vue3 SPA，mount 'ui' → `/admin`）。
 - **背景**：内核零领域语义，不能内置任何前端框架；管理台又必须能聚合第三方扩展的界面。
-- **决策**：合同只有两半——(1) **声明式贡献**：manifest `ui`（menu/pages/widgets/renderers）与激活期 `h.ui.register(fragment)` 累加合并，经 `GET /api/v1/ui` 输出目录快照；(2) **静态资产**：扩展目录 `ui/` 由 @fastify/static 挂载到 `/ext/<extId>/ui/`（无目录索引，路径安全交 @fastify/static）。页面 `entry` 是完整 HTML 文档（如 `ui/index.html`），宿主（webui 控制台，规划中 mount `/admin`）按贡献目录以独立页面承载/嵌入，内核不参与渲染。
+- **决策**：合同只有两半——(1) **声明式贡献**：manifest `ui`（menu/pages/widgets/renderers）与激活期 `h.ui.register(fragment)` 累加合并，经 `GET /api/v1/ui` 输出目录快照；(2) **静态资产**：扩展目录 `ui/` 由 @fastify/static 挂载到 `/ext/<extId>/ui/`（无目录索引，路径安全交 @fastify/static）。页面 `entry` 是完整 HTML 文档（如 `ui/index.html`），宿主渲染器 webui 已作为内置扩展交付（Vue3 SPA，mount 'ui' → `/admin`），按贡献目录以独立页面承载/嵌入，内核不参与渲染。
 - **后果**：扩展作者可用任何前端技术栈，只要产出一个 HTML 入口；合同面极小、无运行时耦合。注：早期任务书曾以「iframe UI 合同」描述此项，代码中的实际机制如上（iframe 是宿主可选的承载手段，不是合同的一部分）。
 
 ### ADR-005 auth / webui 内置扩展化
 
-- **状态**：auth 已实施（`extensions/auth`，`builtin:true` + `mount:'auth'`）；webui 为已规划内置扩展（内核已留 fallback 页与 `/admin` mount 白名单，尚未入库）。
+- **状态**：auth 已实施（`extensions/auth`，`builtin:true` + `mount:'auth'`）；webui 已作为内置扩展交付（Vue3 SPA，mount 'ui' → `/admin`）。
 - **背景**：框架开箱即用需要认证与管理台，但把它们写进内核即违背「内核零领域语义」。
 - **决策**：以 `builtin` 扩展形态提供默认答案。auth 扩展声明相对路由（`/auth/*`、`/users*`），内核按 mount 白名单映射到 `/api/v1/auth|users`（静态 catch-all + 运行时查路由表，enable/disable 即表变更）；auth 扩展还经 `auth.registerProvider` 向内核注册 AuthProvider，使每个受保护请求的令牌校验走 `host.authVerify` 派发回扩展线程；内核 scrypt 密码原语以 `auth:provider` 权限门暴露。同语义第三方扩展可整体替换它。
 - **后果**：内核本体可嵌入无认证的宿主；break-glass root 令牌作为内核层兜底始终可用（worker 不可达时直连校验），且只注入 builtin auth 扩展。

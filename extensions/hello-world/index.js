@@ -18,7 +18,7 @@ defineExtension(async (h) => {
   });
 
   // 定时任务示例（默认注释；取消注释即启用。5 段 cron，内核默认时区）：
-  // h.cron('*/5 * * * *', 'tick', async () => {
+  // h.cron.schedule({ name: 'tick', expr: '*/5 * * * *' }, async () => {
   //   h.log.info('hello-world tick');
   // });
 });
