@@ -1,20 +1,24 @@
 /**
- * webui 内置扩展测试（任务 4）。
+ * webui 内置扩展测试（React + Tailwind + shadcn/ui 重写后的契约面）。
  *
- * 三层覆盖：
+ * 四层覆盖：
  * A. manifest 与扩展入口（单元）：validateManifest/validatePermissions（import 内核）；
  *    index.js 经 vm 注入 defineExtension 加载并捕获 h.page/h.menu 贡献。
- * B. 构建产物与部署面（静态）：ui/index.html 与引用资产齐全；vite/Dockerfile/.gitignore
- *    契约；产物经内核 registerExtAssets 可静态服务。
+ *    —— 管理台从 Vue3 重写为 React 后此契约面不变。
+ * B. 构建产物与部署面（静态）：ui/index.html（React #app 挂载点（React root 挂载点） + 防闪烁脚本）与
+ *    引用资产齐全；React 工程契约（依赖无 Vue、源码无 .vue、无 console.*）；
+ *    主题 Token 体系（styles.css 亮暗两套变量 + theme.tsx 运行期覆盖链）；
+ *    路由注册完整性（router.tsx 含 /login + 11 条主导航 + HashRouter）；
+ *    基础设施契约（api.ts 凭据/401、sse.ts 游标重连/replay-gap）；
+ *    vite/Dockerfile/.gitignore 契约；产物经内核 registerExtAssets 可静态服务。
  * C. 真实 Kernel E2E（真实 createHttpServer + 真实 worker 线程 + 临时 dataDir）：
  *    builtin 自动启用（与 auth 同款）→ manifest/聚合端点 → /admin 与 UI 资产路由断言。
  *
- * ★ 内核接线状态（原三处缺口已修复，C 层断言已翻转为修复后行为）：
- *   1. mount:'ui' → /admin 接管：GET /admin → 302 → /ext/webui/ui/（用例 13）。
- *   2. 扩展 UI 静态资产：registerExtAssets 已延迟到 extManager.start() 之后在 app 上
- *      补挂（Kernel #runBoot），/ext/webui/ui/** 可静态服务（用例 12）。
- *   3. h.page/h.menu 贡献聚合：contributions.ui 段经 validateContributions 保留并
- *      连同 manifest.ui 合并进 UiRegistry → GET /api/v1/ui 含 webui 条目（用例 11）。
+ * ★ 内核接线状态（与上版一致，行为未回归）：
+ *   1. mount:'ui' → /admin 接管：GET /admin → 302 → /ext/webui/ui/。
+ *   2. 扩展 UI 静态资产：registerExtAssets 延迟到 extManager.start() 之后在 app 上补挂，
+ *      /ext/webui/ui/** 可静态服务。
+ *   3. h.page/h.menu 贡献聚合：GET /api/v1/ui 含 webui 条目。
  */
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -41,11 +45,13 @@ import { loadConfig } from '../src/kernel/config/index.js';
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const EXT_DIR = path.join(REPO_ROOT, 'extensions', 'webui');
 const UI_DIR = path.join(EXT_DIR, 'ui');
+const UI_SRC_DIR = path.join(EXT_DIR, 'ui-src');
+const UI_SRC = path.join(UI_SRC_DIR, 'src');
 
 const manifestRaw: unknown = JSON.parse(readFileSync(path.join(EXT_DIR, 'manifest.json'), 'utf8'));
 
 // ############################################################################
-// A. manifest 与扩展入口
+// A. manifest 与扩展入口（Vue → React 重写后契约不变）
 // ############################################################################
 
 describe('webui manifest 与扩展入口', () => {
@@ -108,15 +114,20 @@ function referencedAssets(html: string): string[] {
   return refs;
 }
 
-describe('webui 构建产物与部署面', () => {
-  it('4. ui/index.html 存在，含 <div id="app"> 与脚本引用；引用产物文件齐全', () => {
+describe('webui 构建产物与部署面（React 产物）', () => {
+  it('4. ui/index.html 存在：React #app 挂载点（React root 挂载点） + 主题防闪烁脚本 + ./ 相对引用产物齐全', () => {
     const htmlPath = path.join(UI_DIR, 'index.html');
     expect(existsSync(htmlPath)).toBe(true);
     const html = readFileSync(htmlPath, 'utf8');
+    // React 挂载点（main.tsx: getElementById('root')）
     expect(html).toContain('<div id="app">');
+    // 防闪烁脚本：首帧前按 localStorage('ui.mode') 落 .dark 类（与 lib/theme.tsx 同策略）
+    expect(html).toContain("localStorage.getItem('ui.mode')");
+    expect(html).toContain("classList.toggle('dark'");
     const refs = referencedAssets(html);
     expect(refs.length).toBeGreaterThanOrEqual(2); // 至少 1 js + 1 css
     expect(refs.some((r) => r.endsWith('.js'))).toBe(true);
+    expect(refs.some((r) => r.endsWith('.css'))).toBe(true);
     for (const ref of refs) {
       const assetPath = path.join(UI_DIR, ref);
       expect(existsSync(assetPath), `missing asset: ${ref}`).toBe(true);
@@ -125,7 +136,7 @@ describe('webui 构建产物与部署面', () => {
   });
 
   it('5. vite.config：base 为相对路径、outDir 指向 ../ui（产物出 extensions/webui/ui）', () => {
-    const cfg = readFileSync(path.join(EXT_DIR, 'ui-src', 'vite.config.ts'), 'utf8');
+    const cfg = readFileSync(path.join(UI_SRC_DIR, 'vite.config.ts'), 'utf8');
     expect(cfg).toContain("base: './'");
     expect(cfg).toContain("outDir: '../ui'");
     // 产物目录确有内容（空目录视为未构建）
@@ -133,7 +144,122 @@ describe('webui 构建产物与部署面', () => {
     expect(entries.length).toBeGreaterThan(0);
   });
 
-  it('6. Dockerfile 含 ui 构建阶段，runtime 携带 webui manifest/入口与 ui 产物', () => {
+  it('6. React 工程契约：依赖无 Vue、源码无 .vue 残留、源码无 console.*', () => {
+    // 依赖面：React 三件套在列，Vue 全家清零（dependencies/devDependencies 双检查）
+    const pkg = JSON.parse(readFileSync(path.join(UI_SRC_DIR, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+    expect(pkg.dependencies?.['react']).toBeDefined();
+    expect(pkg.dependencies?.['react-dom']).toBeDefined();
+    expect(pkg.dependencies?.['react-router-dom']).toBeDefined();
+    for (const name of Object.keys(allDeps)) {
+      expect(name.startsWith('vue') || name.includes('/vue') || name.startsWith('@vue'), `residual dep: ${name}`).toBe(false);
+    }
+    // 源码面：无 .vue 文件、无 Vue 导入、无 console.*
+    const vueFiles: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(p);
+        else if (entry.name.endsWith('.vue')) vueFiles.push(p);
+      }
+    };
+    walk(UI_SRC);
+    expect(vueFiles).toEqual([]);
+    const sourceFiles = ['main.tsx', 'router.tsx', 'lib/api.ts', 'lib/sse.ts', 'lib/theme.tsx', 'styles.css'];
+    for (const f of sourceFiles) {
+      const src = readFileSync(path.join(UI_SRC, f), 'utf8');
+      expect(src.includes('from \'vue'), `${f} imports vue`).toBe(false);
+      expect(src, `${f} uses console.*`).not.toMatch(/\bconsole\.(log|error|warn|info|debug)/);
+    }
+  });
+
+  it('7. 主题 Token 体系：styles.css 含亮暗两套变量全集；theme.tsx 运行期覆盖链完整', () => {
+    const css = readFileSync(path.join(UI_SRC, 'styles.css'), 'utf8');
+    // :root 亮色段与 .dark 暗色段各自携带 shadcn 核心变量
+    const rootStart = css.indexOf(':root {');
+    const darkStart = css.indexOf('.dark {');
+    expect(rootStart).toBeGreaterThanOrEqual(0);
+    expect(darkStart).toBeGreaterThan(rootStart);
+    const rootBlock = css.slice(rootStart, darkStart);
+    const darkBlock = css.slice(darkStart);
+    const REQUIRED_VARS = ['--background:', '--foreground:', '--primary:', '--muted:', '--accent:', '--destructive:', '--border:', '--input:', '--ring:', '--radius:'];
+    for (const v of REQUIRED_VARS) {
+      expect(rootBlock.includes(v), `:root missing ${v}`).toBe(true);
+      expect(darkBlock.includes(v), `.dark missing ${v}`).toBe(true);
+    }
+    // class 策略（Tailwind v4 @custom-variant dark）+ 变量 → 工具类桥接
+    expect(css).toContain('@custom-variant dark');
+    expect(css).toContain('@theme inline');
+    expect(css).toContain('--color-background: var(--background);');
+
+    // 运行期覆盖链：ThemeProvider 经 setProperty 应用（mode → preset → radius/density → custom）
+    const theme = readFileSync(path.join(UI_SRC, 'lib', 'theme.tsx'), 'utf8');
+    expect(theme).toContain("setProperty");
+    expect(theme).toContain("'ui.mode'");
+    expect(theme).toContain("'ui.tokens'");
+    expect(theme).toContain('resetToDefaults');
+    expect(theme).toContain("'system'");
+    // 强调色预设 ≥6 组（default/zinc/violet/blue/emerald/amber/rose）
+    const presetIds = [...theme.matchAll(/id: '([a-z]+)'/g)].map((m) => m[1]);
+    expect(new Set(presetIds).size).toBeGreaterThanOrEqual(6);
+    // 圆角档位 5 档
+    for (const step of ['0rem', '0.25rem', '0.5rem', '0.75rem', '1rem']) {
+      expect(theme).toContain(`'${step}'`);
+    }
+    // 密度两档
+    expect(theme).toContain("'comfortable'");
+    expect(theme).toContain("'compact'");
+  });
+
+  it('8. 路由注册完整性：router.tsx 含 HashRouter + /login + 全部 11 条主导航 + 兜底', () => {
+    const router = readFileSync(path.join(UI_SRC, 'router.tsx'), 'utf8');
+    expect(router).toContain('HashRouter');
+    const routes = [
+      '/login',
+      '/',
+      '/extensions',
+      '/cron',
+      '/notifications',
+      '/files-tasks',
+      '/sandbox',
+      '/users',
+      '/api-keys',
+      '/logs',
+      '/settings',
+      '/update',
+    ];
+    for (const r of routes) {
+      expect(router, `route missing: ${r}`).toContain(`path="${r}"`);
+    }
+    // 兜底重定向（未知 hash → 仪表盘），与认证守卫
+    expect(router).toContain('path="*"');
+    expect(router).toContain('RequireAuth');
+    // 与导航单一数据源对账：NAV_GROUPS 恰好覆盖同一组路径（不含 /login）
+    const nav = readFileSync(path.join(UI_SRC, 'lib', 'nav.tsx'), 'utf8');
+    for (const r of routes.filter((r) => r !== '/login')) {
+      expect(nav, `nav missing: ${r}`).toContain(`path: '${r}'`);
+    }
+  });
+
+  it('9. 基础设施契约：api.ts 凭据/401 跳转；sse.ts 游标重连与 replay-gap 对账', () => {
+    const api = readFileSync(path.join(UI_SRC, 'lib', 'api.ts'), 'utf8');
+    expect(api).toContain("'ui.token'");
+    expect(api).toContain("res.status === 401");
+    expect(api).toContain("'#/login'");
+
+    const sse = readFileSync(path.join(UI_SRC, 'lib', 'sse.ts'), 'utf8');
+    // 断线自动重连带 lastEventId 游标（内核 hub 支持 Last-Event-ID 重放）
+    expect(sse).toContain('lastEventId');
+    // replay-gap → 回调清空本地缓存由调用方 REST 对账；: replay 注释帧由 EventSource 天然静默
+    expect(sse).toContain('replay-gap');
+    expect(sse).toContain('/api/v1/stream');
+    expect(sse).toContain('topics');
+  });
+
+  it('10. Dockerfile 含 ui 构建阶段，runtime 携带 webui manifest/入口与 ui 产物', () => {
     const dockerfile = readFileSync(path.join(REPO_ROOT, 'docker', 'Dockerfile'), 'utf8');
     expect(dockerfile).toMatch(/FROM node:24-alpine AS ui-build/);
     expect(dockerfile).toContain('COPY --from=ui-build /app/extensions/webui/ui ./extensions/webui/ui');
@@ -142,14 +268,14 @@ describe('webui 构建产物与部署面', () => {
     expect(dockerfile).toContain('extensions/webui/manifest.json');
   });
 
-  it('7. .gitignore：忽略 ui-src/node_modules，白名单跟踪 extensions/webui/ui 产物', () => {
+  it('11. .gitignore：忽略 ui-src/node_modules，白名单跟踪 extensions/webui/ui 产物', () => {
     const gitignore = readFileSync(path.join(REPO_ROOT, '.gitignore'), 'utf8');
     expect(gitignore).toContain('extensions/webui/ui-src/node_modules/');
     expect(gitignore).toContain('extensions/*/ui/');
     expect(gitignore).toContain('!extensions/webui/ui/');
   });
 
-  it('8. 产物经内核 registerExtAssets 可静态服务：index.html 200（非应急页）+ 引用资产 200', async () => {
+  it('12. 产物经内核 registerExtAssets 可静态服务：index.html 200（非应急页）+ 引用资产 200', async () => {
     const app = Fastify({ logger: false });
     registerExtAssets(app, [{ extId: 'webui', uiRoot: UI_DIR }]);
     try {
@@ -205,7 +331,7 @@ afterAll(async () => {
 });
 
 describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产现状）', () => {
-  it('9. webui 随 boot 自动启用（builtin 同 auth 款）：清单 enabled:true / builtin:true / mount ui', async () => {
+  it('13. webui 随 boot 自动启用（builtin 同 auth 款）：清单 enabled:true / builtin:true / mount ui', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/extensions', headers: auth });
     expect(res.statusCode).toBe(200);
     const list = res.json() as Array<{ id: string; enabled: boolean; builtin: boolean; mount: string | null }>;
@@ -216,7 +342,7 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     expect(webui?.mount).toBe('ui');
   });
 
-  it('10. GET /api/v1/extensions/webui → manifest.ui.pages 携带根页面声明', async () => {
+  it('14. GET /api/v1/extensions/webui → manifest.ui.pages 携带根页面声明', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/extensions/webui', headers: auth });
     expect(res.statusCode).toBe(200);
     const detail = res.json() as {
@@ -225,7 +351,7 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     expect(detail.manifest?.ui?.pages).toEqual([{ path: '/', title: 'Console', entry: 'index.html' }]);
   });
 
-  it('11. GET /api/v1/ui → 200 含 webui 贡献条目（h.page/h.menu 随 host.load 回报并入册）', async () => {
+  it('15. GET /api/v1/ui → 200 含 webui 贡献条目（h.page/h.menu 随 host.load 回报并入册）', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/ui', headers: auth });
     expect(res.statusCode).toBe(200);
     // 内核补线（load 回执 ui → validateContributions 保留 ui 段 → UiRegistry）后：
@@ -240,7 +366,7 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     ]);
   });
 
-  it('12. GET /ext/webui/ui/index.html → 200（资产挂载已延迟到 manager.start() 后补挂）', async () => {
+  it('16. GET /ext/webui/ui/index.html → 200（资产挂载已延迟到 manager.start() 后补挂）', async () => {
     const res = await app.inject({ method: 'GET', url: '/ext/webui/ui/index.html' });
     // Kernel 的 registerExtAssets 现于 extManager.start() 之后直接在 app 上补挂，
     // builtin webui 的 ui/ 产物随 boot 即静态可服务：
@@ -248,7 +374,7 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     expect(res.body).toContain('<div id="app">');
   });
 
-  it('13. GET /admin → 302 重定向到 /ext/webui/ui/（mount:"ui" 接管），跟随后 200 管理台', async () => {
+  it('17. GET /admin → 302 重定向到 /ext/webui/ui/（mount:"ui" 接管），跟随后 200 管理台', async () => {
     const res = await app.inject({ method: 'GET', url: '/admin' });
     // AGENTS.md 内置扩展白名单 webui → /admin：内核已接线（请求期查 enabled + mount==='ui'），
     // 命中即 302 到扩展静态资产前缀根（index.html 回退）：
@@ -259,7 +385,7 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     expect(followed.body).toContain('<div id="app">');
   });
 
-  it('14. webui 生命周期回路：disable → enabled:false，再 enable → enabled:true', async () => {
+  it('18. webui 生命周期回路：disable → enabled:false，再 enable → enabled:true', async () => {
     const off = await app.inject({ method: 'POST', url: '/api/v1/extensions/webui/disable', headers: auth });
     expect(off.statusCode).toBe(200);
     const afterOff = await app.inject({ method: 'GET', url: '/api/v1/extensions/webui', headers: auth });
@@ -271,7 +397,7 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     expect((afterOn.json() as { enabled: boolean }).enabled).toBe(true);
   });
 
-  it('15. GET / → 内核应急页保持不变（webui 不越权改写内核根路由）', async () => {
+  it('19. GET / → 内核应急页保持不变（webui 不越权改写内核根路由）', async () => {
     const res = await app.inject({ method: 'GET', url: '/' });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toContain('text/html');

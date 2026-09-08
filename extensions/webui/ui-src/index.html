@@ -3,11 +3,28 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light dark" />
     <title>Opptrix Console</title>
+    <script>
+      // 主题防闪烁：首帧渲染前按 localStorage('ui.mode') 同步落 .dark 类与 color-scheme。
+      // 与 src/lib/theme.tsx 的 class 策略一致（'light' | 'dark' | 'system'，缺省 system）。
+      (function () {
+        try {
+          var mode = localStorage.getItem('ui.mode') || 'system';
+          var dark =
+            mode === 'dark' ||
+            (mode !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var root = document.documentElement;
+          root.classList.toggle('dark', dark);
+          root.style.colorScheme = dark ? 'dark' : 'light';
+        } catch (e) {
+          /* localStorage 不可用时按亮色首帧，ThemeProvider 挂载后再兜底 */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

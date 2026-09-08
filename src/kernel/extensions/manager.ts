@@ -94,6 +94,8 @@ export interface ExtSummary {
   dir?: string;
   /** 所在池滑动窗口内的 worker 崩溃次数（池级，非单扩展） */
   crashCount: number;
+  /** 第三方扩展人工授信时间（epoch ms）；受信第一方恒为 null */
+  trustedAt?: number | null;
   lastError: string | null;
 }
 

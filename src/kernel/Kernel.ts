@@ -704,6 +704,40 @@ export class Kernel {
             checker: authChecker,
             counters,
             runDbBackup: (cfg) => createBackup(cfg, db),
+            // GET /api/v1/system/logs — SQLite 日志汇查询（logs 表倒序；data 损坏 JSON → null）
+            logs: {
+              list: async (opts) => {
+                const base = db('logs');
+                const filtered = opts.level !== undefined ? base.where('level', opts.level) : base;
+                const rows = (await filtered
+                  .select('ts', 'level', 'scope', 'message', 'data')
+                  .orderBy('id', 'desc')
+                  .limit(opts.limit)) as Array<{
+                  ts: number;
+                  level: string;
+                  scope: string | null;
+                  message: string;
+                  data: string | null;
+                }>;
+                return rows.map((row) => {
+                  let data: unknown = null;
+                  if (typeof row.data === 'string' && row.data !== '') {
+                    try {
+                      data = JSON.parse(row.data);
+                    } catch {
+                      data = null; // 损坏行不拖垮整个列表
+                    }
+                  }
+                  return {
+                    ts: Number(row.ts),
+                    level: String(row.level),
+                    scope: row.scope == null ? '' : String(row.scope),
+                    message: row.message == null ? '' : String(row.message),
+                    data,
+                  };
+                });
+              },
+            },
           });
           registerCronRoutes(extra, {
             checker: authChecker,
@@ -764,6 +798,8 @@ export class Kernel {
             },
             defaultTimeoutMs: this.config.routeTimeoutMs,
             maxConcurrentPerExt: this.config.maxConcurrentPerExt,
+            isBuiltinExt: (extId) =>
+              extManager.list().find((x) => x.id === extId)?.host === 'builtin',
             isExtEnabled: (extId) => extManager?.list().some((s) => s.id === extId && s.enabled) === true,
             counters,
             logger: { warn: (msg, obj) => this.logger.warn(obj ?? {}, msg) },
@@ -852,7 +888,10 @@ export class Kernel {
                 method: request.method,
                 params,
                 query: (request.query ?? {}) as Record<string, unknown>,
-                headers: sanitizeExtHeaders(request.headers as Record<string, string | string[] | undefined>),
+                headers: sanitizeExtHeaders(request.headers as Record<string, string | string[] | undefined>, {
+                  // auth 为受信第一方：保留 authorization（标准 Bearer 凭据通道）
+                  keepAuthorization: true,
+                }),
                 body:
                   method === 'POST' || method === 'PUT' || method === 'PATCH'
                     ? (request.body ?? null)

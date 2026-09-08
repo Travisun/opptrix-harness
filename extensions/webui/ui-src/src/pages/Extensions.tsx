@@ -1,0 +1,628 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  BlocksIcon,
+  PackageXIcon,
+  PuzzleIcon,
+  RefreshCwIcon,
+  RotateCwIcon,
+  SearchIcon,
+  ShieldCheckIcon,
+  TriangleAlertIcon,
+} from 'lucide-react';
+
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { Label } from '@/components/ui/label';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Switch } from '@/components/ui/switch';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { toast } from '@/components/ui/toast';
+import { api } from '@/lib/api';
+import { cn } from '@/lib/utils';
+import {
+  EmptyState,
+  CodeBlock,
+} from '@/pages/_shared';
+import type {
+  ExtRouteTableEntry,
+  ExtSummary,
+  ServiceEntry,
+  UiSnapshotEntry,
+} from '@/pages/_shared';
+import { errText, isApiError } from '@/pages/_shared';
+
+/**
+ * Extensions — 扩展管理。
+ *
+ * - GET    /api/v1/extensions                扩展卡片列表（启停 Switch / host / 信任 / lastError 折叠）；
+ * - POST   /api/v1/extensions/:id/enable     启用（403 HARNESS-3012 → 信任确认 Dialog，确认后带
+ *                                            {confirmTrust:true} 重试授信）；
+ * - POST   /api/v1/extensions/:id/disable    停用；
+ * - POST   /api/v1/extensions/:id/reload     重载；
+ * - POST   /api/v1/extensions/:id/uninstall  卸载（Dialog 确认 + purge 开关，?purge=1）；
+ * - POST   /api/v1/extensions/rescan         重扫扩展目录；
+ * - GET    /api/v1/extensions/routes         路由表 Tab；
+ * - GET    /api/v1/extensions/registry       服务注册 Tab；
+ * - GET    /api/v1/ui                        UI 注册 Tab。
+ */
+
+type ExtAction = 'enable' | 'disable' | 'reload' | 'uninstall';
+
+/** 信任闸命中（线上 code 为 HARNESS-3012 / EXT_TRUST_REQUIRED，状态 403） */
+function isTrustRequired(e: unknown): boolean {
+  return isApiError(e) && e.status === 403 && ['HARNESS-3012', 'EXT_TRUST_REQUIRED'].includes(e.code);
+}
+
+/** 从信任闸错误的 detail 提取声明权限清单 */
+function trustPermissions(e: unknown): string[] {
+  if (!isApiError(e) || e.detail === null || typeof e.detail !== 'object') return [];
+  const perms = (e.detail as { permissions?: unknown }).permissions;
+  return Array.isArray(perms) ? perms.filter((p): p is string => typeof p === 'string') : [];
+}
+
+export default function ExtensionsPage(): React.ReactNode {
+  const [extensions, setExtensions] = useState<ExtSummary[] | null>(null);
+  const [routes, setRoutes] = useState<ExtRouteTableEntry[] | null>(null);
+  const [registry, setRegistry] = useState<ServiceEntry[] | null>(null);
+  const [uiRegistry, setUiRegistry] = useState<UiSnapshotEntry[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [rescanning, setRescanning] = useState(false);
+  /** 行级操作忙态：extId → action */
+  const [busy, setBusy] = useState<Record<string, ExtAction>>({});
+  /** 信任确认 Dialog 目标 */
+  const [trustTarget, setTrustTarget] = useState<{ ext: ExtSummary; permissions: string[] } | null>(null);
+  /** 卸载确认 Dialog 目标 */
+  const [uninstallTarget, setUninstallTarget] = useState<ExtSummary | null>(null);
+  const [purge, setPurge] = useState(false);
+
+  const load = useCallback(async (): Promise<void> => {
+    setError(null);
+    try {
+      const [extRes, routesRes, registryRes, uiRes] = await Promise.all([
+        api.get<ExtSummary[]>('/api/v1/extensions'),
+        api.get<ExtRouteTableEntry[]>('/api/v1/extensions/routes'),
+        api.get<ServiceEntry[]>('/api/v1/extensions/registry'),
+        api.get<UiSnapshotEntry[]>('/api/v1/ui'),
+      ]);
+      setExtensions(extRes);
+      setRoutes(routesRes);
+      setRegistry(registryRes);
+      setUiRegistry(uiRes);
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  /** 行级动作包装：忙态 + 成功提示 + 刷新（信任闸与卸载的分支在外层处理） */
+  const runAction = useCallback(
+    async (ext: ExtSummary, action: ExtAction, opts?: { confirmTrust?: boolean; purge?: boolean }): Promise<boolean> => {
+      setBusy((prev) => ({ ...prev, [ext.id]: action }));
+      try {
+        switch (action) {
+          case 'enable':
+            await api.post(`/api/v1/extensions/${encodeURIComponent(ext.id)}/enable`, opts?.confirmTrust === true ? { confirmTrust: true } : undefined);
+            toast.success('启用成功', ext.manifest?.displayName ?? ext.id);
+            break;
+          case 'disable':
+            await api.post(`/api/v1/extensions/${encodeURIComponent(ext.id)}/disable`);
+            toast.success('已停用', ext.manifest?.displayName ?? ext.id);
+            break;
+          case 'reload':
+            await api.post(`/api/v1/extensions/${encodeURIComponent(ext.id)}/reload`);
+            toast.success('已重载', ext.manifest?.displayName ?? ext.id);
+            break;
+          case 'uninstall':
+            await api.post(
+              `/api/v1/extensions/${encodeURIComponent(ext.id)}/uninstall${opts?.purge === true ? '?purge=1' : ''}`,
+            );
+            toast.success('已卸载', opts?.purge === true ? '持久化数据已一并清除' : ext.id);
+            break;
+        }
+        return true;
+      } catch (e) {
+        if (action === 'enable' && opts?.confirmTrust !== true && isTrustRequired(e)) {
+          // 信任闸：打开确认 Dialog（api 层已 toast 错误本身）
+          setTrustTarget({ ext, permissions: trustPermissions(e) });
+          return false;
+        }
+        toast.error('操作失败', errText(e));
+        return false;
+      } finally {
+        setBusy((prev) => {
+          const next = { ...prev };
+          delete next[ext.id];
+          return next;
+        });
+      }
+    },
+    [],
+  );
+
+  const handleToggle = useCallback(
+    async (ext: ExtSummary, enabled: boolean): Promise<void> => {
+      const ok = await runAction(ext, enabled ? 'enable' : 'disable');
+      if (ok) await load();
+    },
+    [runAction, load],
+  );
+
+  const handleRescan = useCallback(async (): Promise<void> => {
+    setRescanning(true);
+    try {
+      const res = await api.post<{ ok: boolean; discovered: string[] }>('/api/v1/extensions/rescan');
+      toast.success(
+        '重扫完成',
+        res.discovered.length > 0 ? `新发现 ${res.discovered.length} 个扩展：${res.discovered.join('、')}` : '未发现新扩展目录',
+      );
+      await load();
+    } catch (e) {
+      toast.error('重扫失败', errText(e));
+    } finally {
+      setRescanning(false);
+    }
+  }, [load]);
+
+  const confirmUninstall = useCallback(async (): Promise<void> => {
+    if (uninstallTarget === null) return;
+    const ok = await runAction(uninstallTarget, 'uninstall', { purge });
+    setUninstallTarget(null);
+    setPurge(false);
+    if (ok) await load();
+  }, [uninstallTarget, purge, runAction, load]);
+
+  const confirmTrust = useCallback(async (): Promise<void> => {
+    if (trustTarget === null) return;
+    const ok = await runAction(trustTarget.ext, 'enable', { confirmTrust: true });
+    setTrustTarget(null);
+    if (ok) await load();
+  }, [trustTarget, runAction, load]);
+
+  const sorted = useMemo(() => {
+    const list = extensions ?? [];
+    return [...list].sort((a, b) => (a.host === b.host ? a.id.localeCompare(b.id) : a.host === 'builtin' ? -1 : 1));
+  }, [extensions]);
+
+  return (
+    <div className="flex flex-col gap-6">
+      {/* 页头 */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-col gap-1">
+          <h2 className="text-lg font-semibold tracking-tight">扩展</h2>
+          <p className="text-muted-foreground text-sm">扩展的启停、重载、卸载与贡献点查看。</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" onClick={() => void handleRescan()} disabled={rescanning}>
+            <SearchIcon className={cn(rescanning && 'animate-pulse')} aria-hidden />
+            {rescanning ? '扫描中…' : '重新扫描'}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+            <RefreshCwIcon className={cn(loading && 'animate-spin')} aria-hidden />
+            刷新
+          </Button>
+        </div>
+      </div>
+
+      {/* 加载骨架 */}
+      {loading && (
+        <div className="grid gap-3 md:grid-cols-2">
+          {Array.from({ length: 4 }, (_, i) => (
+            <Skeleton key={i} className="h-36 rounded-lg" />
+          ))}
+        </div>
+      )}
+
+      {/* 错误态 */}
+      {!loading && error !== null && (
+        <EmptyState icon={TriangleAlertIcon} title="扩展清单加载失败" description={error}>
+          <Button size="sm" onClick={() => void load()}>
+            <RefreshCwIcon aria-hidden />
+            重试
+          </Button>
+        </EmptyState>
+      )}
+
+      {/* 空态 */}
+      {!loading && error === null && sorted.length === 0 && (
+        <EmptyState
+          icon={PackageXIcon}
+          title="暂无扩展"
+          description="扩展目录（HARNESS_EXTENSIONS_DIR）下还没有已注册的扩展，点击「重新扫描」尝试发现。"
+        >
+          <Button size="sm" variant="outline" onClick={() => void handleRescan()}>
+            <SearchIcon aria-hidden />
+            重新扫描
+          </Button>
+        </EmptyState>
+      )}
+
+      {/* 扩展卡片列表（天然响应式：<md 单列，≥md 双列） */}
+      {!loading && error === null && sorted.length > 0 && (
+        <div className="grid gap-3 md:grid-cols-2">
+          {sorted.map((ext) => (
+            <ExtensionCard
+              key={ext.id}
+              ext={ext}
+              busyAction={busy[ext.id]}
+              onToggle={(enabled) => void handleToggle(ext, enabled)}
+              onReload={() => void runAction(ext, 'reload').then((ok) => ok && void load())}
+              onUninstall={() => setUninstallTarget(ext)}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* 贡献点 Tabs */}
+      {!loading && error === null && (extensions?.length ?? 0) > 0 && (
+        <Tabs defaultValue="routes" className="gap-3">
+          <TabsList>
+            <TabsTrigger value="routes">路由表</TabsTrigger>
+            <TabsTrigger value="registry">服务注册</TabsTrigger>
+            <TabsTrigger value="ui">UI 注册</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="routes">
+            <RoutesTab routes={routes} onRefresh={() => void load()} />
+          </TabsContent>
+          <TabsContent value="registry">
+            <RegistryTab registry={registry} onRefresh={() => void load()} />
+          </TabsContent>
+          <TabsContent value="ui">
+            <UiTab entries={uiRegistry} onRefresh={() => void load()} />
+          </TabsContent>
+        </Tabs>
+      )}
+
+      {/* 信任确认 Dialog */}
+      <Dialog open={trustTarget !== null} onOpenChange={(open) => !open && setTrustTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ShieldCheckIcon className="size-5 text-amber-500" aria-hidden />
+              信任此扩展并启用？
+            </DialogTitle>
+            <DialogDescription>
+              「{trustTarget?.ext.manifest?.displayName ?? trustTarget?.ext.id}」来自不受信目录（社区池），首次启用需要人工授信。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3 text-sm">
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-muted-foreground text-xs">该扩展声明的权限</Label>
+              <div className="flex flex-wrap gap-1.5">
+                {trustTarget !== null && trustTarget.permissions.length > 0 ? (
+                  trustTarget.permissions.map((p) => (
+                    <Badge key={p} variant="outline" className="font-mono text-[11px]">
+                      {p}
+                    </Badge>
+                  ))
+                ) : (
+                  <span className="text-muted-foreground text-xs">（未声明权限）</span>
+                )}
+              </div>
+            </div>
+            <p className="text-destructive flex items-start gap-1.5 text-xs leading-relaxed">
+              <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+              信任表示你确认该扩展来源可靠。启用后它将获得以上权限（网络访问、存储、通知等），请仅授信你了解的扩展。
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setTrustTarget(null)}>
+              取消
+            </Button>
+            <Button onClick={() => void confirmTrust()}>确认信任并启用</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 卸载确认 Dialog */}
+      <Dialog open={uninstallTarget !== null} onOpenChange={(open) => !open && setUninstallTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>卸载扩展</DialogTitle>
+            <DialogDescription>
+              确定要卸载「{uninstallTarget?.manifest?.displayName ?? uninstallTarget?.id}」吗？该操作会停止扩展并从扩展目录登记中移除。
+            </DialogDescription>
+          </DialogHeader>
+          <label className="hover:bg-accent/50 flex cursor-pointer items-center gap-3 rounded-md border p-3">
+            <Switch checked={purge} onCheckedChange={setPurge} aria-label="同时清除持久化数据" />
+            <span className="flex flex-col">
+              <span className="text-sm font-medium">同时清除持久化数据（purge）</span>
+              <span className="text-muted-foreground text-xs">删除该扩展在数据库中的数据记录，不可恢复。</span>
+            </span>
+          </label>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setUninstallTarget(null)}>
+              取消
+            </Button>
+            <Button variant="destructive" onClick={() => void confirmUninstall()}>
+              确认卸载
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+/** 单个扩展卡片 */
+function ExtensionCard({
+  ext,
+  busyAction,
+  onToggle,
+  onReload,
+  onUninstall,
+}: {
+  ext: ExtSummary;
+  busyAction: ExtAction | undefined;
+  onToggle: (enabled: boolean) => void;
+  onReload: () => void;
+  onUninstall: () => void;
+}): React.ReactNode {
+  const [showError, setShowError] = useState(false);
+  const name = ext.manifest?.displayName ?? ext.id;
+  const isBuiltin = ext.host === 'builtin';
+
+  return (
+    <Card className="gap-3 py-4">
+      <CardContent className="flex flex-col gap-3 px-4">
+        {/* 标题行：名称 + host/信任徽标 + 启停 Switch */}
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <PuzzleIcon className="text-muted-foreground size-4 shrink-0" aria-hidden />
+              <span className="truncate text-sm font-semibold" title={name}>
+                {name}
+              </span>
+              <Badge variant="outline" className="font-mono text-[11px]">
+                v{ext.version || '?'}
+              </Badge>
+              <Badge variant={isBuiltin ? 'success' : 'secondary'}>{isBuiltin ? '内置' : '社区'}</Badge>
+              {/* 信任徽标：内置池目录受信；社区池需首次启用时人工授信（trusted_at 由内核落库，清单接口未回显） */}
+              <Badge variant={isBuiltin ? 'outline' : 'warning'} className="gap-1">
+                <ShieldCheckIcon className="size-3" aria-hidden />
+                {isBuiltin ? '受信' : '待授信'}
+              </Badge>
+            </div>
+            <p className="text-muted-foreground truncate font-mono text-xs" title={ext.id}>
+              {ext.id}
+              {ext.dir !== undefined && ` · ${ext.dir}`}
+            </p>
+          </div>
+          <Switch
+            checked={ext.enabled}
+            disabled={busyAction !== undefined}
+            onCheckedChange={onToggle}
+            aria-label={ext.enabled ? `停用 ${name}` : `启用 ${name}`}
+          />
+        </div>
+
+        {/* 贡献点计数 */}
+        {ext.contributions !== undefined && (
+          <div className="flex flex-wrap gap-1.5">
+            <Badge variant="secondary">路由 {ext.contributions.routes}</Badge>
+            <Badge variant="secondary">定时 {ext.contributions.crons}</Badge>
+            <Badge variant="secondary">事件 {ext.contributions.events}</Badge>
+            <Badge variant="secondary">钩子 {ext.contributions.hooks}</Badge>
+            <Badge variant="secondary">服务 {ext.contributions.services}</Badge>
+          </div>
+        )}
+
+        {/* lastError 折叠 */}
+        {ext.lastError !== null && ext.lastError !== '' && (
+          <div className="flex flex-col gap-1.5">
+            <button
+              type="button"
+              onClick={() => setShowError((prev) => !prev)}
+              className="text-destructive flex items-center gap-1.5 text-left text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <TriangleAlertIcon className="size-3.5 shrink-0" aria-hidden />
+              最近一次错误
+              <span className="text-muted-foreground underline">{showError ? '收起' : '展开'}</span>
+            </button>
+            {showError && <CodeBlock text={ext.lastError} />}
+          </div>
+        )}
+
+        {/* 操作行 */}
+        <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+          <Button variant="outline" size="sm" onClick={onReload} disabled={busyAction !== undefined}>
+            <RotateCwIcon className={cn(busyAction === 'reload' && 'animate-spin')} aria-hidden />
+            {busyAction === 'reload' ? '重载中…' : '重载'}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            onClick={onUninstall}
+            disabled={busyAction !== undefined}
+          >
+            <PackageXIcon aria-hidden />
+            {busyAction === 'uninstall' ? '卸载中…' : '卸载'}
+          </Button>
+          {busyAction === 'enable' && <span className="text-muted-foreground text-xs">启用中…</span>}
+          {busyAction === 'disable' && <span className="text-muted-foreground text-xs">停用中…</span>}
+          {ext.crashCount > 0 && (
+            <Badge variant="warning" className="ml-auto">
+              近期崩溃 {ext.crashCount}
+            </Badge>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** 路由表 Tab（<md 横向滚动） */
+function RoutesTab({ routes, onRefresh }: { routes: ExtRouteTableEntry[] | null; onRefresh: () => void }): React.ReactNode {
+  if (routes === null) return <TabSkeleton onRefresh={onRefresh} />;
+  if (routes.length === 0) {
+    return <EmptyState icon={BlocksIcon} title="暂无注册路由" description="当前启用的扩展没有注册任何 HTTP 路由。" />;
+  }
+  return (
+    <div className="overflow-x-auto rounded-lg border">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="w-24">方法</TableHead>
+            <TableHead>路径</TableHead>
+            <TableHead className="w-24">鉴权</TableHead>
+            <TableHead className="w-44">扩展</TableHead>
+            <TableHead className="w-28">超时</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {routes.map((r) => (
+            <TableRow key={`${r.extId}:${r.method}:${r.path}`}>
+              <TableCell>
+                <Badge variant={r.method === 'GET' ? 'secondary' : r.method === 'DELETE' ? 'destructive' : 'outline'} className="font-mono">
+                  {r.method}
+                </Badge>
+              </TableCell>
+              <TableCell className="max-w-[280px] truncate font-mono text-xs" title={r.path}>
+                {r.path}
+              </TableCell>
+              <TableCell>
+                <Badge variant={r.auth === 'public' ? 'outline' : r.auth === 'admin' ? 'warning' : 'secondary'}>{r.auth}</Badge>
+              </TableCell>
+              <TableCell className="font-mono text-xs">{r.extId}</TableCell>
+              <TableCell className="text-muted-foreground tabular-nums text-xs">
+                {r.timeoutMs !== undefined ? `${r.timeoutMs} ms` : '默认'}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+/** 服务注册 Tab */
+function RegistryTab({ registry, onRefresh }: { registry: ServiceEntry[] | null; onRefresh: () => void }): React.ReactNode {
+  if (registry === null) return <TabSkeleton onRefresh={onRefresh} />;
+  if (registry.length === 0) {
+    return <EmptyState icon={BlocksIcon} title="暂无服务注册" description="当前启用的扩展没有通过 h.expose 暴露任何服务。" />;
+  }
+  return (
+    <div className="overflow-x-auto rounded-lg border">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>服务全名</TableHead>
+            <TableHead>方法</TableHead>
+            <TableHead className="w-28">状态</TableHead>
+            <TableHead className="w-44">扩展</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {registry.map((s) => (
+            <TableRow key={s.service}>
+              <TableCell className="font-mono text-xs">{s.service}</TableCell>
+              <TableCell>
+                <div className="flex flex-wrap gap-1">
+                  {s.methods.map((m) => (
+                    <Badge key={m} variant="outline" className="font-mono text-[11px]">
+                      {m}
+                    </Badge>
+                  ))}
+                </div>
+              </TableCell>
+              <TableCell>
+                <Badge variant={s.status === 'active' ? 'success' : 'warning'}>{s.status === 'active' ? '活跃' : '已挂起'}</Badge>
+              </TableCell>
+              <TableCell className="font-mono text-xs">{s.extId}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+/** UI 注册 Tab */
+function UiTab({ entries, onRefresh }: { entries: UiSnapshotEntry[] | null; onRefresh: () => void }): React.ReactNode {
+  if (entries === null) return <TabSkeleton onRefresh={onRefresh} />;
+  if (entries.length === 0) {
+    return <EmptyState icon={BlocksIcon} title="暂无 UI 注册" description="当前启用的扩展没有贡献任何 UI 片段（菜单 / 页面 / 小部件 / 渲染器）。" />;
+  }
+  return (
+    <div className="grid gap-3 md:grid-cols-2">
+      {entries.map((e) => (
+        <Card key={e.extId} className="gap-3 py-4">
+          <CardContent className="flex flex-col gap-2.5 px-4">
+            <p className="font-mono text-xs font-semibold">{e.extId}</p>
+            {e.menu !== undefined && (
+              <p className="text-muted-foreground text-xs">
+                菜单：<span className="text-foreground font-medium">{e.menu.label}</span>
+              </p>
+            )}
+            {e.pages.length > 0 && (
+              <div className="flex flex-col gap-1">
+                <span className="text-muted-foreground text-xs">页面</span>
+                {e.pages.map((p) => (
+                  <p key={p.path} className="truncate text-xs" title={`${p.path} → ${p.entry}`}>
+                    <span className="font-medium">{p.title}</span>
+                    <span className="text-muted-foreground font-mono"> · {p.path}</span>
+                  </p>
+                ))}
+              </div>
+            )}
+            {e.widgets.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {e.widgets.map((w) => (
+                  <Badge key={w.id} variant="secondary" className="text-[11px]">
+                    {w.title}
+                  </Badge>
+                ))}
+              </div>
+            )}
+            {e.renderers.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {e.renderers.map((r) => (
+                  <Badge key={r} variant="outline" className="font-mono text-[11px]">
+                    {r}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+/** Tab 数据未就绪的骨架 */
+function TabSkeleton({ onRefresh }: { onRefresh: () => void }): React.ReactNode {
+  return (
+    <div className="flex flex-col gap-3">
+      <Skeleton className="h-32 rounded-lg" />
+      <Button variant="outline" size="sm" className="w-fit" onClick={onRefresh}>
+        <RefreshCwIcon aria-hidden />
+        重新加载
+      </Button>
+    </div>
+  );
+}

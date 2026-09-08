@@ -2,19 +2,22 @@
  * 系统 API 集成测试（真实 fastify 注入，经 createHttpServer + registerExtra 挂载）。
  *
  * 覆盖：统一鉴权（401 HARNESS-1006）、info 字段完整性、doctor 结构、
- * backup 501/200 两态、openapi 文档端点、/api/v1 请求计数增长。
+ * backup 501/200 两态、logs 门禁/透传/501/校验、openapi 文档端点、
+ * /api/v1 请求计数增长；另含 Kernel 接线的真实端到端用例（logs 表 data 损坏 JSON → null）。
  */
 import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import pino from 'pino';
 import type { FastifyInstance } from 'fastify';
+import type { Knex } from 'knex';
 
-import { registerSystemRoutes } from '../src/api/system.js';
+import { registerSystemRoutes, type SystemLogSource } from '../src/api/system.js';
 import { loadConfig, type HarnessConfig } from '../src/kernel/config/index.js';
 import { err } from '../src/kernel/errors/HarnessError.js';
+import { CONTAINER_KEYS, Kernel } from '../src/kernel/Kernel.js';
 import { createHttpServer } from '../src/kernel/http/server.js';
 import { Counters } from '../src/kernel/system/info.js';
 
@@ -41,6 +44,7 @@ function makeConfig(): HarnessConfig {
 
 interface BuildOpts {
   runDbBackup?: (cfg: HarnessConfig) => Promise<{ path: string; sizeBytes: number }>;
+  logs?: SystemLogSource;
 }
 
 /** 经 createHttpServer 的 registerExtra 钩子挂载系统路由（与内核集成方式一致） */
@@ -68,6 +72,7 @@ function buildServer(
         },
         counters,
         ...(opts.runDbBackup ? { runDbBackup: opts.runDbBackup } : {}),
+        ...(opts.logs ? { logs: opts.logs } : {}),
       });
     },
   });
@@ -232,5 +237,201 @@ describe('system api — 请求计数', () => {
     expect(apiRequestsAfter).toBe(2);
     expect(after['api.requests{route=/api/v1/system/info}']).toBe(2);
     expect(after['api.requests{route=/health}']).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/system/logs（stub 数据源：门禁 / 校验 / 透传 / 501）
+// ---------------------------------------------------------------------------
+
+describe('system api — logs（门禁与未注入）', () => {
+  it('无 token 返回 401 HARNESS-1006，数据源未被触达', async () => {
+    let called = false;
+    const { app } = buildServer({
+      logs: {
+        list: async () => {
+          called = true;
+          return [];
+        },
+      },
+    });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/system/logs' });
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toMatchObject({ code: 'HARNESS-1006', retryable: false });
+    expect(called).toBe(false);
+  });
+
+  it('normal 角色返回 403 HARNESS-1007（日志仅 admin/root），数据源未被触达', async () => {
+    let called = false;
+    const { app } = buildServer({
+      logs: {
+        list: async () => {
+          called = true;
+          return [];
+        },
+      },
+    });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/system/logs', headers: AUTHZ_NORMAL });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toMatchObject({ code: 'HARNESS-1007', retryable: false });
+    expect(res.json().message).toContain('admin or root');
+    expect(called).toBe(false);
+  });
+
+  it('未注入 deps.logs 时返回 501 HARNESS-9004（与其他可选端点同款）', async () => {
+    const { app } = buildServer();
+    const res = await app.inject({ method: 'GET', url: '/api/v1/system/logs', headers: AUTHZ });
+    expect(res.statusCode).toBe(501);
+    expect(res.json()).toMatchObject({ code: 'HARNESS-9004', retryable: false });
+    expect(res.json().message).toBe('not implemented');
+  });
+});
+
+describe('system api — logs（校验与透传）', () => {
+  it('正常透传：limit/level 传给数据源，行原样返回；无 query 时默认 limit=200 且不过滤级别', async () => {
+    const calls: Array<{ level?: string; limit: number }> = [];
+    const { app } = buildServer({
+      logs: {
+        list: async (opts) => {
+          calls.push({ ...opts });
+          return [
+            { ts: 2000, level: 'warn', scope: 'ext.demo', message: 'newer', data: { k: 1 } },
+            { ts: 1000, level: 'info', scope: 'kernel', message: 'older', data: null },
+          ];
+        },
+      },
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/system/logs?limit=50&level=warn',
+      headers: AUTHZ,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(calls).toEqual([{ level: 'warn', limit: 50 }]);
+    const body = res.json();
+    expect(body.items).toHaveLength(2);
+    expect(body.items[0]).toEqual({ ts: 2000, level: 'warn', scope: 'ext.demo', message: 'newer', data: { k: 1 } });
+    expect(body.items[1]).toEqual({ ts: 1000, level: 'info', scope: 'kernel', message: 'older', data: null });
+
+    // 无 query：level 不传（undefined），limit 缺省 200
+    const res2 = await app.inject({ method: 'GET', url: '/api/v1/system/logs', headers: AUTHZ });
+    expect(res2.statusCode).toBe(200);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toEqual({ limit: 200 });
+  });
+
+  it.each([
+    ['limit=0', '/api/v1/system/logs?limit=0'],
+    ['limit=1001（超上限）', '/api/v1/system/logs?limit=1001'],
+    ['limit=abc（非数字）', '/api/v1/system/logs?limit=abc'],
+    ['level=bogus（非法级别）', '/api/v1/system/logs?level=bogus'],
+  ])('非法 query（%s）返回 400 HARNESS-1009，数据源未被触达', async (_name, url) => {
+    let called = false;
+    const { app } = buildServer({
+      logs: {
+        list: async () => {
+          called = true;
+          return [];
+        },
+      },
+    });
+    const res = await app.inject({ method: 'GET', url, headers: AUTHZ });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe('HARNESS-1009');
+    expect(called).toBe(false);
+  });
+
+  it('limit=1000 边界值合法，可正常透传', async () => {
+    const calls: Array<{ level?: string; limit: number }> = [];
+    const { app } = buildServer({
+      logs: {
+        list: async (opts) => {
+          calls.push({ ...opts });
+          return [];
+        },
+      },
+    });
+    const res = await app.inject({ method: 'GET', url: '/api/v1/system/logs?limit=1000', headers: AUTHZ });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().items).toEqual([]);
+    expect(calls).toEqual([{ limit: 1000 }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Kernel 接线端到端：真实 Kernel boot → logs 表 → 行映射（data 损坏 JSON → null）
+// ---------------------------------------------------------------------------
+
+describe('system api — logs（Kernel 接线端到端）', () => {
+  let dataDir = '';
+  let kernel: Kernel | undefined;
+  let app: FastifyInstance;
+  let db: Knex;
+  const auth: Record<string, string> = { authorization: '' };
+
+  beforeAll(async () => {
+    dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'opptrix-system-logs-e2e-'));
+    kernel = new Kernel({
+      config: {
+        ...loadConfig({
+          NODE_ENV: 'test',
+          HARNESS_LOG_LEVEL: 'error',
+          HARNESS_TASK_WORKERS: '1',
+          HARNESS_DATA_DIR: dataDir,
+          HARNESS_PERSIST_ROOT_TOKEN: '0',
+        }),
+        port: 0,
+      },
+    });
+    await kernel.boot();
+    auth.authorization = `Bearer ${kernel.container.resolve<{ token: string }>(CONTAINER_KEYS.authIdentity).token}`;
+    app = kernel.container.resolve<{ app: FastifyInstance }>(CONTAINER_KEYS.http).app;
+    db = kernel.container.resolve<Knex>(CONTAINER_KEYS.db);
+    // 造三行 fatal 级别日志（内核自省日志不产生 fatal，隔离 sqlite sink 异步写入的干扰）：
+    // 插入顺序 good → corrupt → plain（id 递增），倒序期望 plain, corrupt, good
+    await db('logs').insert([
+      { ts: 1000, level: 'fatal', scope: 'k', message: 'good-row', data: JSON.stringify({ requestId: 'req-1', n: 2 }) },
+      { ts: 2000, level: 'fatal', scope: 'k', message: 'corrupt-row', data: '{broken json' },
+      { ts: 3000, level: 'fatal', scope: 'k', message: 'plain-row', data: null },
+    ]);
+  });
+
+  afterAll(async () => {
+    await kernel?.shutdown('system-logs-e2e-afterall');
+    if (dataDir !== '') await fsp.rm(dataDir, { recursive: true, force: true });
+  });
+
+  it('倒序（最新在前）+ data JSON 解析：好行解析为对象、损坏行与 NULL 行 → null', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/v1/system/logs?level=fatal', headers: auth });
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<{
+      ts: number;
+      level: string;
+      scope: string;
+      message: string;
+      data: unknown;
+    }>;
+    expect(items.map((r) => r.message)).toEqual(['plain-row', 'corrupt-row', 'good-row']);
+    expect(items[0]).toMatchObject({ ts: 3000, level: 'fatal', scope: 'k', data: null });
+    expect(items[1]).toMatchObject({ ts: 2000, data: null }); // 损坏 JSON 不拖垮列表 → null
+    expect(items[2]).toMatchObject({ ts: 1000, data: { requestId: 'req-1', n: 2 } });
+  });
+
+  it('limit 收窄生效（id 倒序取前 N 条）+ 未知级别过滤为空列表', async () => {
+    const limited = await app.inject({
+      method: 'GET',
+      url: '/api/v1/system/logs?level=fatal&limit=2',
+      headers: auth,
+    });
+    expect(limited.statusCode).toBe(200);
+    expect((limited.json().items as Array<{ message: string }>).map((r) => r.message)).toEqual([
+      'plain-row',
+      'corrupt-row',
+    ]);
+
+    const empty = await app.inject({ method: 'GET', url: '/api/v1/system/logs?level=trace', headers: auth });
+    expect(empty.statusCode).toBe(200);
+    expect(empty.json().items).toEqual([]);
   });
 });

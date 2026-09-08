@@ -77,6 +77,7 @@ interface HarnessOptions {
   defaultTimeoutMs?: number;
   maxConcurrentPerExt?: number;
   isExtEnabled?: (extId: string) => boolean;
+  isBuiltinExt?: (extId: string) => boolean;
   counters?: { inc(name: string, tags?: Record<string, string>): void };
 }
 
@@ -103,6 +104,7 @@ function buildHarness(opts: HarnessOptions = {}): {
     defaultTimeoutMs: opts.defaultTimeoutMs ?? 5_000,
     maxConcurrentPerExt: opts.maxConcurrentPerExt ?? 8,
     isExtEnabled: opts.isExtEnabled ?? (() => true),
+    ...(opts.isBuiltinExt ? { isBuiltinExt: opts.isBuiltinExt } : {}),
     ...(opts.counters ? { counters: opts.counters } : {}),
   });
   if (opts.routes !== undefined) {
@@ -624,5 +626,33 @@ describe('ExtRouteRegistry（真实 fastify + 通配兜底路由）', () => {
     snapshot[0]!.path = '/mutated';
 
     expect(registry.getTable()).toEqual([r({ path: '/a' })]);
+  });
+});
+
+describe('SEC-7 细化：authorization 头按池区分', () => {
+  it('内置池扩展保留 authorization（第一方 Bearer 通道）', async () => {
+    const { app, dispatcher } = buildHarness({
+      extId: 'auth-app',
+      routes: [{ extId: 'auth-app', method: 'GET', path: '/me', auth: 'public' }],
+      isBuiltinExt: () => true,
+    });
+    await app.ready();
+    const res = await app.inject({ method: 'GET', url: '/ext/auth-app/me', headers: { authorization: 'Bearer ses_x' } });
+    expect(res.statusCode).toBe(200);
+    expect(dispatcher.calls[0]?.request.headers.authorization).toBe('Bearer ses_x');
+    await app.close();
+  });
+
+  it('社区池扩展剥离 authorization（防令牌收割）', async () => {
+    const { app, dispatcher } = buildHarness({
+      extId: 'third',
+      routes: [{ extId: 'third', method: 'GET', path: '/hook', auth: 'public' }],
+      isBuiltinExt: () => false,
+    });
+    await app.ready();
+    const res = await app.inject({ method: 'GET', url: '/ext/third/hook', headers: { authorization: 'Bearer secret' } });
+    expect(res.statusCode).toBe(200);
+    expect(dispatcher.calls[0]?.request.headers.authorization).toBeUndefined();
+    await app.close();
   });
 });
