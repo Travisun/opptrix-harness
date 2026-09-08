@@ -1,5 +1,5 @@
 /**
- * Container — 内核 DI 容器（Laravel 风格）。
+ * Container — 内核 DI 容器（声明式服务装配风格）。
  *
  * 设计要点（minify 安全）：
  * - 不做反射、不做参数名注入、不解析 function.toString；

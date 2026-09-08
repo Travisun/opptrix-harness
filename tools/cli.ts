@@ -16,7 +16,7 @@ import { pathToFileURL } from 'node:url';
 import { HarnessError } from '../src/kernel/errors/index.js';
 import { makeExtension, validateExtension } from './cli-core.js';
 
-/** 默认扩展根目录：约定优于配置（Laravel 心智），make:extension 不传 targetDir 时使用 */
+/** 默认扩展根目录：约定优于配置，make:extension 不传 targetDir 时使用 */
 const DEFAULT_EXTENSIONS_DIR = 'extensions';
 
 const USAGE = `Opptrix Harness CLI

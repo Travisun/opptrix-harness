@@ -3,7 +3,7 @@
  *
  * - `loadDotenv()`：可选的 .env 装载（幂等、不覆盖已有环境变量、.env 缺失不致命）
  * - `loadConfig()`：同步、fail-fast 的配置解析（env 前缀 HARNESS_，运行环境用 NODE_ENV）
- * - `configGet()`：Laravel `config()` 风格的点号取值
+ * - `configGet()`：点号风格的配置取值
  *
  * 来源优先级：默认值 ← .env ← 进程环境变量（dotenv 默认不覆盖已有真实环境变量）。
  * 任何配置项非法都在启动期抛 HarnessError，信息包含变量名、期望值与修复方式。
@@ -173,7 +173,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 }
 
 /**
- * Laravel `config()` 风格点号取值：`configGet(cfg, 'port')`、`configGet(cfg, 'a.b.c')`。
+ * 点号取值：`configGet(cfg, 'port')`、`configGet(cfg, 'a.b.c')`。
  * 路径不存在（或中途断链）返回 fallback；未给 fallback 则为 undefined。
  * 返回类型为 `T | undefined`：调用侧必须处理取值缺失（undefined）的情形。
  */

@@ -172,7 +172,7 @@ describe('fail-fast 校验', () => {
   });
 });
 
-describe('configGet：Laravel config() 点号风格', () => {
+describe('configGet：点号风格', () => {
   const cfg = loadConfig({});
 
   it('单段路径取值', () => {

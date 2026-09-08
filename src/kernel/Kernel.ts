@@ -1,5 +1,5 @@
 /**
- * Kernel — 内核生命周期编排（Laravel 风格）。
+ * Kernel — 内核生命周期编排（服务提供者两阶段引导）。
  *
  * 职责：
  * - 持有 DI 容器、配置与 logger，并把它们以 'config' / 'logger' 单例注入容器

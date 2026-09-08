@@ -1,7 +1,7 @@
 /**
  * ExtensionManager — 扩展生命周期编排 + 热插拔自愈。
  *
- * 职责（Laravel「服务提供者」心智的扩展版）：
+ * 职责（服务提供者两阶段心智的扩展版）：
  * - 发现：扫描 extensionsDirs 下含 manifest.json 的一级子目录，validateManifest 过闸；
  * - 拓扑：按 manifest.requires 做 Kahn 拓扑排序（环 → EXT_DEPENDENCY_MISSING fail-fast）；
  *   硬依赖缺失/未启用的依赖者被单独拒绝（记录 last_error），不影响其他扩展；

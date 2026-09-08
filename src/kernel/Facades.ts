@@ -1,5 +1,5 @@
 /**
- * Facades — Laravel 风格静态门面（App / Config / Log / Event / Hook / Cron）。
+ * Facades — 静态门面（App / Config / Log / Event / Hook / Cron）。
  *
  * 设计要点：
  * - 模块级持有当前 Kernel：`bindFacadeKernel()` 在宿主 boot 时绑定一次；
@@ -99,7 +99,7 @@ function resolveFacadeService<T>(key: string): T {
 // ---------------------------------------------------------------------------
 
 /**
- * `App` — Laravel `App` 门面风格：内核 DI 容器的静态访问入口。
+ * `App` — 内核 DI 容器的静态访问入口。
  *
  * @example
  * const settings = App.resolve<SettingsService>('settings');
@@ -132,7 +132,7 @@ export class App {
 // ---------------------------------------------------------------------------
 
 /**
- * `Config` — Laravel `config()` 门面风格：内核配置的点号读取入口。
+ * `Config` — 内核配置的点号读取入口。
  *
  * @example
  * Config.get<number>('port');            // 3000

@@ -1,12 +1,12 @@
 /**
- * 批次化迁移运行器（Laravel 语义，记账表自管）。
+ * 批次化迁移运行器（批次号记账表自管）。
  *
  * 自研而非复用 knex.migrate 的理由：knex.migrate 依赖文件目录与命名约定，
  * 记账表（knex_migrations）结构固定；本运行器以数组注入迁移、自管记账表
  * （默认 `migrations_log`：name TEXT PK / batch INTEGER / applied_at INTEGER epoch ms），
  * 不绑定任何文件布局，天然支持后续扩展库复用（每个扩展库一个 Migrator 实例、独立记账表）。
  *
- * 语义对齐 Laravel：
+ * 语义：
  * - `latest()` 一次调用 = 一个批次，batch = max(batch) + 1；
  * - `rollback()` 回滚最新批次的全部迁移，逆序执行 down；
  * - 每个迁移独立事务：up/down 与记账写入同事务，任一抛错即整体回滚。

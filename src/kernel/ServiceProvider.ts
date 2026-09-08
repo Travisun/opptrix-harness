@@ -1,5 +1,5 @@
 /**
- * ServiceProvider — 服务提供者基类（Laravel 风格生命周期编排）。
+ * ServiceProvider — 服务提供者基类（register → boot → stop 生命周期编排）。
  *
  * - register：只做容器绑定登记，不做任何有副作用的实际工作（可同步可异步）。
  * - boot：所有提供者的 register 都完成后才会被内核调用，此时可安全 resolve 依赖。

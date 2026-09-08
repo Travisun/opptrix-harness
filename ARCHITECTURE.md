@@ -164,7 +164,7 @@ POST /api/v1/files（multipart, ≤ maxUploadBytes）
 | 包 | 角色 |
 | --- | --- |
 | fastify + @fastify/*（cors/multipart/rate-limit/static/swagger） | HTTP 引擎与外围 |
-| knex + better-sqlite3 | Laravel 式 query/schema builder + 同步 SQLite 驱动 |
+| knex + better-sqlite3 | 现代化 query/schema builder + 同步 SQLite 驱动 |
 | zod | 全部外部入参（HTTP body / RPC payload / manifest）校验 |
 | croner / dockerode / pino / dotenv / semver / tar-stream / nodemailer | cron · Docker 沙箱 · 结构化日志 · .env · 版本裁决 · 打包 · SMTP |
 | openai / @anthropic-ai/sdk | LLM 协议官方 SDK |

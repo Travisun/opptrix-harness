@@ -1,97 +1,141 @@
+<div align="center">
+
 # Opptrix Harness OS
 
-**服务器级 AI Harness OS 框架** —— Laravel 理念、扩展优先、内核零领域语义。内核提供 HTTP / 数据 / 任务 / 升级 / 沙箱 / 扩展线程等 OS 语义，一切领域能力（含认证与管理台）都以扩展形态运行。
+**服务器级 AI Harness OS 框架** —— 机制归内核，语义归扩展。
 
-## 特性
+内核提供 HTTP 路由、数据、任务调度、消息通道、升级、代码沙箱等 OS 级机制；一切领域能力（含认证与管理台）都以**扩展**形态运行在隔离沙箱中。
 
-- **内核零领域语义** —— 主线程 = Fastify HTTP + DI 容器 + 核心服务 + ExtensionManager；领域语义全部下沉到扩展
-- **扩展线程 + vm 沙箱** —— 所有扩展跑在唯一 worker 线程里，各自独立 `vm.Context`；受限 require、最小全局面、单调用异常隔离
-- **热插拔自愈** —— fail-fast 类型化错误 / RPC 强制超时 / VM 异常隔离 / 退避重启 + 拓扑重注册 + 惯犯熔断
-- **每扩展独立 SQLite** —— `<dataDir>/db/ext/<id>.sqlite`，互不污染；主库承载内核表（knex + better-sqlite3）
-- **A/B 双槽热升级** —— 下载 → sha256 校验 → 预检自检 → 原子提交 → 看门狗自动回滚；断电安全（全状态 tmp+rename 原子落盘）
-- **通知与聊天面** —— inbox / webhook / console / email 渠道驱动，聊天桥（HMAC 签名投递 + 投递流水落库），SSE 多 topic 实时广播
-- **LLM 网关** —— OpenAI / Anthropic 官方 SDK 适配；供应商配置存 settings，密钥经 secrets 引用解析，永不落配置/日志
-- **代码执行沙箱** —— dockerode 按需拉起一次性容器（node24 + python3 + git 基镜像），Docker 不可用时优雅降级
-- **结构化可观测** —— pino（密钥字段 redact）+ SQLite 环形日志汇 + doctor 环境体检 + 进程内 counters
+[快速开始](#快速开始) · [架构](#架构总览) · [扩展开发](#扩展开发) · [文档](#文档)
+
+</div>
+
+---
+
+## 为什么是 Opptrix Harness
+
+为「基于同一底座持续交付各行各业定制系统」而生：
+
+- **一切皆扩展** —— 认证、管理台、文档识别、行业业务全部是扩展；内核只做机制，永不被业务污染
+- **扩展即插即拔** —— 声明式激活、原子注册、运行中禁用不影响他者与内核；一个扩展崩溃不会带垮系统
+- **数据物理隔离** —— 每个扩展独享一个 SQLite 数据库文件，越权与故障的爆炸半径止于自身
+- **安全边界清晰** —— vm 沙箱 + 权限模型（fail-closed）+ 受限 require + 容器级代码执行沙箱
+- **持续演进的底座** —— A/B 双槽热升级：下载 → 校验 → 预检自检 → 原子提交 → 失败自动回滚
+
+## 特性全景
+
+| 领域 | 能力 |
+| --- | --- |
+| HTTP | Fastify 薄路由层、洋葱中间件、统一错误体（`HARNESS-xxxx` 错误码）、OpenAPI 自动生成 |
+| 扩展系统 | 唯一 worker 线程 + 每扩展独立 `vm.Context`、声明式激活、服务注册中心（`h.expose`/`h.call`）、热插拔自愈（fail-fast / 强制超时 / 异常隔离 / 退避重启 + 拓扑重注册 + 惯犯熔断） |
+| 数据 | 每扩展独立 SQLite（knex query/schema builder）、内核迁移、settings/secrets 层、备份导出 |
+| 消息 | 通知中心（inbox / webhook / email / console 渠道驱动 + 路由规则）、ChatChannels（结构化消息、入站 webhook、出站桥接、Bot 事件）、SSE 多 topic 实时推送 |
+| 调度 | Cron（时区 / 重叠与错过策略 / 运行历史）、长任务（独立任务线程、进度上报、超时取消） |
+| AI | LLM Gateway（OpenAI Chat Completions / Responses + Anthropic Messages 三协议、流式 SSE、参数白名单）、Docker 代码执行沙箱（持久 Workspace、非 root、资源上限） |
+| 运维 | A/B 双槽热升级、pino 结构化日志（密钥 redact）+ SQLite 环形日志、doctor 环境体检、counters 指标 |
+| 管理台 | 内置 Web 控制台（`/admin`）：登录、仪表盘、扩展管理、Cron、通知、聊天、文件任务、设置、升级管理 |
 
 ## 快速开始
 
-本地开发：
+### 本地开发
 
 ```bash
+git clone https://github.com/Travisun/opptrix-harness.git
+cd opptrix-harness
 npm install
-cp .env.example .env      # 可选：令牌/日志级别/沙箱开关
-npm run dev               # tsx watch src/main.ts，默认 0.0.0.0:3000
-cat data/root-token       # 首启生成的 break-glass root 令牌（或看首启日志 warn 行）
+cp .env.example .env          # 可选：端口/日志级别/沙箱开关
+npm run dev                   # 默认监听 0.0.0.0:3000
+
+# 首次启动生成 break-glass root 令牌（打印一次并持久化）
+cat data/root-token
 curl -s http://localhost:3000/health
 ```
 
-Docker：
+打开 `http://localhost:3000/admin` 进入管理台，使用 `owner` + root 令牌登录。
+
+### Docker 部署
 
 ```bash
 cp .env.example .env
+docker build -t opptrix-sandbox:latest -f docker/Dockerfile.sandbox docker/   # 可选：代码执行沙箱基镜像
 docker compose -f docker/docker-compose.yml up -d --build
 docker compose -f docker/docker-compose.yml exec opptrix cat /data/root-token
-# 镜像入口 bootstrap.mjs 从 <data>/releases/<slot>/dist/main.js 启动：
-# 全新数据卷需先播种一次发布产物（npm run release 产出），详见下文「发布」
 ```
 
-## 核心命令
+### 60 秒体验扩展
+
+```bash
+npm run harness -- make:extension my-ext      # 脚手架
+npm run harness -- validate extensions/my-ext # 校验
+# 在管理台「扩展」页启用 my-ext，或：
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:3000/api/v1/extensions/my-ext/enable
+curl http://localhost:3000/ext/my-ext/hello   # → {"hello":"world"}
+```
+
+## 架构总览
+
+```text
+┌─────────────────────────────────────────────────────┐
+│ 主线程 Kernel（bootstrap.mjs 进程监管）               │
+│  HTTP 路由 │ 事件总线 │ Hooks │ Cron │ 通知 │ 聊天    │
+│  文件存储 │ 任务调度 │ LLM 网关 │ 数据层 │ 升级器      │
+│  DI 容器 │ ExtensionManager │ 服务注册中心            │
+├──────────────┬──────────────────┬───────────────────┤
+│ 扩展线程      │ 任务线程          │ 代码执行沙箱        │
+│ 每扩展独立    │ CPU 密集长任务    │ Docker 持久容器     │
+│ vm.Context   │ 进度/超时/取消     │ 非 root + 资源上限  │
+└──────────────┴──────────────────┴───────────────────┘
+        ▲ MessagePort RPC（权限门 + 审计 + 熔断）
+```
+
+- **扩展线程**：所有扩展共享一个 worker 线程，各自独立 `vm.Context`；handler 异常只终结单次调用，线程崩溃自动退避重启并按依赖拓扑重注册
+- **每扩展独立数据库**：`<dataDir>/db/ext/<id>.sqlite`，互不污染，卸载可选保留或清除
+- **升级五道防线**：升级前自动备份 → sha256 校验 → 独立端口预检自检 → slots 原子提交 → 健康看门狗失败自动回滚
+
+详细设计见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+
+## 扩展开发
+
+扩展就是一个目录 + 一个 `manifest.json` + 一个入口文件：
+
+```js
+// extensions/my-ext/index.js
+module.exports = defineExtension({
+  setup(h) {
+    h.route('GET', '/hello', async () => ({ hello: 'world' }));
+    h.cron.schedule({ name: 'tick', expr: '*/5 * * * *' }, async () => {
+      await h.notify.send({ title: '心跳', level: 'info' });
+    });
+    h.on('file.uploaded', async (file) => { /* 文件到达 */ });
+    h.expose('parse', { run: async (args) => { /* 供其他扩展调用 */ } });
+  },
+});
+```
+
+全部能力经权限声明后可用：`h.route / h.on / h.hook / h.cron / h.notify / h.chat / h.files / h.tasks / h.db / h.llm / h.sandbox / h.storage / h.ui / h.expose / h.call`。
+
+## 命令
 
 | 命令 | 作用 |
 | --- | --- |
-| `npm run dev` | 开发模式（tsx watch，`src/main.ts`） |
-| `npm run build` | TypeScript 编译到 `dist/`（`tsconfig.build.json`） |
-| `npm start` | 运行编译产物（`node dist/main.js`） |
-| `npm run typecheck` | `tsc --noEmit` 全量类型检查 |
-| `npm test` | vitest 全量单测 + 集成测试（`test/**/*.test.ts`） |
-| `npm test -- --coverage` | 覆盖率（v8 provider，统计 `src/kernel/**`，行覆盖 ≥ 80% 否则失败） |
-| `npm run harness -- <cmd>` | 扩展 CLI：`make:extension <id>` 脚手架 / `validate <extDir>` 校验 |
-| `npm run release -- [opts]` | 发布工程：tar.gz + sha256 + 升级 feed（`--version/--out/--channel/--notes/--force/--skip-build`） |
+| `npm run dev` | 开发模式（tsx watch） |
+| `npm run build` / `npm start` | 编译到 `dist/` 并运行 |
+| `npm run typecheck` | 全量类型检查 |
+| `npm test` | 全量测试（63 文件 / 1206 用例） |
+| `npm test -- --coverage` | 覆盖率（内核行覆盖 ≥ 80%，否则失败） |
+| `npm run harness -- make:extension <id>` | 扩展脚手架 |
+| `npm run harness -- validate <extDir>` | 扩展校验 |
+| `npm run release` | 发布工程：tar.gz + sha256 + 升级 feed |
 
-CI（`.github/workflows/ci.yml`）：`npm ci → typecheck → npm audit --audit-level=high → test --coverage → build`。
+## 文档
 
-## 目录结构
+完整文档（快速开始、架构、14 个核心服务、扩展开发、REST / 沙箱 API 参考、运维与升级手册、实战教程）位于独立文档站仓库 `opptrixdocuments`（Mintlify，35 章）。
 
-```text
-OpptrixHarness/
-├── src/
-│   ├── main.ts               # 进程入口（dotenv → Kernel → 信号处理 → boot）
-│   ├── kernel/               # 内核全部模块
-│   │   ├── Kernel.ts         # 生命周期编排（boot/shutdown/状态机）
-│   │   ├── Container.ts      # DI 容器（显式工厂，无反射）
-│   │   ├── config/ logging/ errors/    # 配置 fail-fast / pino+SQLite 汇 / HARNESS-xxxx 错误码
-│   │   ├── auth/ http/ events/ hooks/  # root 令牌+AuthProvider / SSE Hub / 事件总线 / 埋点
-│   │   ├── storage/          # SQLite、迁移、settings、secrets、备份
-│   │   ├── extensions/       # manifest/权限/生命周期/路由表/服务注册/UI 贡献
-│   │   ├── providers/        # 核心服务总装配（channels/notify/chat/files/tasks/llm）
-│   │   ├── chat/ notification/ files/ tasks/ cron/ llm/ channels/   # 领域服务
-│   │   ├── sandbox/          # Docker 工作区沙箱（dockerode）
-│   │   ├── update/           # A/B slots + Updater
-│   │   └── system/           # doctor 体检 / counters
-│   ├── api/                  # REST 路由模块（/api/v1/*，薄边界 + zod）
-│   └── extension-host/       # worker 线程 / vm-runtime / 受限 require / RPC 协议
-├── extensions/               # 第一方与示例扩展（auth、hello-world、echo-bot、doc-demo）
-├── types/harness.d.ts        # 扩展作者类型声明（h.* API）
-├── docker/                   # Dockerfile（多阶段）、Dockerfile.sandbox、docker-compose.yml
-├── scripts/                  # release.mjs（薄入口）+ release-core.mjs（发布核心）
-├── tools/                    # cli.ts / cli-core.ts（扩展脚手架与校验）
-├── bootstrap.mjs             # 进程监管器：A/B slot 解析、退避重启、看门狗回滚
-├── test/                     # vitest 单测 + 集成测试
-└── docs/dependencies.md      # Package-First 依赖决策表（每依赖一行）
-```
+## 安全
 
-## 文档站
-
-完整文档（快速开始、架构、扩展开发、运维手册）位于独立文档站仓库：`../opptrixdocuments`（Mintlify）。若与框架仓库同级克隆，直接 `cd ../opptrixdocuments` 查看；运维三章对应 `operations/deployment|upgrading|observability.mdx`，教程对应 `tutorials/`。
-
-## 贡献
-
-- 工程约束（Package-First 原则）：任何功能实现前先检索并评估合适的 npm 包，有合格包不自研；仅 OS 语义核心（vm 沙箱 / RPC 信封 / 权限门 / 生命周期编排）例外；
-- 代码要求：TypeScript strict、入参 zod 校验、错误统一 `HarnessError`（`HARNESS-xxxx` 错误码）、pino 结构化日志（密钥不入日志）、时间一律 UTC 存储；
-- 每个模块交付必须附带 vitest 单测，内核整体行覆盖率 ≥ 80%；
-- 引入依赖须遵守许可证白名单（MIT / Apache-2.0 / BSD，禁 GPL 系）。
+安全模型与边界声明见 [ARCHITECTURE.md](./ARCHITECTURE.md)（沙箱隔离语义、权限 fail-closed、root break-glass 令牌、上传净化、SQL 防护、容器加固旗标）。发现安全问题请勿公开提 Issue，优先私下联系维护者。
 
 ## License
 
-未定（占位）。引入依赖须遵守 ENGINEERING.md 的许可证白名单（MIT / Apache-2.0 / BSD，禁 GPL 系）。
+[Apache-2.0](./LICENSE)

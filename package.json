@@ -1,9 +1,10 @@
 {
   "name": "opptrix-harness",
   "version": "0.1.0",
-  "description": "Opptrix Harness OS — server-side AI Harness OS framework (Laravel-inspired, extension-first)",
+  "description": "Opptrix Harness OS — server-side AI Harness OS framework (mechanism-in-kernel, everything-else-as-extensions)",
   "type": "module",
   "private": true,
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=22.5.0"
   },
