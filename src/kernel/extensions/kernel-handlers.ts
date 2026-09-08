@@ -27,6 +27,11 @@
  *   'sandbox' 权限（缺 → FORBIDDEN）；容器无 SandboxManager（裸装配）→ NOT_IMPLEMENTED；
  *   manager 未启用（未配 Docker/配置禁用）透传 SANDBOX_DISABLED。workspaceId 缺省
  *   'ext-<extId>'（扩展的持久工作区家目录语义），不存在时懒创建后执行。
+ * - `deps.extraBridges`（skills/mcp/plugins 桥并表）：本表**不实现**这些 topic，只在
+ *   内核 handler 未命中时经运行期查询委托给 extraBridges（懒解析——三桥由
+ *   providers/core-services.ts 装配并登记容器 'ext.bridges'，与本表的创建顺序解耦）。
+ *   三桥自带权限闸（'skills' / 'mcp:client' / 'plugins'，由桥工厂的 requirePermission
+ *   闭包收口），故 TOPIC_PERMISSIONS 矩阵刻意不含它们（避免双闸口径漂移）。
  *
  * 服务一律**懒解析**容器（createKernelHandlers 在 boot 早期执行，核心服务随后才登记；
  * 参照 providers/core-services.ts 的 resolve 模式，但推迟到首调用）。
@@ -214,6 +219,8 @@ export interface AuthProviderRegistration {
  * @param deps.kernel 内核实例（配置/logger/容器/DI 键的单一来源）
  * @param deps.auth auth provider 注册回调（可选；缺省时 auth.registerProvider → NOT_IMPLEMENTED，
  *   由集成接线层注入以打通 AuthProviderRegistry）
+ * @param deps.extraBridges 外部桥 handler 并表（可选；skills/mcp/plugins 三桥，自带权限闸。
+ *   懒查询：不快照键表，返回的表在内核 handler 未命中时按 topic 运行期再查一次）
  * @returns 交给 ExtensionManager.deps.bridgeHandlers 的处理器表
  */
 /** 出站目标是否为私网/环回地址（SSRF 防护） */
@@ -249,6 +256,7 @@ function netOutAllowed(permissions: string[], hostname: string, resolvedIps: str
 export function createKernelHandlers(deps: {
   kernel: Kernel;
   auth?: AuthProviderRegistration;
+  extraBridges?: KernelBridgeHandlers;
 }): KernelBridgeHandlers {
   const { kernel } = deps;
   /** 每扩展专属 knex 连接缓存（进程生命周期内复用；v1 不做 LRU 关闭） */
@@ -955,6 +963,28 @@ export function createKernelHandlers(deps: {
         detail: { taskId, extId },
       });
     }
+  }
+
+  // ---- 外部桥并表（skills/mcp/plugins，懒解析）----
+  // 三桥由 providers/core-services.ts 装配并登记容器 'ext.bridges'，与本表的创建顺序解耦：
+  // 不做快照拷贝，返回 Proxy 在内核 handler 未命中时按 topic 运行期再查一次 extraBridges
+  // （bridge 分派走 handlers[topic] 属性访问，恰好命中 get 陷阱）。三桥自带权限闸
+  // （'skills' / 'mcp:client' / 'plugins'，见桥工厂 requirePermission 闭包），本表不再二次复核。
+  const extraBridges = deps.extraBridges;
+  if (extraBridges !== undefined) {
+    return new Proxy(handlers, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string' && target[prop] === undefined) {
+          const extraHandler = extraBridges[prop];
+          if (extraHandler !== undefined) return extraHandler;
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+      has(target, prop) {
+        if (Reflect.has(target, prop)) return true;
+        return typeof prop === 'string' && extraBridges[prop] !== undefined;
+      },
+    });
   }
 
   return handlers;

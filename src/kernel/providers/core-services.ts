@@ -1,12 +1,15 @@
 /**
- * core-services — 内核核心服务总装配（channels / notification / chat / files / tasks）。
+ * core-services — 内核核心服务总装配（channels / notification / chat / files / tasks /
+ * skills / mcp / plugins）。
  *
  * 由 Kernel 在 boot 的 cron 装配之后调用 `createCoreServices(kernel)`：
  * - 从容器 resolve 基础设施（config / logger / authChecker / db / settings / secrets /
  *   counters + sseHub + 事件总线 / hook 管理器门面）；
- * - 组装五个领域服务并登记进容器（CONTAINER_KEYS.channels / notify / chat / files / tasks）；
- * - `registerRoutes(app)` 把五个 REST 模块挂到 fastify 实例（由 Kernel 的 registerExtra 调用）；
- * - `start()` / `stop()` 托管 TaskManager 生命周期（core 先于 cron 启动，先于 cron 停止）。
+ * - 组装领域服务并登记进容器（CONTAINER_KEYS.channels / notify / chat / files / tasks /
+ *   skills.registry / mcp.config / mcp.registry / plugins.registry / ext.bridges）；
+ * - `registerRoutes(app)` 把 REST 模块挂到 fastify 实例（由 Kernel 的 registerExtra 调用）；
+ * - `start()` / `stop()` 托管 TaskManager 生命周期 + skills/plugins 聚合 + MCP 连接
+ *   （core 先于 cron 启动，先于 cron 停止）。
  *
  * 装配图（谁依赖谁）：
  * - registry（ChannelRegistry 单例）← 通知驱动 ×4（inbox/webhook/console/email）
@@ -17,9 +20,18 @@
  * - FileService ← createLocalDriver(dataDir/uploads) / db / hooks / emit(eventBus) / logger
  * - TaskManager ← store(db) / pool 懒门面（指向后构造的 TaskWorkerPool，规避互指构造顺序）/
  *   emit(eventBus) / publish(sseHub) / logger
+ * - SkillRegistry ← roots(repoRoot/skills=builtin + dataDir/skills=data) / logger；
+ *   McpConfigStore(dataDir) + McpRegistry ← configStore / logger；PluginRegistry ←
+ *   dataDir / logger / skillsRegistry（直接透传） / mcpRegistry 适配器（configStore +
+ *   connect 编排，id 冠前缀归一）/ scriptRunner（沙箱容器执行，未启用 → NOT_IMPLEMENTED）
+ * - 三桥（skills.* / mcp.* / plugins.*）并表登记容器 'ext.bridges'，由 Kernel 经
+ *   createKernelHandlers({ extraBridges }) 懒合入 worker→kernel 分发表；权限由桥工厂
+ *   自查（'skills' / 'mcp:client' / 'plugins'），kernel-handlers 的 TOPIC_PERMISSIONS
+ *   矩阵刻意不重复收口（避免双闸口径漂移）。
  */
-import { join } from 'node:path';
-import { HOST_METHODS } from '../../extension-host/protocol.js';
+import { cpSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type { FastifyInstance } from 'fastify';
 import type { Knex } from 'knex';
@@ -28,8 +40,13 @@ import type { Logger } from 'pino';
 import { registerChatRoutes } from '../../api/chat.js';
 import { registerFileRoutes } from '../../api/files.js';
 import { registerLlmRoutes } from '../../api/llm.js';
+import { registerMcpRoutes } from '../../api/mcp.js';
 import { registerNotificationRoutes } from '../../api/notifications.js';
+import { registerPluginRoutes } from '../../api/plugins.js';
+import { registerSkillRoutes } from '../../api/skills.js';
 import { registerTaskRoutes } from '../../api/tasks.js';
+import { HOST_METHODS, KERNEL_TOPICS } from '../../extension-host/protocol.js';
+import type { ExtensionManager } from '../extensions/manager.js';
 import type { AuthIdentity, AuthVerifyInput } from '../auth/types.js';
 import { ChannelRegistry, type ChannelLevel } from '../channels/index.js';
 import { type ChannelBridgeConfig, createEmailBridge, createWebhookBridge, ChatBridgeDispatcher } from '../chat/bridges.js';
@@ -38,13 +55,24 @@ import { ChatStore } from '../chat/store.js';
 import type { HarnessConfig } from '../config/index.js';
 import { CONTAINER_KEYS, type Kernel } from '../Kernel.js';
 import { FACADE_CONTAINER_KEYS } from '../Facades.js';
+import { err } from '../errors/index.js';
 import { FileService, createLocalDriver } from '../files/index.js';
 import type { EventBus } from '../events/bus.js';
 import type { HookManager } from '../hooks/manager.js';
 import { LlmGateway } from '../llm/gateway.js';
 import type { LlmChatInput, LlmProviderConfig, LlmStreamEvent } from '../llm/types.js';
+import { createMcpBridge, McpConfigStore, McpRegistry, MCP_CLIENT_PERMISSION } from '../mcp/index.js';
 import { NotificationStore, NotificationManager, createConsoleDriver, createWebhookDriver, inboxDriver } from '../notification/index.js';
 import { createEmailDriver } from '../notification/drivers/email.js';
+import {
+  createPluginsBridge,
+  installPluginZip,
+  isSafePluginRelativePath,
+  PluginRegistry,
+} from '../plugins/index.js';
+import type { McpRegistryLike, PluginMcpServerConfig, ScriptRunnerLike } from '../plugins/types.js';
+import type { SandboxManager } from '../sandbox/manager.js';
+import { createSkillsBridge, SkillRegistry } from '../skills/index.js';
 import { TaskManager, TaskStore, TaskWorkerPool } from '../tasks/index.js';
 import type { SecretsService } from '../storage/secrets.js';
 import type { SettingsService } from '../storage/settings.js';
@@ -61,6 +89,17 @@ const DELIVERIES_TABLE = 'deliveries';
 
 /** TaskManager 默认任务超时（毫秒）：派发任务超过该时长由 sweep 判 failed('timeout') */
 const CORE_TASK_TIMEOUT_MS = 600_000;
+
+// ---- Skills / MCP / 插件（OS 能力目录）----
+
+/** 仓库根目录（本文件位于 src/kernel/providers/ → 向上三级；dist/kernel/providers/ 同理） */
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+/** skills 桥读面的 manifest 权限（skills.list/get/refresh；skills.register 贡献面免权限） */
+const SKILLS_PERMISSION = 'skills';
+
+/** plugins 桥的 manifest 权限（plugins.list） */
+const PLUGINS_PERMISSION = 'plugins';
 
 /** hook 链门面的最小结构视图（内核 HookManager 天然满足） */
 type HookPort = {
@@ -290,12 +329,256 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     yield* inner;
   }
 
+  // -------------------------------------------------------------------------
+  // skills — 技能注册表（builtin=repoRoot/skills + data=<dataDir>/skills；均可选，
+  // 目录缺失即空库）。扩展贡献走 skills.register 桥（按 extId 记名），扩展禁用时由
+  // Kernel 的 onServicesChanged(null) 分支联动 removeContributed。
+  // -------------------------------------------------------------------------
+  const skillsRegistry = new SkillRegistry({
+    roots: [
+      { root: join(REPO_ROOT, 'skills'), source: 'builtin' },
+      { root: join(config.dataDir, 'skills'), source: 'data' },
+    ],
+    logger,
+  });
+  kernel.container.instance(CONTAINER_KEYS.skillsRegistry, skillsRegistry);
+
+  // -------------------------------------------------------------------------
+  // mcp — MCP 客户端（配置持久化 + 连接编排）。refreshAll 的单点失败标 error 不阻塞
+  // boot（见 start()）；REST /api/v1/mcp/* 与扩展桥 mcp.* 共用同一 registry。
+  // -------------------------------------------------------------------------
+  const mcpConfigStore = new McpConfigStore({ dataDir: config.dataDir });
+  const mcpRegistry = new McpRegistry({ configStore: mcpConfigStore, logger });
+  kernel.container.instance(CONTAINER_KEYS.mcpConfig, mcpConfigStore);
+  kernel.container.instance(CONTAINER_KEYS.mcpRegistry, mcpRegistry);
+
+  // -------------------------------------------------------------------------
+  // plugins — 插件包注册表（<dataDir>/plugins/ 发现聚合 + 贡献注入 skills/mcp）。
+  // -------------------------------------------------------------------------
+  /**
+   * PluginRegistry 的 server id（`plugin:<pid>:<sid>`，含 ':'）→ MCP 配置面合法 id。
+   * McpServerConfig 的 id 形态（^[a-z0-9][a-z0-9_-]*$）不含 ':'，而插件/子资源 id 的
+   * 字符集（^[a-z0-9][a-z0-9_-]*$）永不产生 ':'，故 ':'→'--' 映射可逆、无碰撞。
+   */
+  const toMcpConfigId = (pluginServerId: string): string => pluginServerId.replaceAll(':', '--');
+
+  /** 插件贡献注入的适配队列：串行化 configStore/connect 编排，避免 refresh 的
+   * detachAll→inject 与磁盘原子写交错（McpRegistryLike 是同步契约，这里 fire-and-forget） */
+  let mcpAdapterChain: Promise<void> = Promise.resolve();
+
+  /** McpRegistryLike 适配器：addServer = 落配置（enabled:true）+ 连接；失败 warn 不抛 */
+  const mcpRegistryAdapter: McpRegistryLike = {
+    addServer: (cfg: PluginMcpServerConfig): unknown => {
+      mcpAdapterChain = mcpAdapterChain.then(async () => {
+        const configId = toMcpConfigId(cfg.id);
+        try {
+          if ((await mcpConfigStore.get(configId)) === undefined) {
+            await mcpConfigStore.add({ ...cfg, id: configId, enabled: true });
+          }
+          // boot 期 refreshAll 可能已连上同 id 配置：已连接则不重复重建会话
+          if ((await mcpRegistry.status(configId)).state !== 'connected') {
+            await mcpRegistry.connect(configId);
+          }
+        } catch (cause) {
+          logger.warn(
+            { err: cause instanceof Error ? cause.message : String(cause), serverId: cfg.id },
+            'plugins: mcp server injection failed (non-fatal; see /api/v1/mcp/servers status)',
+          );
+        }
+      });
+      return undefined;
+    },
+    removeServer: (id: string): boolean => {
+      mcpAdapterChain = mcpAdapterChain.then(async () => {
+        const configId = toMcpConfigId(id);
+        try {
+          await mcpRegistry.disconnect(configId);
+          await mcpConfigStore.remove(configId);
+        } catch (cause) {
+          logger.warn(
+            { err: cause instanceof Error ? cause.message : String(cause), serverId: id },
+            'plugins: mcp server detach failed (non-fatal)',
+          );
+        }
+      });
+      return true; // McpRegistryLike 同步契约：实际摘除异步完成（失败只 warn）
+    },
+  };
+
+  /**
+   * scriptRunner — 插件脚本执行（v1 简约契约，JSDoc 即契约文档）：
+   * - 仅经 SandboxManager 在工作区 `plugin-<pluginId>` 内执行（家目录 bind 到容器
+   *   /home/dev；执行前把插件包整目录同步进工作区家目录——家目录即事实），绝不在宿主进程运行；
+   * - 传参：`node scripts/<file> --args <JSON.stringify(args)>`（argv 追加，末参为 JSON 文本；
+   *   v1 不走 stdin——docker exec 在本沙箱实现中不开 stdin）；
+   * - 返回：脚本退出码 0 且未超时 → `{ ok:true, result }`，result = stdout 的 JSON 解析
+   *   （解析失败回退原文）；否则 `{ ok:false, error }`（stderr 优先，截尾 4KB）；
+   * - 容器无 SandboxManager（裸装配）或沙箱未启用（无 Docker/配置关闭）→ 抛
+   *   NOT_IMPLEMENTED（HARNESS-9004）；沙箱基础设施故障（SANDBOX_*）原样上抛。
+   */
+  const scriptRunner: ScriptRunnerLike = {
+    async run(pluginId: string, scriptId: string, args: unknown) {
+      const manager = kernel.container.has(CONTAINER_KEYS.sandbox)
+        ? kernel.container.resolve<SandboxManager>(CONTAINER_KEYS.sandbox)
+        : undefined;
+      if (manager === undefined || !manager.enabled()) {
+        const why =
+          manager === undefined
+            ? 'the kernel has no SandboxManager registered (container "sandbox")'
+            : 'the sandbox is not enabled (Docker unavailable or disabled by config)';
+        throw err('NOT_IMPLEMENTED', {
+          message: `plugin script execution is unavailable: ${why} (scripts never run on the host process)`,
+          detail: { pluginId, scriptId },
+        });
+      }
+
+      // 从安装目录的 plugin.json 解析 script 声明（registry 校验过；此处防御性复核路径）
+      const pluginDir = join(config.dataDir, 'plugins', pluginId);
+      let scriptFile: string | undefined;
+      try {
+        const raw = JSON.parse(readFileSync(join(pluginDir, 'plugin.json'), 'utf8')) as {
+          scripts?: Array<{ id?: unknown; file?: unknown }>;
+        };
+        const declared = Array.isArray(raw.scripts) ? raw.scripts.find((s) => s?.id === scriptId) : undefined;
+        scriptFile = typeof declared?.file === 'string' ? declared.file : undefined;
+      } catch {
+        scriptFile = undefined;
+      }
+      if (
+        scriptFile === undefined ||
+        !scriptFile.startsWith('scripts/') ||
+        !isSafePluginRelativePath(scriptFile)
+      ) {
+        throw err('EXT_NOT_FOUND', {
+          message: `plugin "${pluginId}" has no runnable script "${scriptId}" under scripts/`,
+          detail: { pluginId, scriptId },
+        });
+      }
+
+      const workspaceId = `plugin-${pluginId}`;
+      if (manager.get(workspaceId) === null) {
+        await manager.createWorkspace({ id: workspaceId });
+      }
+      const workspace = manager.get(workspaceId);
+      if (workspace === null) {
+        throw err('INTERNAL', {
+          message: `sandbox workspace "${workspaceId}" disappeared right after creation`,
+          detail: { pluginId, scriptId },
+        });
+      }
+      // 插件包同步进工作区家目录（宿主侧 cp；家目录 bind 挂载点，容器内即 /home/dev）
+      cpSync(pluginDir, workspace.homeDir, { recursive: true });
+
+      const execResult = await manager.exec(workspaceId, [
+        'node',
+        scriptFile,
+        '--args',
+        JSON.stringify(args ?? null),
+      ]);
+      const ok = execResult.exitCode === 0 && !execResult.timedOut;
+      let parsed: unknown;
+      try {
+        parsed = execResult.stdout.trim() === '' ? null : JSON.parse(execResult.stdout.trim());
+      } catch {
+        parsed = execResult.stdout;
+      }
+      if (!ok) {
+        const detail =
+          execResult.stderr.trim() !== ''
+            ? execResult.stderr
+            : execResult.stdout.trim() !== ''
+              ? execResult.stdout
+              : `node ${scriptFile} exited with code ${execResult.exitCode}`;
+        return { ok: false, error: detail.slice(-4096) };
+      }
+      return { ok: true, result: parsed };
+    },
+  };
+
+  const pluginsRegistry = new PluginRegistry({
+    dataDir: config.dataDir,
+    logger,
+    // 贡献技能签名一致（PluginContributedSkill ≅ ContributedSkillInput）：直接透传
+    skillsRegistry,
+    mcpRegistry: mcpRegistryAdapter,
+    scriptRunner,
+  });
+  kernel.container.instance(CONTAINER_KEYS.pluginsRegistry, pluginsRegistry);
+
+  // -------------------------------------------------------------------------
+  // skills / mcp / plugins 扩展桥并表（容器 'ext.bridges'）。
+  // 权限决策：**矩阵不加、桥工厂自查**——skills 读面（list/get/refresh）与 plugins.list
+  // 由下方 gatedBridge 以 'skills' / 'plugins' 收口；mcp 三 topic 由 createMcpBridge
+  // 的 requirePermission 闭包以 'mcp:client' 收口；skills.register（贡献）免权限——
+  // 贡献按调用方 extId 记名、扩展禁用即由内核摘除，无跨扩展读写面。kernel-handlers
+  // 的 TOPIC_PERMISSIONS 矩阵刻意不含这些 topic（避免双闸口径漂移）。
+  // -------------------------------------------------------------------------
+  const requireExtPermission = (extId: string, topic: string, permission: string): void => {
+    const manager = kernel.container.has(CONTAINER_KEYS.extManager)
+      ? kernel.container.resolve<ExtensionManager>(CONTAINER_KEYS.extManager)
+      : undefined;
+    const permissions = manager?.getManifest(extId)?.permissions ?? [];
+    if (!permissions.includes(permission)) {
+      throw err('FORBIDDEN', {
+        message: `kernel service "${topic}" requires the "${permission}" permission in the extension manifest (add it to manifest.permissions)`,
+        detail: { topic, extId, requiredPermission: permission },
+      });
+    }
+  };
+
+  /** 非扩展端点闸（与 kernel-handlers.extIdFrom 同规则）：'kernel'/空 → RPC_PERMISSION_DENIED */
+  const requireExtCaller = (from: string, topic: string): string => {
+    const extId = from === 'kernel' ? null : from.startsWith('ext:') ? from.slice('ext:'.length) : from;
+    if (extId === null || extId === '') {
+      throw err('RPC_PERMISSION_DENIED', {
+        message: `kernel service "${topic}" is only callable by extension endpoints (got "${from}")`,
+        detail: { topic, from },
+      });
+    }
+    return extId;
+  };
+
+  /** 给桥 handler 表统一包一层「扩展端点 + manifest 权限」闸（exempt 内的 topic 免权限） */
+  const gatedBridge = (
+    handlers: Record<string, (payload: unknown, from: string) => Promise<unknown>>,
+    permission: string,
+    exempt: readonly string[] = [],
+  ): Record<string, (payload: unknown, from: string) => Promise<unknown>> =>
+    Object.fromEntries(
+      Object.entries(handlers).map(([topic, handler]) => [
+        topic,
+        async (payload: unknown, from: string) => {
+          const extId = requireExtCaller(from, topic);
+          if (!exempt.includes(topic)) requireExtPermission(extId, topic, permission);
+          return handler(payload, from);
+        },
+      ]),
+    );
+
+  kernel.container.instance(CONTAINER_KEYS.extBridges, {
+    ...gatedBridge(createSkillsBridge({ registry: skillsRegistry }), SKILLS_PERMISSION, [
+      KERNEL_TOPICS.skillsRegister,
+    ]),
+    ...createMcpBridge({
+      registry: mcpRegistry,
+      requirePermission: (extId, topic, permission) => requireExtPermission(extId, topic, permission),
+    }),
+    ...gatedBridge(createPluginsBridge({ registry: pluginsRegistry }), PLUGINS_PERMISSION),
+  });
+
   return {
     registerRoutes(app: FastifyInstance): void {
-      registerFileRoutes(app, {
-        checker,
-        service: fileService,
-        maxUploadBytes: config.maxUploadBytes,
+      // files 与 plugins 两个 REST 模块都在各自内部执行 `app.register(multipart)`
+      // （@fastify/multipart 为 fp 包装、无封装边界——同一 fastify 上下文注册两次会撞
+      // 装饰器；子上下文又会克隆父上下文的 content-type parser，先注册的一侧会污染
+      // 后注册的子上下文）。故各自挂到**兄弟封装上下文**：装饰器/parser 互不可见，
+      // 路由照常全局暴露。
+      app.register((filesCtx) => {
+        registerFileRoutes(filesCtx, {
+          checker,
+          service: fileService,
+          maxUploadBytes: config.maxUploadBytes,
+        });
       });
       registerNotificationRoutes(app, {
         checker,
@@ -331,14 +614,49 @@ export function createCoreServices(kernel: Kernel): CoreServices {
         },
         secrets,
       });
+      // Skills / MCP / 插件 REST（/api/v1/skills* · /api/v1/mcp/* · /api/v1/plugins*）：
+      // 与扩展桥共用同一批 registry/configStore 实例（单一事实来源）
+      registerSkillRoutes(app, { checker, registry: skillsRegistry });
+      registerMcpRoutes(app, { checker, registry: mcpRegistry, configStore: mcpConfigStore });
+      // plugins 路由自带 `app.register(multipart)`（与 files 路由同款手法）。同一 fastify
+      // 实例上两次注册同一个 fp 包装插件会撞装饰器（FST_ERR_DEC_ALREADY_PRESENT）——
+      // 这里挂到子上下文隔离：multipart 装饰器只对本上下文路由可见，路由照常暴露。
+      app.register((child) => {
+        registerPluginRoutes(child, {
+          checker,
+          registry: pluginsRegistry,
+          // 原始形态（fn.length>=2）：REST 层以 { dataDir: registry.dataDir } 绑定首参后调用
+          installerZip: (cfg, zipPath, opts) => installPluginZip(cfg, zipPath, opts),
+        });
+      });
     },
 
     async start(): Promise<void> {
       await taskManager.start();
+      // skills / plugins 聚合：磁盘扫描 + 贡献重建（目录缺失即空库，绝不抛）
+      await skillsRegistry.refresh();
+      await pluginsRegistry.refresh();
+      // MCP boot 重连：enabled 配置全部（重）连接；单点失败标 error（status 可见），
+      // 绝不抛——启动期不被单个 server 拖垮
+      const mcpReport = await mcpRegistry.refreshAll();
+      if (mcpReport.failed.length > 0) {
+        logger.warn(
+          { failed: mcpReport.failed },
+          'core-services: some mcp servers failed to connect at boot (marked error; boot continues)',
+        );
+      }
     },
 
     async stop(): Promise<void> {
       await taskManager.stop();
+      // 优雅断开全部 MCP 连接（stdio 子进程/HTTP 会话）；配置损坏等异常不阻断关停
+      try {
+        for (const cfg of await mcpConfigStore.load()) {
+          await mcpRegistry.disconnect(cfg.id);
+        }
+      } catch (cause) {
+        logger.warn({ err: cause }, 'core-services: mcp disconnect during shutdown warned');
+      }
     },
   };
 }

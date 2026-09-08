@@ -3,8 +3,9 @@
  *
  * 覆盖链路（每步即一个用例组）：
  * 1. boot：builtin auth/webui 自动启用；GET /ext/webui/ui/ → 200（P0-1 资产补挂时序）；
- * 2. auth 登录：POST /api/v1/auth/login（owner/rootToken）→ 强制 2FA enrollment
- *    （/ext/auth/2fa/setup + /2fa/enroll，真实 otplib TOTP）→ ses token；
+ * 2. owner 引导（v0.2 语义）：POST /api/v1/auth/onboarding（root 令牌所有权门）创建 owner
+ *    （激活期不再自动建号）→ auth 登录：POST /api/v1/auth/login（owner/onboarding 密码）→
+ *    强制 2FA enrollment（/ext/auth/2fa/setup + /2fa/enroll，真实 otplib TOTP）→ ses token；
  * 3. ses token 调 API：GET /api/v1/auth/me → 200；
  * 4. enable doc-demo + echo-bot；GET /api/v1/ui 含 doc-demo（P0-3 contributions.ui 透传）；
  * 5. 建 general 频道 → webhook 入站消息 → echo-bot 自动回复出现（轮询 messages）；
@@ -38,6 +39,9 @@ let dataDir = '';
 let kernel: Kernel;
 let app: FastifyInstance;
 let rootToken = '';
+
+/** owner 账号密码（v0.2 语义：owner 一律经 POST /auth/onboarding 创建，root 令牌不再是登录密码） */
+const OWNER_PASSWORD = 'owner-pass-8';
 
 /** root 令牌直连头（bootstrap 面） */
 const rootAuth = { authorization: '' };
@@ -78,6 +82,25 @@ async function waitFor(what: string, pred: () => Promise<boolean>, timeoutMs = 1
     if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 25));
   }
+}
+
+/**
+ * owner 引导（v0.2 语义，boot 后登录前必须先执行）：
+ * POST /api/v1/auth/onboarding（root 令牌所有权门）——users 空表 → fresh 创建首个 admin。
+ * 激活期不再自动建号（needsOnboarding=users 空表），owner 不存在时 login 一律 401。
+ */
+async function onboardOwner(): Promise<void> {
+  const status = await app.inject({ method: 'GET', url: '/api/v1/auth/onboarding/status' });
+  expect(status.statusCode).toBe(200);
+  expect((status.json() as { needsOnboarding: boolean }).needsOnboarding).toBe(true); // users 空表
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/onboarding',
+    payload: { rootToken, password: OWNER_PASSWORD },
+  });
+  expect(res.statusCode).toBe(200);
+  expect(res.json()).toMatchObject({ enrollmentRequired: true }); // 返回 enr 注册令牌，续走 2FA 绑定
 }
 
 /**
@@ -151,9 +174,12 @@ describe('最终回炉 E2E 终验', () => {
     expect(ui.body).toContain('<div id="app">');
   });
 
-  it('auth 登录（owner/rootToken）→ 强制 2FA enrollment → ses token 调 API（/auth/me 200）', async () => {
+  it('owner 引导 + auth 登录：onboarding 建号 → 强制 2FA enrollment → ses token 调 API（/auth/me 200）', async () => {
+    // v0.2 语义：激活不自动建号——boot 后第一步先经 onboarding（root 令牌门）创建 owner
+    await onboardOwner();
+
     // 强制 2FA：owner 首登不放行会话，走 enrollment（真实 otplib TOTP 全链）后拿到 ses token
-    const body = { token: await enrollLogin('owner', rootToken) };
+    const body = { token: await enrollLogin('owner', OWNER_PASSWORD) };
     expect(body.token).toMatch(/^ses_/);
     sesAuth.authorization = `Bearer ${body.token}`;
     sesToken = body.token;

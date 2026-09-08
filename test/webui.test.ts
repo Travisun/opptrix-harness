@@ -390,12 +390,21 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     expect(followed.body).toContain('<div id="app">');
   });
 
-  it('18. webui 生命周期回路：disable → enabled:false，再 enable → enabled:true', async () => {
+  it('18. 核心内置扩展保护（HARNESS-1007 core-builtin）：webui disable/uninstall → 403，webui 保持 enabled', async () => {
+    // webui 是 builtin:true 的核心扩展：不可停用（停用 = 管理台消失，恢复只能进数据目录改库）
     const off = await app.inject({ method: 'POST', url: '/api/v1/extensions/webui/disable', headers: auth });
-    expect(off.statusCode).toBe(200);
+    expect(off.statusCode).toBe(403);
+    expect(off.json()).toMatchObject({ code: 'HARNESS-1007', detail: { reason: 'core-builtin' } });
     const afterOff = await app.inject({ method: 'GET', url: '/api/v1/extensions/webui', headers: auth });
-    expect((afterOff.json() as { enabled: boolean }).enabled).toBe(false);
+    expect(afterOff.statusCode).toBe(200);
+    expect((afterOff.json() as { enabled: boolean }).enabled).toBe(true);
 
+    // 卸载同受保护
+    const gone = await app.inject({ method: 'POST', url: '/api/v1/extensions/webui/uninstall', headers: auth });
+    expect(gone.statusCode).toBe(403);
+    expect(gone.json()).toMatchObject({ code: 'HARNESS-1007', detail: { reason: 'core-builtin' } });
+
+    // enable 幂等无害（已启用的核心扩展重复 enable 仍 200）
     const on = await app.inject({ method: 'POST', url: '/api/v1/extensions/webui/enable', headers: auth });
     expect(on.statusCode).toBe(200);
     const afterOn = await app.inject({ method: 'GET', url: '/api/v1/extensions/webui', headers: auth });

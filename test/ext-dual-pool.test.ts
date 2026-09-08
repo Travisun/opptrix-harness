@@ -593,7 +593,7 @@ describe('扩展双池化（方案 B）', () => {
     expect(h.workerOf('community')?.loads).toEqual(['client']);
   });
 
-  it('disable / reload / uninstall 按池路由：unload RPC 只落在扩展所在的池', async () => {
+  it('disable / reload / uninstall 按池路由：unload RPC 只落在扩展所在的池；builtin disable 受 core-builtin 保护', async () => {
     const h = await buildHarness({
       dirs: {
         authx: { manifest: manifestOf({ id: 'authx', builtin: true }), trusted: true },
@@ -604,24 +604,31 @@ describe('扩展双池化（方案 B）', () => {
     });
     await h.manager.start();
 
-    await h.manager.disable('authx');
-    expect(h.workerOf('builtin')?.unloads).toEqual(['authx']);
-    expect(h.workerOf('community')?.unloads).toEqual([]);
-    expect(h.manager.list().find((s) => s.id === 'authx')?.enabled).toBe(false);
+    // HARNESS-1007 core-builtin：builtin 扩展不可停用——拒绝发生在 unload RPC 之前，池零扰动
+    await expect(h.manager.disable('authx')).rejects.toMatchObject({
+      code: 'HARNESS-1007',
+      detail: { reason: 'core-builtin' },
+    });
+    expect(h.workerOf('builtin')?.unloads ?? []).toEqual([]);
+    expect(h.manager.list().find((s) => s.id === 'authx')?.enabled).toBe(true);
 
-    await h.manager.enable('authx'); // 复活，为 reload 做准备
-    await h.manager.reload('authx');
+    // community 扩展照常 disable：unload 只落 community 池
+    await h.manager.disable('app');
+    expect(h.workerOf('community')?.unloads).toEqual(['app']);
+    expect(h.workerOf('builtin')?.unloads ?? []).toEqual([]);
+    expect(h.manager.list().find((s) => s.id === 'app')?.enabled).toBe(false);
+
+    await h.manager.reload('authx'); // reload 不受保护限制：unload+load 落 builtin 池
     const calls = h.workerOf('builtin')?.calls ?? [];
     const unloadAt = calls.indexOf(`${HOST_METHODS.unloadExt} authx`);
     const reloadLoadAt = calls.indexOf(`${HOST_METHODS.loadExt} authx`, unloadAt);
     expect(unloadAt).toBeGreaterThanOrEqual(0);
     expect(reloadLoadAt).toBeGreaterThan(unloadAt);
-    expect(h.workerOf('community')?.unloads).toEqual([]); // community 池全程无扰动
 
-    await h.manager.uninstall('app');
+    await h.manager.uninstall('app'); // 已 disabled：uninstall 不再重复发 unload
     expect(await rowOf(h, 'app')).toBeUndefined();
     expect(h.workerOf('community')?.unloads).toEqual(['app']);
-    expect(h.workerOf('builtin')?.unloads).toEqual(['authx', 'authx']); // reload 的一次 + 复活前的那次
+    expect(h.workerOf('builtin')?.unloads).toEqual(['authx']); // builtin 全程仅 reload 的那一次
   });
 
   it('rescan：运行中新增非受信目录 → community 池候选（host=community），enable 落 community 线程', async () => {

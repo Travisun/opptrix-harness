@@ -9,8 +9,10 @@
  *   与 kernelCall auth.hashPassword / auth.verifyPassword 底层同源）；
  * - h.route / h.authProvider：捕获进 Map / 槽位，随后直接调用处理器模拟请求。
  *
- * 覆盖：契约 fail-fast、建表、owner 引导（boot/ctx/config 三通道与反例）、
- * login/logout/me/change-password、users CRUD 与 admin 门、api-key 签发/认证/吊销、
+ * 覆盖：契约 fail-fast、建表、owner 引导新语义（v0.2：激活期不再自动建号——users 空表
+ * = needsOnboarding；owner 一律经 POST /auth/onboarding 的 root 令牌门创建/重置；
+ * rootToken 三通道解析仅影响 root 直连）、login/logout/me/change-password、
+ * users CRUD 与 admin 门、api-key 签发/认证/吊销、
  * root 令牌直连、错误形状（HARNESS-1006/1007/1008/1009/1001）、源码卫生。
  */
 import { createHash } from 'node:crypto';
@@ -36,6 +38,8 @@ function sha256Hex(value: string): string {
 
 const EXT_INDEX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'extensions', 'auth', 'index.js');
 const ROOT_TOKEN = 'f'.repeat(64); // 64 hex，模拟 ensureRootToken 产出的 root 令牌
+/** owner 账号密码（v0.2 语义：owner 一律经 POST /auth/onboarding 创建，root 令牌不再是登录密码） */
+const OWNER_PASSWORD = 'owner-pass-8';
 
 /** 路由处理器入参（HarnessApi RouteContext 的测试子集） */
 interface RouteContextLike {
@@ -228,9 +232,24 @@ async function enroll(
 }
 
 /**
- * 便捷登录（owner 默认密码即 ROOT_TOKEN）：自动续走强制 2FA——
- * enrollmentRequired → POST /2fa/enroll（canned 码）；mfaRequired → POST /auth/login/2fa。
- * 意外失败时抛出便于定位。
+ * fixture helper（v0.2 语义）：激活后经 POST /auth/onboarding（root 令牌所有权门）创建 owner。
+ * 激活期不再自动建号（users 空表 = needsOnboarding），依赖 owner 的用例必须先调用本助手。
+ * users 为空 → fresh 分支建首个 admin；返回 enr 注册令牌（可续走 2FA 绑定）。
+ */
+async function ensureOwner(b: Booted, password: string = OWNER_PASSWORD): Promise<string> {
+  const res = (await call(b.routes, 'POST', '/auth/onboarding', {
+    body: { rootToken: ROOT_TOKEN, password },
+  })) as { enrollmentRequired?: boolean; enrollToken?: string };
+  if (res.enrollmentRequired !== true || typeof res.enrollToken !== 'string') {
+    throw new Error(`ensureOwner unexpectedly failed: ${JSON.stringify(res)}`);
+  }
+  return res.enrollToken;
+}
+
+/**
+ * 便捷登录（owner 密码为 onboarding 时设置的 OWNER_PASSWORD，先 ensureOwner 再登录）：
+ * 自动续走强制 2FA——enrollmentRequired → POST /2fa/enroll（canned 码）；mfaRequired →
+ * POST /auth/login/2fa。意外失败时抛出便于定位。
  */
 async function login(
   b: Booted,
@@ -328,47 +347,83 @@ describe('auth 扩展 · 激活期（setup）', () => {
     await expect(setup(make(['authProvider']).h)).rejects.toThrow(/HarnessApi\.authProvider/);
   });
 
-  it('owner 引导：users 空表 + h.boot.rootToken → owner/admin，密码可校验为 rootToken', async () => {
+  it('owner 引导新语义：users 空表 + h.boot.rootToken 激活后不再自动创建 owner（needsOnboarding=true）', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const owner = b.db.prepare('SELECT id, username, role, password_hash FROM users').get() as {
-      id: string;
-      username: string;
-      role: string;
-      password_hash: string;
-    };
-    expect(owner.username).toBe('owner');
-    expect(owner.role).toBe('admin');
-    expect(owner.id).toMatch(/^usr_[0-9a-f]{24}$/);
-    expect(await passwords.verify(ROOT_TOKEN, owner.password_hash)).toBe(true);
+    // v0.2 起 owner 一律经 POST /auth/onboarding 创建：激活路径零 users 写入
+    const count = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
+    expect(count.n).toBe(0);
+    expect(await call(b.routes, 'GET', '/auth/onboarding/status')).toEqual({ needsOnboarding: true });
+    // root 令牌解析通道不受影响：onboarding 所有权门仍按内核 verifyRootToken 判定（错令牌拒绝）
+    expectFail(
+      await call(b.routes, 'POST', '/auth/onboarding', { body: { rootToken: 'not-the-root', password: OWNER_PASSWORD } }),
+      401,
+      'HARNESS-1006',
+    );
   });
 
-  it('owner 引导兼容通道：h.boot 缺失时回落 ctx.rootToken', async () => {
+  it('rootToken 兼容通道：h.boot 缺失时回落 ctx.rootToken —— 不建号，但 root 直连解析生效', async () => {
     const b = boot(); // 无 h.boot
     await b.activate({ rootToken: ROOT_TOKEN });
-    const owner = b.db.prepare('SELECT username, role FROM users').get() as { username: string; role: string };
-    expect(owner).toMatchObject({ username: 'owner', role: 'admin' });
+    const count = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
+    expect(count.n).toBe(0); // ctx 通道同样不再自动建号（v0.2 语义）
+    // ctx.rootToken 解析进 AUTH_ROOT_TOKEN：root 直连（break-glass 语义）仍可用
+    const meRoot = (await call(b.routes, 'GET', '/auth/me', { headers: bearer(ROOT_TOKEN) })) as {
+      userId: string;
+      role: string;
+      tokenType: string;
+    };
+    expect(meRoot).toMatchObject({ userId: 'root', role: 'root', tokenType: 'root' });
   });
 
-  it('owner 引导兜底通道：ctx 亦缺时读 h.config.get("boot.rootToken")', async () => {
+  it('rootToken 兜底通道：ctx 亦缺时读 h.config.get("boot.rootToken") —— root 直连可用且不建号', async () => {
     const b = boot({ configRootToken: ROOT_TOKEN });
     await b.activate();
-    const owner = b.db.prepare('SELECT username FROM users').get() as { username: string };
-    expect(owner.username).toBe('owner');
+    const count = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
+    expect(count.n).toBe(0);
+    const meRoot = (await call(b.routes, 'GET', '/auth/me', { headers: bearer(ROOT_TOKEN) })) as {
+      userId: string;
+      role: string;
+      tokenType: string;
+    };
+    expect(meRoot).toMatchObject({ userId: 'root', role: 'root', tokenType: 'root' });
   });
 
-  it('无 rootToken（三通道皆缺）→ 不引导 owner，setup 仍成功', async () => {
+  it('无 rootToken（三通道皆缺）→ setup 仍成功；users 空表（needsOnboarding）且 root 直连不可用', async () => {
     const b = boot();
     await b.activate();
     const count = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
     expect(count.n).toBe(0);
+    expect(await call(b.routes, 'GET', '/auth/onboarding/status')).toEqual({ needsOnboarding: true });
+    // AUTH_ROOT_TOKEN 未解析：root 令牌不再被识别为直连身份
+    expectFail(await call(b.routes, 'GET', '/auth/me', { headers: bearer(ROOT_TOKEN) }), 401, 'HARNESS-1006');
   });
 
-  it('users 非空时不重复引导（重载幂等）', async () => {
+  it('POST /auth/onboarding（root 令牌门）创建 owner：fresh 建号后 needsOnboarding 翻转、密码为入参而非 rootToken', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
+    expect(await call(b.routes, 'GET', '/auth/onboarding/status')).toEqual({ needsOnboarding: true });
+    await ensureOwner(b); // users 空表 → fresh 分支
+    const owner = b.db.prepare('SELECT username, role, password_hash FROM users').get() as {
+      username: string;
+      role: string;
+      password_hash: string;
+    };
+    expect(owner).toMatchObject({ username: 'owner', role: 'admin' });
+    expect(await passwords.verify(OWNER_PASSWORD, owner.password_hash)).toBe(true);
+    expect(await passwords.verify(ROOT_TOKEN, owner.password_hash)).toBe(false); // root 令牌仅作所有权门
+    expect(await call(b.routes, 'GET', '/auth/onboarding/status')).toEqual({ needsOnboarding: false });
+  });
+
+  it('重载幂等：onboarding 建号后再次激活不重复建号（users 仍 1 行，激活路径从不写 users）', async () => {
+    const b = boot({ bootRootToken: ROOT_TOKEN });
+    await b.activate();
+    await ensureOwner(b);
+    const after = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
+    expect(after.n).toBe(1);
+    await b.activate(); // 重载（等价内核 reload：setup 幂等重跑）
     const count = b.db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
-    expect(count.n).toBe(1); // 只有 owner，未二次插入
+    expect(count.n).toBe(1);
   });
 
   it('源码卫生：无 console.* / require( / process.（沙箱内也不注入这三者）', () => {
@@ -382,8 +437,9 @@ describe('auth 扩展 · login / 会话', () => {
   it('login 成功：ses_+48hex 令牌、7 天有效期入库、返回用户三字段；库内只存 SHA-256 hex（脱敏）', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
+    await ensureOwner(b); // owner 一律经 onboarding 创建（v0.2 语义）
     const before = Date.now();
-    const res = await login(b, 'owner', ROOT_TOKEN);
+    const res = await login(b, 'owner', OWNER_PASSWORD);
     expect(res.token).toMatch(/^ses_[0-9a-f]{48}$/);
     expect(res.user).toMatchObject({ username: 'owner', role: 'admin' });
     expect(res.user.id).toMatch(/^usr_/);
@@ -405,7 +461,7 @@ describe('auth 扩展 · login / 会话', () => {
 
   it('令牌哈希迁移：setup 清除旧版明文 token_hash 残留行（sessions + api_keys），64-hex 行保留', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
-    await b.activate(); // 首次 boot：建表 + owner 引导（v1 明文版本升级前的库）
+    await b.activate(); // 首次 boot：建表（v0.2 起激活不建号；残留行为直插，无外键依赖）
     const now = Date.now();
     // 模拟升级前残留：直插旧版明文令牌行 + 一行合法 64-hex（新格式，应保留）
     b.db
@@ -434,6 +490,7 @@ describe('auth 扩展 · login / 会话', () => {
   it('login 密码错误 / 用户不存在：同为 401 HARNESS-1006，响应完全一致（不泄露存在性）', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
+    await ensureOwner(b); // owner 存在：badPw 走"密码错"分支，noUser 走"用户不存在"分支
     const badPw = await call(b.routes, 'POST', '/auth/login', { body: { username: 'owner', password: 'wrong-pass' } });
     const noUser = await call(b.routes, 'POST', '/auth/login', { body: { username: 'ghost', password: 'wrong-pass' } });
     expectFail(badPw, 401, 'HARNESS-1006');
@@ -450,7 +507,8 @@ describe('auth 扩展 · login / 会话', () => {
   it('authProvider：会话令牌 → {userId, role, scopes:["*"]}；未知/过期令牌 → null', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const ses = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const ses = await login(b, 'owner', OWNER_PASSWORD);
     const identity = await b.getProvider()({ token: ses.token, headers: {} });
     expect(identity).toMatchObject({ userId: ses.user.id, role: 'admin', scopes: ['*'] });
 
@@ -469,7 +527,8 @@ describe('auth 扩展 · login / 会话', () => {
   it('logout：删除会话行；此后 provider 拒绝，重复 logout → 401', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const ses = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const ses = await login(b, 'owner', OWNER_PASSWORD);
     const res = await call(b.routes, 'POST', '/auth/logout', { headers: bearer(ses.token) });
     expect(res).toEqual({ ok: true });
     expect(await b.getProvider()({ token: ses.token })).toBeNull();
@@ -481,7 +540,8 @@ describe('auth 扩展 · login / 会话', () => {
   it('me：会话 / root 令牌分别回显身份与 tokenType；支持 query.token；无令牌 → 401', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const ses = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const ses = await login(b, 'owner', OWNER_PASSWORD);
 
     const meSes = (await call(b.routes, 'GET', '/auth/me', { headers: bearer(ses.token) })) as {
       userId: string;
@@ -509,13 +569,14 @@ describe('auth 扩展 · login / 会话', () => {
   it('change-password：短密码 400；旧密码错 401；成功后改哈希并撤销其他会话', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const sesA = await login(b, 'owner', ROOT_TOKEN);
-    const sesB = await login(b, 'owner', ROOT_TOKEN); // 待被撤销的"另一端"会话
+    await ensureOwner(b);
+    const sesA = await login(b, 'owner', OWNER_PASSWORD);
+    const sesB = await login(b, 'owner', OWNER_PASSWORD); // 待被撤销的"另一端"会话
 
     expectFail(
       await call(b.routes, 'POST', '/auth/change-password', {
         headers: bearer(sesA.token),
-        body: { oldPassword: ROOT_TOKEN, newPassword: 'short' },
+        body: { oldPassword: OWNER_PASSWORD, newPassword: 'short' },
       }),
       400,
       'HARNESS-1009',
@@ -531,7 +592,7 @@ describe('auth 扩展 · login / 会话', () => {
 
     const ok = (await call(b.routes, 'POST', '/auth/change-password', {
       headers: bearer(sesA.token),
-      body: { oldPassword: ROOT_TOKEN, newPassword: 'new-password-8' },
+      body: { oldPassword: OWNER_PASSWORD, newPassword: 'new-password-8' },
     })) as { ok: boolean; revokedOtherSessions: number };
     expect(ok).toMatchObject({ ok: true, revokedOtherSessions: 1 });
 
@@ -539,7 +600,7 @@ describe('auth 扩展 · login / 会话', () => {
     expect(await b.getProvider()({ token: sesB.token })).toBeNull();
     expect(await b.getProvider()({ token: sesA.token })).not.toBeNull();
     expectFail(
-      await call(b.routes, 'POST', '/auth/login', { body: { username: 'owner', password: ROOT_TOKEN } }),
+      await call(b.routes, 'POST', '/auth/login', { body: { username: 'owner', password: OWNER_PASSWORD } }),
       401,
       'HARNESS-1006',
     );
@@ -550,7 +611,8 @@ describe('auth 扩展 · login / 会话', () => {
   it('会话门：API Key / root 令牌 / 匿名均不能 logout 或 change-password', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const ses = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const ses = await login(b, 'owner', OWNER_PASSWORD);
     const key = (await call(b.routes, 'POST', '/auth/api-keys', {
       headers: bearer(ses.token),
       body: { name: 'ci' },
@@ -574,7 +636,8 @@ describe('auth 扩展 · API Keys', () => {
   it('签发：ak_+48hex 一次性返回明文；provider 校验通过且 scopes 生效；列表不回显令牌', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const ses = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const ses = await login(b, 'owner', OWNER_PASSWORD);
     const key = (await call(b.routes, 'POST', '/auth/api-keys', {
       headers: bearer(ses.token),
       body: { name: 'ci', scopes: ['chat:send'] },
@@ -598,7 +661,8 @@ describe('auth 扩展 · API Keys', () => {
   it('expiresInDays 落库 expires_at；缺省为 null（长期）', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const ses = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const ses = await login(b, 'owner', OWNER_PASSWORD);
     const k1 = (await call(b.routes, 'POST', '/auth/api-keys', {
       headers: bearer(ses.token),
       body: { name: 'day', expiresInDays: 1 },
@@ -615,7 +679,8 @@ describe('auth 扩展 · API Keys', () => {
   it('非法入参 → 400 HARNESS-1009（name 空 / scopes 形状 / expiresInDays 越界）', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const ses = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const ses = await login(b, 'owner', OWNER_PASSWORD);
     const mk = (body: unknown) => call(b.routes, 'POST', '/auth/api-keys', { headers: bearer(ses.token), body });
     expectFail(await mk({ name: '  ' }), 400, 'HARNESS-1009');
     expectFail(await mk({ name: 'x', scopes: 'chat:send' }), 400, 'HARNESS-1009');
@@ -627,7 +692,8 @@ describe('auth 扩展 · API Keys', () => {
   it('吊销：provider 立即拒绝；他人的 key / 不存在的 key → 404 不泄露存在性', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const owner = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const owner = await login(b, 'owner', OWNER_PASSWORD);
     const own = (await call(b.routes, 'POST', '/auth/api-keys', {
       headers: bearer(owner.token),
       body: { name: 'mine' },
@@ -670,7 +736,8 @@ describe('auth 扩展 · users 管理（admin 门）', () => {
   it('normal 用户访问 /users → 403 HARNESS-1007；匿名 → 401；admin 的 API Key 可过角色门', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const owner = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const owner = await login(b, 'owner', OWNER_PASSWORD);
     await call(b.routes, 'POST', '/users', {
       headers: bearer(owner.token),
       body: { username: 'alice', password: 'alice-pass-8' },
@@ -691,7 +758,8 @@ describe('auth 扩展 · users 管理（admin 门）', () => {
   it('POST /users：创建入列（对外形状无 password_hash）；重名 400；短密码/坏角色 400', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const owner = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const owner = await login(b, 'owner', OWNER_PASSWORD);
 
     const created = (await call(b.routes, 'POST', '/users', {
       headers: bearer(owner.token),
@@ -734,7 +802,8 @@ describe('auth 扩展 · users 管理（admin 门）', () => {
   it('PATCH /users/:id：改密后新密码可登录、旧密码失效；改角色生效并回读；未知用户 404', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const owner = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const owner = await login(b, 'owner', OWNER_PASSWORD);
     const created = (await call(b.routes, 'POST', '/users', {
       headers: bearer(owner.token),
       body: { username: 'bob', password: 'bob-pass-8' },
@@ -769,7 +838,8 @@ describe('auth 扩展 · users 管理（admin 门）', () => {
   it('保护规则：降级/删除最后一个 admin 400；删自己 400；删 normal 用户连带清凭据', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const owner = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const owner = await login(b, 'owner', OWNER_PASSWORD);
     const created = (await call(b.routes, 'POST', '/users', {
       headers: bearer(owner.token),
       body: { username: 'bob', password: 'bob-pass-8' },
@@ -951,39 +1021,45 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expectFail(replay, 401, 'HARNESS-1006');
   });
 
-  it('onboarding reset 模式：root 令牌重置 owner → 旧密码/旧会话/旧 API Key/2FA 全部失效', async () => {
+  it('onboarding reset 分支：先 onboarding 建号，再 onboarding 重置 → 密码改写 + totp/sessions/api_keys 清空', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const first = await login(b, 'owner', ROOT_TOKEN); // helper 自动走绑定流程 → owner 已绑 2FA
+
+    // 第一分支（fresh）：users 空表 → onboarding 创建 owner，登录绑定 2FA 并签发 API Key
+    await ensureOwner(b, OWNER_PASSWORD);
+    const first = await login(b, 'owner', OWNER_PASSWORD); // helper 自动走绑定流程 → owner 已绑 2FA
     const key = (await call(b.routes, 'POST', '/auth/api-keys', {
       headers: bearer(first.token),
       body: { name: 'pre-reset' },
     })) as { token: string };
     expect(await b.getProvider()({ token: key.token })).not.toBeNull();
 
+    // 第二分支（reset）：users 非空 → root 令牌找回通道：固定重置 owner（username 入参被忽略）
     const reset = (await call(b.routes, 'POST', '/auth/onboarding', {
       body: { rootToken: ROOT_TOKEN, password: 'reset-pass-8' },
     })) as { enrollmentRequired: boolean; enrollToken: string };
     expect(reset.enrollmentRequired).toBe(true);
 
-    // 旧会话 / 旧 API Key 立即失效；totp 清空
-    expect(await b.getProvider()({ token: first.token })).toBeNull();
-    expect(await b.getProvider()({ token: key.token })).toBeNull();
-    const owner = b.db.prepare('SELECT totp_enabled, totp_secret FROM users').get() as {
+    // 密码改写：新密码可校验、旧密码（与 root 令牌）均不可校验
+    const owner = b.db.prepare('SELECT password_hash, totp_enabled, totp_secret FROM users').get() as {
+      password_hash: string;
       totp_enabled: number;
       totp_secret: string | null;
     };
+    expect(await passwords.verify('reset-pass-8', owner.password_hash)).toBe(true);
+    expect(await passwords.verify(OWNER_PASSWORD, owner.password_hash)).toBe(false);
+    expect(await passwords.verify(ROOT_TOKEN, owner.password_hash)).toBe(false);
+    // totp 清空 + 会话 / API Key 全清（旧凭据立即失效）
     expect(owner.totp_enabled).toBe(0);
     expect(owner.totp_secret).toBeNull();
+    expect(await b.getProvider()({ token: first.token })).toBeNull();
+    expect(await b.getProvider()({ token: key.token })).toBeNull();
     const sesCount = b.db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number };
     expect(sesCount.n).toBe(0);
+    const keyCount = b.db.prepare('SELECT COUNT(*) AS n FROM api_keys').get() as { n: number };
+    expect(keyCount.n).toBe(0);
 
-    // 旧密码不可登录；新密码可登录但被强制重新绑定（新 enr → setup → enroll）
-    expectFail(
-      await call(b.routes, 'POST', '/auth/login', { body: { username: 'owner', password: ROOT_TOKEN } }),
-      401,
-      'HARNESS-1006',
-    );
+    // 新密码可登录但被强制重新绑定（新 enr → setup → enroll）
     const unbound = await loginUnbound(b, 'owner', 'reset-pass-8');
     const done = await enroll(b, unbound.enrollToken);
     expect(done.user.username).toBe('owner');
@@ -993,7 +1069,8 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('login 未绑定 → enrollmentRequired + enr；pending secret 预置：不经 setup 直接 enroll 也可成功', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const unbound = await loginUnbound(b, 'owner', OWNER_PASSWORD);
     const done = await enroll(b, unbound.enrollToken); // 直接触 enroll（跳过 /2fa/setup）
     expect(done.token).toMatch(/^ses_[0-9a-f]{48}$/);
     const row = b.db.prepare('SELECT totp_enabled FROM users WHERE username = ?').get('owner') as {
@@ -1005,8 +1082,9 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('login 已绑定未带码 → mfaRequired；POST /auth/login/2fa 错码 401（令牌保留可重试）→ 对码会话', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    await login(b, 'owner', ROOT_TOKEN); // 绑定 2FA
-    const mfa = await loginMfa(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    await login(b, 'owner', OWNER_PASSWORD); // 绑定 2FA
+    const mfa = await loginMfa(b, 'owner', OWNER_PASSWORD);
 
     const bad = await call(b.routes, 'POST', '/auth/login/2fa', {
       body: { mfaToken: mfa.mfaToken, totp: '000000' },
@@ -1032,16 +1110,17 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('login 已绑定带码：对码直接会话（与 login/2fa 等价）；错码 → 401 "invalid 2fa code"', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    await login(b, 'owner', OWNER_PASSWORD); // 绑定 2FA
 
     const bad = await call(b.routes, 'POST', '/auth/login', {
-      body: { username: 'owner', password: ROOT_TOKEN, totp: '000000' },
+      body: { username: 'owner', password: OWNER_PASSWORD, totp: '000000' },
     });
     expectFail(bad, 401, 'HARNESS-1006');
     expect(bad).toMatchObject({ body: { message: 'invalid 2fa code' } });
 
     const ok = (await call(b.routes, 'POST', '/auth/login', {
-      body: { username: 'owner', password: ROOT_TOKEN, totp: '123456' },
+      body: { username: 'owner', password: OWNER_PASSWORD, totp: '123456' },
     })) as { token: string; mfaRequired?: boolean; enrollmentRequired?: boolean };
     expect(ok.token).toMatch(/^ses_[0-9a-f]{48}$/);
     expect(ok.mfaRequired).toBeUndefined();
@@ -1051,6 +1130,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('enr/mfa 令牌门：未知令牌 → 401 "enrollment/mfa token expired or invalid"；enroll 缺 code → 400 1009', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
+    await ensureOwner(b);
     const ghost = 'enr_' + '0'.repeat(48);
     const ghostMfa = 'mfa_' + '0'.repeat(48);
     const msg = 'enrollment/mfa token expired or invalid';
@@ -1067,7 +1147,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     // 缺 enrollToken / 缺 code：同一令牌门 / 入参形状语义
     expectFail(await call(b.routes, 'GET', '/auth/2fa/setup', { query: {} }), 401, 'HARNESS-1006');
 
-    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    const unbound = await loginUnbound(b, 'owner', OWNER_PASSWORD);
     expectFail(
       await call(b.routes, 'POST', '/auth/2fa/enroll', { body: { enrollToken: unbound.enrollToken } }),
       400,
@@ -1078,7 +1158,8 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('enr 错码不消费：错码 400 后原令牌重试对码仍可成功', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const unbound = await loginUnbound(b, 'owner', OWNER_PASSWORD);
     expectFail(
       await call(b.routes, 'POST', '/auth/2fa/enroll', { body: { enrollToken: unbound.enrollToken, code: '999999' } }),
       400,
@@ -1091,7 +1172,8 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('GET /2fa/setup 可重复调用刷新 pending secret（重扫二维码语义），刷新后 enroll 对新 secret 生效', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const unbound = await loginUnbound(b, 'owner', OWNER_PASSWORD);
     const s1 = (await call(b.routes, 'GET', '/auth/2fa/setup', { query: { enrollToken: unbound.enrollToken } })) as {
       uri: string;
       secret: string;
@@ -1112,7 +1194,8 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('POST /auth/2fa/disable：密码错 401；totp 错码 401；全对 → {ok:true} 清 2FA；再登录强制重绑', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const ses = await login(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const ses = await login(b, 'owner', OWNER_PASSWORD);
 
     const badPw = await call(b.routes, 'POST', '/auth/2fa/disable', {
       headers: bearer(ses.token),
@@ -1122,7 +1205,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expect(badPw).toMatchObject({ body: { message: 'invalid credentials' } });
     const badCode = await call(b.routes, 'POST', '/auth/2fa/disable', {
       headers: bearer(ses.token),
-      body: { password: ROOT_TOKEN, code: '000000' },
+      body: { password: OWNER_PASSWORD, code: '000000' },
     });
     expectFail(badCode, 401, 'HARNESS-1006');
     expect(badCode).toMatchObject({ body: { message: 'invalid 2fa code' } });
@@ -1133,11 +1216,11 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     ).toBe(1);
 
     // 匿名 / API Key 不可调用（会话门）
-    expectFail(await call(b.routes, 'POST', '/auth/2fa/disable', { body: { password: ROOT_TOKEN, code: '123456' } }), 401, 'HARNESS-1006');
+    expectFail(await call(b.routes, 'POST', '/auth/2fa/disable', { body: { password: OWNER_PASSWORD, code: '123456' } }), 401, 'HARNESS-1006');
 
     const ok = await call(b.routes, 'POST', '/auth/2fa/disable', {
       headers: bearer(ses.token),
-      body: { password: ROOT_TOKEN, code: '123456' },
+      body: { password: OWNER_PASSWORD, code: '123456' },
     });
     expect(ok).toEqual({ ok: true });
     const row = b.db.prepare('SELECT totp_enabled, totp_secret FROM users WHERE username = ?').get('owner') as {
@@ -1151,17 +1234,18 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expect(
       await call(b.routes, 'POST', '/auth/2fa/disable', {
         headers: bearer(ses.token),
-        body: { password: ROOT_TOKEN, code: '000000' },
+        body: { password: OWNER_PASSWORD, code: '000000' },
       }),
     ).toEqual({ ok: true });
     // 下次登录强制重新绑定（与「强制 2FA」一致）
-    await loginUnbound(b, 'owner', ROOT_TOKEN);
+    await loginUnbound(b, 'owner', OWNER_PASSWORD);
   });
 
   it('内存令牌过期：expiresAt 翻到过去 → enr/mfa 一律 401 "enrollment/mfa token expired or invalid"', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const unbound = await loginUnbound(b, 'owner', OWNER_PASSWORD);
     // 篡改扩展 VM 内 AUTH_MEM_TOKENS 全部条目为已过期（等价 TTL 流逝；现有测试手法无注入时钟）
     b.runInVm('AUTH_MEM_TOKENS.forEach(function (v) { v.expiresAt = 0; })');
     const msg = 'enrollment/mfa token expired or invalid';
@@ -1175,8 +1259,8 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expect(enrollRes).toMatchObject({ body: { message: msg } });
 
     // mfa 令牌同样受过期语义约束
-    await login(b, 'owner', ROOT_TOKEN); // 重新绑定
-    const mfa = await loginMfa(b, 'owner', ROOT_TOKEN);
+    await login(b, 'owner', OWNER_PASSWORD); // 重新绑定
+    const mfa = await loginMfa(b, 'owner', OWNER_PASSWORD);
     b.runInVm('AUTH_MEM_TOKENS.forEach(function (v) { v.expiresAt = 0; })');
     const mfaRes = await call(b.routes, 'POST', '/auth/login/2fa', {
       body: { mfaToken: mfa.mfaToken, totp: '123456' },
@@ -1188,7 +1272,8 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
   it('canned 可编程：改写罐头码表后，只有新码可过 verify（totpVerify 桩按表判定）', async () => {
     const b = boot({ bootRootToken: ROOT_TOKEN });
     await b.activate();
-    const unbound = await loginUnbound(b, 'owner', ROOT_TOKEN);
+    await ensureOwner(b);
+    const unbound = await loginUnbound(b, 'owner', OWNER_PASSWORD);
     b.totpOkCodes.length = 0;
     b.totpOkCodes.push('654321');
     // 默认码 '123456' 已不再是合法码
@@ -1203,7 +1288,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expectFail(
       await call(b.routes, 'POST', '/auth/2fa/disable', {
         headers: bearer(done.token),
-        body: { password: ROOT_TOKEN, code: '123456' },
+        body: { password: OWNER_PASSWORD, code: '123456' },
       }),
       401,
       'HARNESS-1006',
@@ -1211,7 +1296,7 @@ describe('auth 扩展 · Onboarding 引导 + 全员强制 2FA', () => {
     expect(
       await call(b.routes, 'POST', '/auth/2fa/disable', {
         headers: bearer(done.token),
-        body: { password: ROOT_TOKEN, code: '654321' },
+        body: { password: OWNER_PASSWORD, code: '654321' },
       }),
     ).toEqual({ ok: true });
   });

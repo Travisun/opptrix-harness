@@ -502,19 +502,14 @@ defineExtension(async (h, ctx) => {
   }
   AUTH_ROOT_TOKEN = rootToken;
 
-  // owner 引导：users 表为空且拿到 rootToken 时，创建可登录的 owner（break-glass 入口）。
-  // 只在空表时执行一次；rootToken 轮换后 owner 密码不自动跟随（用 PATCH /users/:id 改密，见 README）。
-  if (rootToken !== undefined) {
-    var countRow = await h.db.get('SELECT COUNT(*) AS n FROM users');
-    if (countRow && Number(authStr(countRow, 'n') || '0') === 0) {
-      var now = Date.now();
-      await h.db.run(
-        'INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)',
-        ['usr_' + authRandomHex(12), 'owner', String(await h.auth.hashPassword(rootToken)), 'admin', now],
-      );
-      h.log.info('auth: owner bootstrapped from root token', { username: 'owner' });
-    }
-  }
+  // owner 不再由 root 令牌自动引导（v0.2 起）：管理员账户一律通过 Web Onboarding
+  // 向导创建（/admin → /onboarding：root 令牌仅作所有权校验 + 设置账号密码 + 强制绑定 2FA）。
+  // rootToken 仍保留为 onboarding 的所有权证明与找回通道（见 POST /auth/onboarding）。
+  var hasOwner = false;
+  var countRow = await h.db.get('SELECT COUNT(*) AS n FROM users');
+  hasOwner = !!(countRow && Number(authStr(countRow, 'n') || '0') > 0);
+  h.log.info('auth: onboarding ' + (hasOwner ? 'completed' : 'pending (open /admin to initialize the admin account)'),
+    { needsOnboarding: !hasOwner });
 
   // ---- 3. 注册 AuthProvider（内核对每个受保护请求派发；激活期一次）----------
   h.authProvider(async (input) => {

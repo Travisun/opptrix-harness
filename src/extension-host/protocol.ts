@@ -80,6 +80,21 @@ export const KERNEL_TOPICS = {
   systemStats: 'system.stats',
   /** 出站 HTTP（内核 fetch 代理 + SSRF 防护）：需 manifest 声明 net:out / net:out:<host> */
   httpFetch: 'http.fetch',
+  // ---- Skills / MCP / 插件（OS 能力目录）----
+  skillsList: 'skills.list',
+  skillsGet: 'skills.get',
+  skillsRefresh: 'skills.refresh',
+  skillsRegister: 'skills.register',
+  mcpServersList: 'mcp.servers.list',
+  mcpServerAdd: 'mcp.servers.add',
+  mcpServerRemove: 'mcp.servers.remove',
+  mcpToolsList: 'mcp.tools.list',
+  mcpToolsCall: 'mcp.tools.call',
+  mcpResourcesList: 'mcp.resources.list',
+  mcpResourcesRead: 'mcp.resources.read',
+  mcpPromptsList: 'mcp.prompts.list',
+  mcpPromptsGet: 'mcp.prompts.get',
+  pluginsList: 'plugins.list',
   /** SHA-256 摘要（令牌脱敏存储等）：{ value } → { hash }（需 'auth:provider' 权限） */
   authHashToken: 'auth.hashToken',
   authTotpGenerate: 'auth.totpGenerate',
