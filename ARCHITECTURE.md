@@ -4,7 +4,7 @@
 
 ## 1. 总览与进程模型
 
-Opptrix Harness OS 是一个多线程单进程内核 + 进程监管器的框架：**主线程**承载 HTTP 与全部核心服务，**唯一的 Extension Worker 线程**承载所有扩展（每扩展一个 `vm.Context`），**任务线程池**承载 CPU 密集长任务。生产环境由 `bootstrap.mjs` 作为监管进程拉起内核并负责崩溃重启与升级回滚。
+Opptrix Harness OS 是一个多线程单进程内核 + 进程监管器的框架：**主线程**承载 HTTP 与全部核心服务，**扩展线程 ×2（内置池/社区池）**按信任来源分池承载所有扩展（每扩展一个 `vm.Context`），**任务线程池**承载 CPU 密集长任务。生产环境由 `bootstrap.mjs` 作为监管进程拉起内核并负责崩溃重启与升级回滚。
 
 ```text
 ┌────────────────────────── bootstrap.mjs（监管进程）──────────────────────────┐
@@ -22,8 +22,9 @@ Opptrix Harness OS 是一个多线程单进程内核 + 进程监管器的框架�
 │  ├─ CronScheduler（croner）· EventBus · HookManager · SseHub                 │
 │  └─ Updater（A/B 升级）· SandboxManager（dockerode）                          │
 │                                                                              │
-│  Extension Worker 线程（唯一，worker_threads）                                │
-│  └─ 每扩展一个 vm.Context（受限 require / 最小全局面 / 定时器登记表）           │
+│  Extension Worker 线程 ×2（worker_threads，按信任来源分池）                    │
+│  ├─ 内置池（受信第一方：auth/webui；崩溃永不熔断，退避重启+通知）               │
+│  └─ 社区池（第三方；崩溃熔断隔离在本池）· 每扩展一个 vm.Context                 │
 │                                                                              │
 │  Task 线程池（默认 1，HARNESS_TASK_WORKERS 1–16）—— 每任务新 VM               │
 └──────────────┬──────────────────────────────┬────────────────────────────────┘
@@ -51,7 +52,7 @@ Opptrix Harness OS 是一个多线程单进程内核 + 进程监管器的框架�
 | `http/` | Fastify 服务器工厂（统一错误形状 `{code,message,detail,retryable}`、404/405 区分、CORS、trustProxy）+ `sse/hub.ts`（多 topic SSE：鉴权、心跳、帧 id 序列、topic 订阅上限） |
 | `events/` `hooks/` | 进程内事件总线（监听器异常隔离）；Hook 埋点链（kernel.boot/ready/shutdown、cron.beforeRun/afterRun/onError、notification.beforeSend 等 filter 语义） |
 | `storage/` | `openSqlite`（主库 `<dataDir>/db/kernel.sqlite`、扩展库 `db/ext/<id>.sqlite`）；`Migrator`（批次化迁移，记账表 `migrations_log`）+ `kernel-migrations.ts`（001–014 权威 Schema）；settings/secrets；`backup.ts`（VACUUM INTO + tar.gz 备份，含恢复约定） |
-| `extensions/` | `manifest.ts`（zod schema + 权限白名单 + API 版本门禁）、`manager.ts`（生命周期 + 自愈 + 惯犯熔断）、`routes.ts`（/ext/* 通配兜底 + 路由表 + 并发/超时/drain）、`registry.ts`（h.expose/h.call 服务目录）、`kernel-handlers.ts`（KERNEL_TOPICS 的内核侧实现 + 权限闸）、`ui-registry.ts` + `assets.ts`（UI 贡献与静态挂载）、`contributions.ts`、`bridge.ts` |
+| `extensions/` | `manifest.ts`（zod schema + 权限白名单 + API 版本门禁）、`manager.ts`（生命周期 + 双池自愈：内置池永不熔断 / 社区池惯犯熔断）、`routes.ts`（/ext/* 通配兜底 + 路由表 + 并发/超时/drain）、`registry.ts`（h.expose/h.call 服务目录）、`kernel-handlers.ts`（KERNEL_TOPICS 的内核侧实现 + 权限闸）、`ui-registry.ts` + `assets.ts`（UI 贡献与静态挂载）、`contributions.ts`、`bridge.ts` |
 | `providers/core-services.ts` | 核心领域服务总装配：ChannelRegistry（通知驱动 inbox/webhook/console/email + 聊天桥 webhook/email）→ NotificationManager / ChatService(+BridgeDispatcher+deliveries 落库) / FileService(本地驱动) / TaskManager(+WorkerPool) / LlmGateway，并挂载对应 REST |
 | `chat/` `notification/` `files/` `tasks/` `cron/` `llm/` `channels/` | 领域服务实现：频道/成员/消息（判别联合内容 text/file/card）；通知（入库 → SSE created → 渠道投递 → delivered）；文件（本地驱动 `uploads/`，`file.uploaded/deleted` 事件）；任务（store/pool/worker、进度/超时 sweep）；croner 调度 + `cron_runs` 历史；LLM 协议适配（openai-chat / openai-responses / anthropic-messages）；signedPost（HMAC 头 + 超时 + 退避重试） |
 | `sandbox/` | Docker 工作区沙箱：一次性容器执行命令、家目录恢复扫描、空闲停机；Docker 不可用 → `SANDBOX_DISABLED` 优雅降级 |
@@ -86,10 +87,10 @@ Opptrix Harness OS 是一个多线程单进程内核 + 进程监管器的框架�
 4. EventBus / HookManager / CronJobStore + CronScheduler；
 5. `createCoreServices`（领域服务装配 + 容器登记）；
 6. Updater + SandboxManager；`updateAuto && updateFeed` 时注册内核 cron 任务 `kernel:auto-update`（`extId=null`）；
-7. 扩展子系统：UiRegistry → kernel-handlers → 服务注册中心 → ExtensionManager（auth 接线：扩展可注册 AuthProvider；worker→kernel 服务表；路由表 diff 应用器）；
+7. 扩展子系统：UiRegistry → kernel-handlers → 服务注册中心 → ExtensionManager（auth 接线：扩展可注册 AuthProvider；worker→kernel 服务表；路由表 diff 应用器；内置/社区双池 notifier 注入）；
 8. SQLite 日志汇挂载（minLevel info）→ `kernel.boot` hook/event → providers register → providers boot；
 9. serverFactory：挂 system/cron/core REST → sandbox/update/extensions API → `/api/v1/ui` → ExtRouteRegistry（构造即挂 `/ext/*` 通配兜底）→ 重放缓存路由表 → 扩展 UI 静态资产 → builtin auth mount（`/api/v1/auth|users` 静态 catch-all，运行时查 manager 路由表）→ 宿主 registerExtra；
-10. 启动序：`core.start()`（任务池）→ `settlePendingUpdate`（在途升级收尾）→ `sandbox.start()` → `extManager.start()`（worker + 已启用扩展）→ `cron.start()`（含 misfire 裁决）→ `http.start()` → **ready**。
+10. 启动序：`core.start()`（任务池）→ `settlePendingUpdate`（在途升级收尾）→ `sandbox.start()` → `extManager.start()`（按池 spawn worker + 各池启用已启用扩展）→ `cron.start()`（含 misfire 裁决）→ `http.start()` → **ready**。
 
 ### 一次请求
 
@@ -130,7 +131,7 @@ extensions 目录扫描（<dataDir>/extensions + <cwd>/extensions）
 - **注册期闸门**：`route/webhook/on/hook/expose/cron/page/menu` 仅可在 setup 内调用（`EXT_REGISTRATION_PHASE`）；
 - **权限即能力面**：KERNEL_TOPICS 的内核侧实现按 manifest.permissions 放行（如 `llm.chat` 需 `llm`、`sandbox.exec` 需 `sandbox`、`auth.*` 需 `auth:provider`）；root 令牌只注入 `builtin && mount==='auth'` 扩展（worker 侧双重复核）；
 - **RPC 有界**：worker→kernel 单次调用默认 30s；路由 handler 默认 30s（可 `timeoutMs` 覆盖）；超时 = `HARNESS-1002`，VM 内继续跑但结果丢弃；
-- **自愈**：worker 异常退出 → 指数退避重启 + 拓扑重注册（路由/服务/UI/AuthProvider 全量重建）；`crashLoopWindowMs`（默认 60s）内崩溃 > `crashLoopMax`（默认 5）→ 熔断：全部扩展停用、`EXT_CRASH_LOOP` 记 last_error，人工 enable 是唯一恢复出口。
+- **自愈（双池分策）**：worker 异常退出 → 指数退避重启 + 池内拓扑重注册（路由/服务/UI/AuthProvider 全量重建）。社区池：`crashLoopWindowMs`（默认 60s）内崩溃 > `crashLoopMax`（默认 5）→ 熔断：该池全部扩展停用、`EXT_CRASH_LOOP` 记 last_error，人工 enable 是唯一恢复出口；内置池：**永不自动禁用**——无限次退避重启（500ms×2ⁿ 封顶 30s）+ 崩溃/恢复通知（5 分钟节流）。分池动机：第三方扩展的崩溃循环不得陪葬 auth/webui（`extensions/manager.ts` 的 HostRuntime，每池一份）。
 
 ## 5. 数据流（三条代表性链路）
 

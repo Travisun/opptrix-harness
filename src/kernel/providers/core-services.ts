@@ -249,7 +249,8 @@ export function createCoreServices(kernel: Kernel): CoreServices {
             const manager = kernel.container.resolve<import('../../kernel/extensions/manager.js').ExtensionManager>(
               CONTAINER_KEYS.extManager,
             );
-            const bridge = manager.bridge;
+            // 双池化：按扩展归属池取桥（跨线程 RPC 必须发到扩展所在的 worker）
+            const bridge = manager.bridgeFor(extId);
             if (bridge === null) {
               throw new Error('extension bridge is not available (worker restarting)');
             }

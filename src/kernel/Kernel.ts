@@ -510,7 +510,7 @@ export class Kernel {
           authRegistry.register({
             name: extId,
             verify: async ({ token, headers }) => {
-              const bridge = extManager?.bridge;
+              const bridge = extManager?.bridgeFor(extId);
               if (bridge === undefined || bridge === null) return null;
               const reply = (await bridge.callToWorker(
                 extId,
@@ -535,7 +535,7 @@ export class Kernel {
       const extSvcRegistry = new ExtensionServiceRegistry({
         dispatcher: {
           callService: async (targetExtId, service, method, args, timeoutMs) => {
-            const bridge = extManager?.bridge;
+            const bridge = extManager?.bridgeFor(targetExtId);
             if (bridge === undefined || bridge === null) {
               throw err('SERVICE_UNAVAILABLE', {
                 detail: { targetExtId, service, cause: 'extension worker is not running' },
@@ -638,6 +638,19 @@ export class Kernel {
           manifest.builtin === true && manifest.mount === 'auth' && isTrustedExtensionDir(dir)
             ? { rootToken: identity.token }
             : undefined,
+        // 双池化：内置池崩溃/恢复通知——懒解析 container 'notify' 的包装（此刻 core
+        // 服务已登记，仍按 has+try/catch 兜底：notify 缺失或投递失败静默，不阻断自愈）
+        notifier: {
+          send: async (input) => {
+            try {
+              if (!this.container.has(CONTAINER_KEYS.notify)) return undefined;
+              return await this.container.resolve<UpdaterNotifier>(CONTAINER_KEYS.notify).send(input);
+            } catch (cause) {
+              this.logger.warn({ err: cause }, 'extension host notification delivery failed');
+              return undefined;
+            }
+          },
+        },
       });
       this.#extManager = extManager;
       this.container.instance(CONTAINER_KEYS.extManager, extManager);
@@ -652,7 +665,7 @@ export class Kernel {
           const originalName = job.name.startsWith(`${job.extId}:`)
             ? job.name.slice(job.extId.length + 1)
             : job.name;
-          const bridge = extManager?.bridge;
+          const bridge = extManager?.bridgeFor(job.extId);
           if (bridge === undefined || bridge === null) return;
           await bridge.callToWorker(job.extId, HOST_METHODS.cronFire, { name: originalName });
         } catch (e) {
@@ -735,7 +748,7 @@ export class Kernel {
                 if (entry === undefined) {
                   throw err('ROUTE_NOT_FOUND', { detail: { routeKey } });
                 }
-                const bridge = extManager?.bridge;
+                const bridge = extManager?.bridgeFor(entry.extId);
                 if (bridge === undefined || bridge === null) {
                   throw err('SERVICE_UNAVAILABLE', {
                     detail: { routeKey, cause: 'extension worker is not running' },
@@ -827,7 +840,7 @@ export class Kernel {
                   throw err('FORBIDDEN', { detail: { route: `${entry.method} ${entry.path}`, scope: entry.scope } });
                 }
               }
-              const bridge = extManager?.bridge;
+              const bridge = extManager?.bridgeFor(entry.extId);
               if (bridge === undefined || bridge === null) {
                 throw err('SERVICE_UNAVAILABLE', {
                   detail: { route: `${entry.method} ${entry.path}`, cause: 'extension worker is not running' },

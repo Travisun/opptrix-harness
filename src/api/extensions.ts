@@ -31,7 +31,11 @@ import { err, HarnessError } from '../kernel/errors/index.js';
 // 依赖契约
 // ---------------------------------------------------------------------------
 
-/** 扩展清单条目（形状由 ExtensionManager 决定，本模块只要求携带 id） */
+/**
+ * 扩展清单条目（形状由 ExtensionManager 决定，本模块只要求携带 id）。
+ * 双池化后 ExtSummary 携带 host: 'builtin' | 'community'（所在宿主池），
+ * 经本索引签名结构原样透传，无需显式字段。
+ */
 export interface ExtSummaryLike {
   id: string;
   [key: string]: unknown;
