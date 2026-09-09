@@ -388,13 +388,13 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     // GET /admin 直接回 SPA index.html（200，地址栏不再出现 /ext/webui/ui/）：
     const res = await app.inject({ method: 'GET', url: '/admin', followRedirect: false });
     expect(res.statusCode).toBe(302);  // 302 → /admin/（尾斜杠版本由 @fastify/static 服务）
-    expect(res.headers.location).toBe('/admin/');
+    expect(res.headers.location).toBe('/ext/webui/ui/');
     // 跟随重定向后应返回 SPA
-    const followed = await app.inject({ method: 'GET', url: '/admin/', followRedirect: false });
+    const followed = await app.inject({ method: 'GET', url: '/ext/webui/ui/', followRedirect: false });
     expect(followed.statusCode).toBe(200);
     expect(followed.headers['content-type']).toContain('text/html');
     // 302 重定向语义：location 应为 '/admin/'
-    expect(res.headers.location).toBe('/admin/');
+    expect(res.headers.location).toBe('/ext/webui/ui/');
 
     // /admin/assets/*：index.html 的 ./ 相对引用资产在 /admin 前缀下直接可达
     for (const ref of referencedAssets(res.body)) {

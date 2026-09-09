@@ -1059,37 +1059,15 @@ export class Kernel {
         if (assetDirs.length > 0) registerExtAssets(app, assetDirs);
 
 
-        // ---- /admin 直接服务管理台 SPA（取代旧 GET /admin 302 → /ext/{id}/ui/）----
-        // 与 /ext/{id}/ui/ 各自处于兄弟封装上下文：fastify 同实例只允许一份 reply 装饰，
-        // 根实例上的 registerExtAssets 全部 decorateReply:false；此处单独开一个插件
-        // 上下文让本实例 decorateReply:true（sendFile 装饰仅本上下文可见，互不冲突）。
-        // - GET /admin（无尾斜杠）→ reply.sendFile('index.html')：200 直出入口页，无重定向；
-        // - GET /admin/assets/**（及 ui/ 下其余资产）→ 由 prefix '/admin/' 通配直出；
-        // - SPA base 为 './' + HashRouter：无需服务端 rewrite/目录索引兜底。
-        // 无 ui-mount 扩展时不注册 → /admin 落 fastify notFound（404，语义与旧 404 一致）。
+        // ---- builtin mount:'ui'（/admin 接线）----
+        // 极简策略：/admin 302 → /ext/webui/ui/（标准扩展路由，零特殊处理）。
         if (adminUiRoot !== undefined) {
-          void app.register(async (admin) => {
-            await admin.register(fastifyStatic, {
-              root: adminUiRoot,
-              prefix: '/admin/',
-              index: 'index.html',
-            });
-            // /admin（无尾斜杠）→ 302 到 /admin/（保证相对路径正确解析）
-            admin.get(
-              '/admin',
-              { schema: { hide: true } },
-              async (_request, reply) => reply.redirect('/admin/'),
-            );
-          });
-          // 兜底：浏览器在 /admin（无尾斜杠）下把 ./assets/... 解析为 /assets/...
-          // → 注册 /assets/* 路由指向同一目录，彻底消除 404
-          void app.register(async (assets) => {
-            await assets.register(fastifyStatic, {
-              root: adminUiRoot,
-              prefix: '/assets/',
-              decorateReply: false,
-            });
-          });
+          app.get(
+            '/admin',
+            { schema: { hide: true } },
+            async (_request: import('fastify').FastifyRequest, reply: import('fastify').FastifyReply) =>
+              reply.redirect('/ext/webui/ui/'),
+          );
         }
       }
 
