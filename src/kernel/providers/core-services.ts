@@ -376,6 +376,8 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     },
   };
   const subagentStore = new SubagentStore(db);
+  // 并发缺省不在此显式传入：maxConcurrent / maxChildrenPerParent 未传 → manager 缺省吃
+  // runtime-profile 画像值（按核数自适应）；显式覆盖仍以 deps 传入为准。
   const subagentManager = new SubagentManager({
     store: subagentStore,
     runner: async (input, onEvent) => {

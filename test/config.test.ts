@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { configGet, loadConfig, loadDotenv } from '../src/kernel/config/index.js';
 import { HarnessError } from '../src/kernel/errors/index.js';
+import { detectRuntimeProfile } from '../src/kernel/runtime-profile.js';
 
 describe('loadConfig 默认值', () => {
   it('空 env → 全部默认值', () => {
@@ -16,7 +17,8 @@ describe('loadConfig 默认值', () => {
       trustProxy: false,
       logLevel: 'info',
       timezone: 'UTC',
-      taskWorkers: 1,
+      // 缺省 = 运行时画像（按宿主机核数自适应，见 runtime-profile.ts），非固定 1
+      taskWorkers: detectRuntimeProfile().taskWorkers,
       rpcTimeoutMs: 30_000,
       routeTimeoutMs: 30_000,
       maxBodyBytes: 2 * 1024 * 1024,

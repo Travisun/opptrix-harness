@@ -26,7 +26,7 @@ Opptrix Harness OS 是一个多线程单进程内核 + 进程监管器的框架�
 │  ├─ 内置池（受信第一方：auth/webui；崩溃永不熔断，退避重启+通知）               │
 │  └─ 社区池（第三方；崩溃熔断隔离在本池）· 每扩展一个 vm.Context                 │
 │                                                                              │
-│  Task 线程池（默认 1，HARNESS_TASK_WORKERS 1–16）—— 每任务新 VM               │
+│  Task 线程池（缺省=运行时画像，HARNESS_TASK_WORKERS 1–16 覆盖）—— 每任务新 VM          │
 └──────────────┬──────────────────────────────┬────────────────────────────────┘
                │ dockerode（按需）             │ 预检自检（升级期）
 ┌──────────────▼─────────────┐   ┌────────────▼──────────────┐
@@ -46,6 +46,7 @@ Opptrix Harness OS 是一个多线程单进程内核 + 进程监管器的框架�
 | `Kernel.ts` | 生命周期编排：状态机 `created → registering → booting → ready → stopping → stopped`；boot 顺序 = 鉴权挂点 → SQLite+迁移 → 事件/Hook/Cron → 核心服务 → 沙箱/升级器 → 扩展子系统 → HTTP；关停逆序且幂等 |
 | `Container.ts` / `ServiceProvider.ts` / `Facades.ts` | DI 容器（bind/singleton/instance/alias，显式工厂、无反射）；provider 的 register/boot/stop 契约；静态门面（App/Config/Log/Event/Hook/Cron） |
 | `config/` | `HARNESS_*` 环境变量 → `HarnessConfig`（同步 fail-fast，非法值启动期抛 `VALIDATION_FAILED`）；.env 可选装载 |
+| `runtime-profile.ts` | 运行时画像：探测 CPU 核数/内存 → taskWorkers / 子代理并发上限 / libuv 线程池建议值（全部可注入、纯函数；os 读取见「并发模型」小节） |
 | `errors/` | `HarnessError` + `HARNESS-xxxx` 错误码表（域分段：1xxx 通用、3xxx 资源、4xxx 任务、7xxx 投递、8xxx 升级…见 `codes.ts`） |
 | `logging/` | pino logger（epoch ms、密钥 redact）+ 启动期 multistream + SQLite 环形日志汇（`logs` 表，默认 5000 行上限，批量 flush，容错） |
 | `auth/` | break-glass root 令牌（生成/持久化/原子写）、`AuthProviderRegistry`、`authProxy`（统一 checker + `extractToken`：Bearer 优先 `?token=` 次之）、扩展 AuthProvider 支撑 |
@@ -208,3 +209,21 @@ POST /api/v1/files（multipart, ≤ maxUploadBytes）
 - **背景**：框架开箱即用需要认证与管理台，但把它们写进内核即违背「内核零领域语义」。
 - **决策**：以 `builtin` 扩展形态提供默认答案。auth 扩展声明相对路由（`/auth/*`、`/users*`），内核按 mount 白名单映射到 `/api/v1/auth|users`（静态 catch-all + 运行时查路由表，enable/disable 即表变更）；auth 扩展还经 `auth.registerProvider` 向内核注册 AuthProvider，使每个受保护请求的令牌校验走 `host.authVerify` 派发回扩展线程；内核 scrypt 密码原语以 `auth:provider` 权限门暴露。同语义第三方扩展可整体替换它。
 - **后果**：内核本体可嵌入无认证的宿主；break-glass root 令牌作为内核层兜底始终可用（worker 不可达时直连校验），且只注入 builtin auth 扩展。
+
+## 8. 并发模型（运行时画像）
+
+内核的两类负载并发策略刻意不同：
+
+- **子代理 = I/O 密集**：子代理生命周期几乎全部时间阻塞在 LLM 网络往返上（等待不占 CPU），单进程事件循环即可大量并发——全局并发上限与单父树宽不必受核数约束；
+- **CPU 密集负载 = 任务池/沙箱容器分摊多核**：长任务走任务线程池（每任务新 VM），插件脚本/代码执行走一次性沙箱容器，均不阻塞主线程事件循环。
+
+并发缺省值由**运行时画像**（`src/kernel/runtime-profile.ts` 的 `detectRuntimeProfile()`，纯函数、os 读取可注入）统一产出，config 与 SubagentManager 只消费画像值，env 显式设置仍最高优先：
+
+| 画像字段 | 公式（clamp 后） | 依据 |
+| --- | --- | --- |
+| `taskWorkers` | clamp(cpus, 1, min(cpus, 16)) | CPU 密集线程超过核数只添上下文切换；16 对齐 `HARNESS_TASK_WORKERS` env 合法区间 |
+| `subagentMaxConcurrent` | clamp(cpus×8, 8, 64) | 等待型并发按核数放大，64 封顶防句柄/内存失控 |
+| `subagentMaxPerParent` | clamp(cpus×2, 4, 16) | 单父树宽约束，与全局并发保持 4:1 量级差 |
+| `uvThreadpoolSize` | UV_THREADPOOL_SIZE > NODE_OPTIONS `--uv-threadpool-size` > clamp(4, 4, cpus) | libuv fs/crypto/dns 共用线程池；显式设置时如实回读（clamp 1..1024），否则建议 = CPU 核数（大核维持 Node 缺省 4） |
+
+收敛规则：**单核自动收敛**（全部下限：taskWorkers=1、并发=8、单父=4、libuv=1）；**小机保护**——总内存 < 2GB 时 taskWorkers 与子代理并发减半（下限 1）；`os.cpus()` 异常（0 核）按 1 防御。UV_THREADPOOL_SIZE 必须在 Node 启动前于进程环境设置（如 compose `environment:`），.env 装载晚于 libuv 初始化、对该值无效。单机纵向上限之上，多实例横向扩展（Postgres/选主）为 T2 路径，当前版本不承诺。

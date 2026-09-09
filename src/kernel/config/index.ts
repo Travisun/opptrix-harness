@@ -11,6 +11,7 @@
 import { createRequire } from 'node:module';
 
 import { err } from '../errors/index.js';
+import { detectRuntimeProfile } from '../runtime-profile.js';
 
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
@@ -144,7 +145,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       'info',
     ),
     timezone: validateTimezone(strEnv(env.HARNESS_TIMEZONE, 'UTC')),
-    taskWorkers: intEnv('HARNESS_TASK_WORKERS', env.HARNESS_TASK_WORKERS, 1, 1, 16),
+    // 缺省 = 运行时画像（按 CPU 核数自适应，见 runtime-profile.ts）；env 显式设置仍最高优先
+    taskWorkers: intEnv('HARNESS_TASK_WORKERS', env.HARNESS_TASK_WORKERS, detectRuntimeProfile().taskWorkers, 1, 16),
     rpcTimeoutMs: intEnv('HARNESS_RPC_TIMEOUT_MS', env.HARNESS_RPC_TIMEOUT_MS, 30_000, 1_000, 600_000),
     routeTimeoutMs: intEnv('HARNESS_ROUTE_TIMEOUT_MS', env.HARNESS_ROUTE_TIMEOUT_MS, 30_000, 1_000, 600_000),
     maxBodyBytes: intEnv('HARNESS_MAX_BODY_BYTES', env.HARNESS_MAX_BODY_BYTES, 2 * 1024 * 1024, 1, Number.MAX_SAFE_INTEGER),

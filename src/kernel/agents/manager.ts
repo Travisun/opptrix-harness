@@ -20,6 +20,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { err } from '../errors/index.js';
+import { detectRuntimeProfile } from '../runtime-profile.js';
 import {
   SUBAGENT_TERMINAL_STATUSES,
   type SubagentRecord,
@@ -33,9 +34,9 @@ import {
 /** 默认最大树深度（main→1→2 合法，depth 3 被拒） */
 export const DEFAULT_MAX_DEPTH = 2;
 /** 默认每个直接父的最大子代数 */
-export const DEFAULT_MAX_CHILDREN_PER_PARENT = 8;
-/** 默认全局并发上限（超出入队等待） */
-export const DEFAULT_MAX_CONCURRENT = 8;
+export const DEFAULT_MAX_CHILDREN_PER_PARENT = detectRuntimeProfile().subagentMaxPerParent;
+/** 默认全局并发上限（超出入队等待）＝运行时画像的等待型并发值（按核数自适应，见 runtime-profile.ts） */
+export const DEFAULT_MAX_CONCURRENT = detectRuntimeProfile().subagentMaxConcurrent;
 /** 默认子代理超时（毫秒） */
 export const DEFAULT_SUBAGENT_TIMEOUT_MS = 600_000;
 /** prompt 最大字节数（UTF-8；与 REST 层 64KB 上限一致） */
