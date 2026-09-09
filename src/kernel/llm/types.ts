@@ -22,6 +22,13 @@ export interface LlmToolCall {
   arguments: string;
 }
 
+/** chat 结果中的结构化工具调用（非流式路径自 provider 响应提取；argsJson 为原始 JSON 字符串） */
+export interface LlmResultToolCall {
+  id: string;
+  name: string;
+  argsJson: string;
+}
+
 export interface LlmChatInput {
   model: string;
   messages: LlmMessage[];
@@ -64,6 +71,11 @@ export interface LlmChatResult {
   usage?: LlmUsage;
   /** provider 原始响应（透传给上层诊断用；禁止入日志） */
   raw?: unknown;
+  /**
+   * 模型请求的结构化工具调用（非流式路径提取；无工具调用时缺省不出现）。
+   * 流式路径不填充——tool_call_delta 增量由调用方自行聚合。
+   */
+  toolCalls?: LlmResultToolCall[];
 }
 
 export interface LlmAdapter {

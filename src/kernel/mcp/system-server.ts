@@ -94,8 +94,8 @@ export class SystemToolRuntime {
     return this.#tools.length;
   }
 
-  /** 按名执行一个系统工具（未知工具 / 校验失败 / 抛错 → {ok:false,error} 结果对象） */
-  async call(name: string, rawArgs: unknown): Promise<Record<string, unknown>> {
+  /** 按名执行一个系统工具（未知工具 / 校验失败 / 抛错 → {ok:false,error} 结果对象）；audit 附加调用方审计信息（子代理工具循环） */
+  async call(name: string, rawArgs: unknown, audit?: { agentId?: string; depth?: number }): Promise<Record<string, unknown>> {
     const tool = this.#tools.find((t) => t.name === name);
     if (tool === undefined) {
       return { ok: false, error: { code: 'HARNESS-3004', message: `system tool "${name}" not found` } };
@@ -111,7 +111,13 @@ export class SystemToolRuntime {
         },
       };
     }
-    const ctx: SystemToolContext = { kernel: this.#kernel, updater: this.#updater, cronHistory: this.#cronHistory };
+    const ctx: SystemToolContext = {
+      kernel: this.#kernel,
+      updater: this.#updater,
+      cronHistory: this.#cronHistory,
+      ...(audit?.agentId !== undefined ? { agentId: audit.agentId } : {}),
+      ...(audit?.depth !== undefined ? { depth: audit.depth } : {}),
+    };
     try {
       return await tool.execute(parsed.data as Record<string, unknown>, ctx);
     } catch (e) {

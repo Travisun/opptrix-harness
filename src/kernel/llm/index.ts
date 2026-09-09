@@ -17,6 +17,7 @@ export {
   type LlmMessage,
   type LlmProtocol,
   type LlmProviderConfig,
+  type LlmResultToolCall,
   type LlmStreamEvent,
   type LlmToolCall,
   type LlmUsage,

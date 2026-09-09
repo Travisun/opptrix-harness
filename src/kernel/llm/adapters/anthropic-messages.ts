@@ -5,6 +5,8 @@
  * - 消息互转：user/assistant 直传；tool 消息 → user 角色 `tool_result` 块；
  *   assistant 富形状 toolCalls → `tool_use` 块（arguments JSON 反序列化为 input）。
  * - max_tokens 必填（缺省 4096）；stop → `stop_sequences`。
+ * - 非流式：content[] 中 `tool_use` 块 → `LlmChatResult.toolCalls` 结构化提取
+ *   （input 对象经 JSON.stringify 归一为 argsJson，与 openai 系 arguments 字符串对齐）。
  * - 流式：`content_block_delta`(text_delta) → delta；`message_start` 取 input_tokens、
  *   `message_delta` 取 output_tokens，流结束统一 emit done(usage)。
  * - 错误：SDK 异常统一包装 `LLM_PROVIDER_ERROR`；不做隐藏重试（策略归上层）。
@@ -23,6 +25,7 @@ import {
   type LlmChatResult,
   type LlmMessage,
   type LlmProviderConfig,
+  type LlmResultToolCall,
   type LlmStreamEvent,
 } from '../types.js';
 
@@ -112,7 +115,16 @@ export const anthropicMessagesAdapter: LlmAdapter = {
         .map((b) => b.text)
         .join('');
       const usage = { inputTokens: res.usage.input_tokens, outputTokens: res.usage.output_tokens };
-      return { text, usage, raw: res };
+      // 结构化工具调用提取：content[] 中 type==='tool_use' 块（input 对象序列化为 argsJson）
+      const toolCalls: LlmResultToolCall[] = res.content
+        .filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
+        .map((b) => ({ id: b.id, name: b.name, argsJson: JSON.stringify(b.input ?? {}) }));
+      return {
+        text,
+        usage,
+        raw: res,
+        ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      };
     } catch (e) {
       wrapProviderError(e);
     }

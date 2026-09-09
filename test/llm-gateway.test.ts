@@ -8,6 +8,8 @@
  * provider HTTP 错误 → LLM_PROVIDER_ERROR、
  * openai-responses 非流式（output_text、max_output_tokens）与流式事件映射、
  * anthropic 非流式（system 提取、max_tokens 缺省 4096、tool_result/tool_use）与流式（content_block_delta）、
+ * LlmChatResult.toolCalls 非流式结构化工具调用提取（openai-chat tool_calls / openai-responses
+ * function_call / anthropic tool_use；无调用时缺省不出现；gateway 全链路透传）、
  * gateway 路由（模型未找到 LLM_MODEL_NOT_FOUND、secret 缺失 LLM_NOT_CONFIGURED、
  * 多 provider 取第一个、全链路参数透传与流式生成器透出）。
  */
@@ -546,5 +548,108 @@ describe('LlmGateway — 路由与配置解析', () => {
     expect(res.text).toBe('from-first');
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toBe('https://mock.local/v1/chat/completions');
+  });
+});
+
+// ---------- LlmChatResult.toolCalls — 非流式结构化工具调用提取 ----------
+
+describe('LlmChatResult.toolCalls — 三协议非流式结构化提取', () => {
+  it('openai-chat：message.tool_calls(function) → {id,name,argsJson}；非 function 类型跳过；content null → 空文本', async () => {
+    stubFetch(() =>
+      jsonResponse({
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: [
+                { id: 'call_1', type: 'function', function: { name: 'lookup', arguments: '{"q":"x"}' } },
+                { id: 'call_2', type: 'custom', custom: { name: 'weird' } },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+        usage: { prompt_tokens: 3, completion_tokens: 2 },
+      }),
+    );
+    const res = await openaiChatAdapter.chat(provider(), 'sk', CHAT_INPUT);
+    expect(res.text).toBe('');
+    expect(res.toolCalls).toEqual([{ id: 'call_1', name: 'lookup', argsJson: '{"q":"x"}' }]);
+  });
+
+  it('openai-chat：无 tool_calls → 结果不带 toolCalls 键（既有字段零破坏）', async () => {
+    stubFetch(() =>
+      jsonResponse({
+        choices: [{ index: 0, message: { role: 'assistant', content: 'plain' }, finish_reason: 'stop' }],
+      }),
+    );
+    const res = await openaiChatAdapter.chat(provider(), 'sk', CHAT_INPUT);
+    expect(res.text).toBe('plain');
+    expect('toolCalls' in res).toBe(false);
+  });
+
+  it('openai-responses：output[] 中 function_call 项 → {id:call_id,name,argsJson}', async () => {
+    stubFetch(() =>
+      jsonResponse({
+        id: 'r1',
+        object: 'response',
+        status: 'completed',
+        output_text: '',
+        output: [
+          { type: 'message', content: [{ type: 'output_text', text: 'let me check' }] },
+          { type: 'function_call', call_id: 'fc_1', name: 'cron_list', arguments: '{"limit":5}' },
+          { type: 'function_call', call_id: 'fc_2', name: 'system_info', arguments: '{}' },
+        ],
+        usage: { input_tokens: 4, output_tokens: 3 },
+      }),
+    );
+    const res = await openaiResponsesAdapter.chat(provider({ protocol: 'openai-responses' }), 'sk', CHAT_INPUT);
+    expect(res.text).toBe('let me check');
+    expect(res.toolCalls).toEqual([
+      { id: 'fc_1', name: 'cron_list', argsJson: '{"limit":5}' },
+      { id: 'fc_2', name: 'system_info', argsJson: '{}' },
+    ]);
+  });
+
+  it('anthropic-messages：content[] 中 tool_use 块 → {id,name,argsJson}（input 对象序列化）', async () => {
+    stubFetch(() =>
+      jsonResponse({
+        id: 'm1',
+        type: 'message',
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'checking' },
+          { type: 'tool_use', id: 'toolu_1', name: 'weather', input: { city: 'SF' } },
+        ],
+        stop_reason: 'tool_use',
+        usage: { input_tokens: 5, output_tokens: 4 },
+      }),
+    );
+    const res = await anthropicMessagesAdapter.chat(provider({ protocol: 'anthropic-messages' }), 'sk', CHAT_INPUT);
+    expect(res.text).toBe('checking');
+    expect(res.toolCalls).toEqual([{ id: 'toolu_1', name: 'weather', argsJson: '{"city":"SF"}' }]);
+  });
+
+  it('LlmGateway.chat 全链路透传 toolCalls（openai-chat provider）', async () => {
+    stubFetch(() =>
+      jsonResponse({
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: [{ id: 'call_9', type: 'function', function: { name: 'lookup', arguments: '{}' } }],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      }),
+    );
+    const gw = makeGateway([provider()]);
+    const res = (await gw.chat(CHAT_INPUT)) as LlmChatResult;
+    expect(res.toolCalls).toEqual([{ id: 'call_9', name: 'lookup', argsJson: '{}' }]);
   });
 });

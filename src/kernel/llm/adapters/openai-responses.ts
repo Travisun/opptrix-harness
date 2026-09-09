@@ -4,6 +4,7 @@
  * - 消息映射：system/user/assistant → `{ role, content }` 输入项；
  *   assistant 富形状 toolCalls → `function_call` 项；tool 消息 → `function_call_output` 项。
  * - 参数映射：maxTokens → `max_output_tokens`；temperature/top_p/tools 直传（协议无 stop）。
+ * - 非流式：output[] 中 `function_call` 项 → `LlmChatResult.toolCalls` 结构化提取。
  * - 流式事件映射：`response.output_text.delta` → delta；`response.completed` → done(usage)；
  *   `response.failed` / `error` → error 事件。
  * - 错误：SDK 异常统一包装 `LLM_PROVIDER_ERROR`；不做隐藏重试（策略归上层）。
@@ -22,6 +23,7 @@ import {
   type LlmChatResult,
   type LlmMessage,
   type LlmProviderConfig,
+  type LlmResultToolCall,
   type LlmStreamEvent,
 } from '../types.js';
 
@@ -104,7 +106,16 @@ export const openaiResponsesAdapter: LlmAdapter = {
       const usage = res.usage
         ? { inputTokens: res.usage.input_tokens, outputTokens: res.usage.output_tokens }
         : undefined;
-      return { text, usage, raw: res };
+      // 结构化工具调用提取：output[] 中 type==='function_call' 项（custom 等其他类型跳过）
+      const toolCalls: LlmResultToolCall[] = res.output
+        .filter((item): item is OpenAI.Responses.ResponseFunctionToolCall => item.type === 'function_call')
+        .map((item) => ({ id: item.call_id, name: item.name, argsJson: item.arguments }));
+      return {
+        text,
+        usage,
+        raw: res,
+        ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      };
     } catch (e) {
       wrapProviderError(e);
     }

@@ -26,9 +26,11 @@ const KERNEL_TABLES = [
   'files',
   'tasks',
   'deliveries',
+  'subagents',
 ] as const;
 
-/** 期望的迁移名（顺序敏感）。015_extensions_trust：第三方扩展信任确认列（ext-trust 工作包追加）。 */
+/** 期望的迁移名（顺序敏感）。015_extensions_trust：第三方扩展信任确认列（ext-trust 工作包追加）；
+ *  016_subagents：子代理表（subagents 工作包追加）。 */
 const EXPECTED_MIGRATION_NAMES = [
   '001_settings',
   '002_secrets',
@@ -45,6 +47,7 @@ const EXPECTED_MIGRATION_NAMES = [
   '013_tasks',
   '014_deliveries',
   '015_extensions_trust',
+  '016_subagents',
 ] as const;
 
 type RawRow = Record<string, unknown>;
@@ -136,7 +139,7 @@ describe('KERNEL_MIGRATIONS 清单', () => {
 });
 
 describe('up：全部迁移执行后', () => {
-  it('14 张内核表全部创建', async () => {
+  it('15 张内核表全部创建', async () => {
     expect(await userTables(db)).toEqual([...KERNEL_TABLES].sort());
   });
 
@@ -241,6 +244,38 @@ describe('up：全部迁移执行后', () => {
     expect(cols.get('ok')).toMatchObject({ type: 'INTEGER', notnull: 1 });
     expect(cols.get('created_at')).toMatchObject({ type: 'INTEGER', notnull: 1 });
     expect(await userIndexes(db)).toContain('deliveries_kind_created_at_index');
+  });
+
+  it('subagents：完整列序、id 主键、status 默认 running、parent_id/status 索引', async () => {
+    const cols = await tableColumns(db, 'subagents');
+    expect([...cols.keys()]).toEqual([
+      'id',
+      'parent_id',
+      'depth',
+      'model',
+      'system_prompt',
+      'prompt',
+      'tool_names',
+      'status',
+      'result',
+      'error',
+      'transcript',
+      'usage_in',
+      'usage_out',
+      'created_at',
+      'started_at',
+      'finished_at',
+    ]);
+    expect(cols.get('id')).toMatchObject({ type: 'TEXT', pk: 1 });
+    expect(cols.get('parent_id')).toMatchObject({ type: 'TEXT', notnull: 1 });
+    expect(cols.get('depth')).toMatchObject({ type: 'INTEGER', notnull: 1 });
+    expect(cols.get('prompt')).toMatchObject({ type: 'TEXT', notnull: 1 });
+    expect(cols.get('status')).toMatchObject({ type: 'TEXT', notnull: 1, dflt: "'running'" });
+    expect(cols.get('tool_names')).toMatchObject({ type: 'TEXT', notnull: 0 });
+    expect(cols.get('transcript')).toMatchObject({ type: 'TEXT', notnull: 0 });
+    expect(cols.get('usage_in')).toMatchObject({ type: 'INTEGER', notnull: 0 });
+    expect(await userIndexes(db)).toContain('subagents_parent_id_index');
+    expect(await userIndexes(db)).toContain('subagents_status_index');
   });
 });
 

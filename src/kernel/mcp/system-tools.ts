@@ -3,7 +3,7 @@
  *
  * 把 Harness OS 的全部系统操作暴露为标准 MCP 工具（按域前缀命名：
  * skills_ / cron_ / notifications_ / extensions_ / files_ / mcp_ / plugins_ /
- * logs_ / update_ / system_），供两类调用方复用：
+ * subagents_ / logs_ / update_ / system_），供两类调用方复用：
  * - 外部 LLM/系统：经 `/mcp` 端点（Streamable HTTP，见 system-server.ts）调用；
  * - 内部扩展：经 h.mcp 桥（serverId='system'，见 bridge.ts 的目录合并）调用。
  *
@@ -27,6 +27,7 @@ import type { Knex } from 'knex';
 import { z } from 'zod';
 
 import { CONTAINER_KEYS, type Kernel, type UpdaterFacade } from '../Kernel.js';
+import { SUBAGENT_STATUSES, SUBAGENT_TERMINAL_STATUSES } from '../agents/types.js';
 import { FACADE_CONTAINER_KEYS } from '../Facades.js';
 import type { HarnessConfig } from '../config/index.js';
 import type { CronJobRecord } from '../cron/scheduler.js';
@@ -58,6 +59,9 @@ export const SYSTEM_SERVER_ID = 'system';
 export interface SystemToolContext {
   /** 内核（容器 / config / logger 的懒解析根） */
   kernel: Kernel;
+  /** 调用方子代理审计信息（经 SubagentRunner 工具循环执行时由集成方附加） */
+  agentId?: string;
+  depth?: number;
   /** 升级器门面（update_check / update_history 用；Kernel 接线时注入） */
   updater: UpdaterFacade;
   /** cron 执行历史读取（cron_history 用；Kernel 接线时注入 cronStore.history 绑定） */
@@ -145,7 +149,86 @@ const notifyLevelSchema = z.enum(['info', 'success', 'warn', 'error']);
 const logLevelSchema = z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
 
 // ---------------------------------------------------------------------------
-// 工具目录（37 项；顺序即 tools/list 下发顺序，按域分组）
+// 子代理域（subagent_*）——委派机制的工具面
+// ---------------------------------------------------------------------------
+
+/**
+ * 子代理管理器的容器登记键候选（**容错延迟绑定**）。
+ *
+ * 子代理树形运行时落 `src/kernel/agents/`（SubagentManager，由 Kernel 装配登记）；
+ * 工具层只依赖下方 `SubagentManagerLike` 结构视图，调用期按候选键顺序解析首个已登记
+ * 实现。两个键均未登记时（子代理子系统未装配/未落盘）subagent_* 工具统一收敛为
+ * `{ok:false, error:{code:'HARNESS-9001'}}`（KERNEL_NOT_READY 语义），不影响其余域工具。
+ */
+export const SUBAGENT_MANAGER_CONTAINER_KEYS = ['subagents.manager', 'agents.manager'] as const;
+
+/** 子代理 prompt 上限：64KB（UTF-8 字节口径，与 agents/manager.ts 的 MAX_PROMPT_BYTES 一致；
+ * zod 层为字符数上限，execute 内再按字节精确校验） */
+const SUBAGENT_PROMPT_MAX_BYTES = 64 * 1024;
+
+/** subagent_result 的 wait 轮询：默认上限 120s、schema 上限 600s、轮询间隔 100ms
+ * （与 agents/manager.ts 的 DEFAULT_WAIT_FOR_TIMEOUT_MS / WAIT_FOR_POLL_MS 一致） */
+const SUBAGENT_WAIT_DEFAULT_MS = 120_000;
+const SUBAGENT_WAIT_MAX_MS = 600_000;
+const SUBAGENT_POLL_INTERVAL_MS = 100;
+
+/**
+ * 子代理管理器结构视图（src/kernel/agents/manager.ts 的契约面；工具层只依赖此形状）。
+ * - `spawn({parentId,prompt,systemPrompt?,model?,toolNames?,maxIterations?}) → record`；
+ * - `assertDirectParent(childId, callerId)`：树断言（跨代禁令落点）——subagent 的
+ *   transcript/result 读取仅限直接父（或 main）；兄弟/孙辈 → HARNESS-1007 FORBIDDEN；
+ * - `waitFor(id, timeoutMs?)`：轮询等待终态（超时抛 HARNESS-2001 RPC_TIMEOUT）；
+ * - record 归一形状 `{id, parentId, depth, status, result?, error?, usageIn, usageOut, transcript}`。
+ */
+interface SubagentManagerLike {
+  spawn(input: {
+    parentId: string;
+    prompt: string;
+    systemPrompt?: string;
+    model?: string;
+    toolNames?: string[];
+    maxIterations?: number;
+  }): Promise<Record<string, unknown>>;
+  cancel(id: string): Promise<unknown>;
+  get(id: string): Promise<Record<string, unknown> | null>;
+  list(filter?: { parentId?: string; status?: string }): Promise<unknown[]>;
+  assertDirectParent(childId: string, callerId: string): Promise<void>;
+}
+
+/** 容错延迟绑定：返回首个已登记的管理器实现；全部未登记 → undefined */
+function resolveSubagentManager(ctx: SystemToolContext): SubagentManagerLike | undefined {
+  for (const key of SUBAGENT_MANAGER_CONTAINER_KEYS) {
+    if (ctx.kernel.container.has(key)) {
+      return ctx.kernel.container.resolve<SubagentManagerLike>(key);
+    }
+  }
+  return undefined;
+}
+
+/** 管理器未登记时的统一失败形状（提示装配缺失，而非裸 TypeError/硬失败） */
+function subagentManagerMissing(): Record<string, unknown> {
+  return fail(
+    'HARNESS-9001',
+    'subagent manager is not registered in this kernel assembly (see SUBAGENT_MANAGER_CONTAINER_KEYS / src/kernel/agents/manager.ts)',
+  );
+}
+
+/** 子代理记录的 id 归一（契约字段 agentId；容忍缩写 id 的实现漂移） */
+function agentIdOf(record: Record<string, unknown>): string {
+  return String(record['agentId'] ?? record['id'] ?? '');
+}
+
+/** 是否终态：已知终态（done/failed/cancelled）即终态；未知状态按终态处理（避免未知枚举导致无限轮询） */
+function isTerminalSubagentStatus(status: unknown): boolean {
+  return typeof status !== 'string' || (SUBAGENT_TERMINAL_STATUSES as readonly string[]).includes(status);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// 工具目录（43 项；顺序即 tools/list 下发顺序，按域分组）
 // ---------------------------------------------------------------------------
 
 /**
@@ -867,6 +950,192 @@ export function createSystemTools(): SystemTool[] {
           const config = required<HarnessConfig>(ctx, CONTAINER_KEYS.config);
           const report = await runDoctor(config);
           return ok({ report });
+        }),
+    ),
+
+    // -------------------------------------------------------- subagents ----
+    // 子代理 MCP 工具面（LLM 驱动核心的**委派机制**）。树形运行时落
+    // src/kernel/agents/（SubagentManager/runner），本目录只做「参数校验 + 委派 +
+    // 结果归一」，经 ctx.kernel 容器按 SUBAGENT_MANAGER_CONTAINER_KEYS 容错延迟绑定。
+    //
+    // 安全（JSDoc 即契约）：
+    // - **全部以内核 admin 身份执行**（/mcp 门禁 root|admin 或 mcp:call scope、
+    //   h.mcp 的 mcp:client 权限在入口裁决，见 system-server.ts 信任模型）；
+    // - **树断言**：subagent 的 status/result/transcript 读取统一经
+    //   manager.assertDirectParent(agentId, 'main')——MCP 层调用方恒为主会话
+    //   （caller='main'：外部 LLM 经 /mcp、扩展经 h.mcp 到达皆同，管理器侧放行 main）；
+    //   非 main 调用方（一级子代理在其自身循环内读取时）由同一断言拒绝兄弟/孙辈
+    //   （HARNESS-1007 FORBIDDEN），本工具面忠实透传该拒绝；
+    // - **深度规则**：MCP 工具只能创建 depth=1（parentId 恒 'main'）——跨代语义不在
+    //   MCP 层表达；二级子代理由一级子代理在其自身循环内经 runner 下发的工具白名单
+    //   创建（manager 强制 maxDepth=2，depth 3 被拒）。
+    defineTool(
+      'subagent_spawn',
+      '派生一个子代理异步执行任务（立即返回 agentId 与 status；并发槽满时 status=queued 排队；MCP 层视为主会话委派，子代理固定挂在 main 之下，depth=1；模型缺省按 显式 model → subagents.defaultModel 设置 → 第一可用 provider 模型 解析）。',
+      {
+        prompt: z.string().min(1).max(SUBAGENT_PROMPT_MAX_BYTES),
+        systemPrompt: z.string().min(1).max(SUBAGENT_PROMPT_MAX_BYTES).optional(),
+        model: z.string().min(1).max(256).optional(),
+        toolNames: z.array(z.string().min(1).max(256)).max(64).optional(),
+        maxIterations: z.number().int().min(1).max(1000).optional(),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const manager = resolveSubagentManager(ctx);
+          if (manager === undefined) return subagentManagerMissing();
+          const prompt = String(args['prompt']);
+          // 字节精确校验（zod max 按 UTF-16 码元计，多字节字符可绕过，此处兜底 64KB）
+          const promptBytes = Buffer.byteLength(prompt, 'utf8');
+          if (promptBytes > SUBAGENT_PROMPT_MAX_BYTES) {
+            return fail('HARNESS-1005', `prompt exceeds ${SUBAGENT_PROMPT_MAX_BYTES} bytes`, {
+              bytes: promptBytes,
+              maxBytes: SUBAGENT_PROMPT_MAX_BYTES,
+            });
+          }
+          const record = await manager.spawn({
+            parentId: 'main', // MCP 层恒为主会话委派（depth=1；跨代由一级子代理在其自身循环内创建）
+            prompt,
+            ...(args['systemPrompt'] !== undefined ? { systemPrompt: String(args['systemPrompt']) } : {}),
+            ...(args['model'] !== undefined ? { model: String(args['model']) } : {}),
+            ...(args['toolNames'] !== undefined ? { toolNames: args['toolNames'] as string[] } : {}),
+            ...(args['maxIterations'] !== undefined ? { maxIterations: Number(args['maxIterations']) } : {}),
+          });
+          return ok({ agentId: agentIdOf(record), status: record['status'] ?? 'running', depth: record['depth'] ?? 1 });
+        }),
+    ),
+    defineTool(
+      'subagent_status',
+      '查询子代理当前状态（status、result?、error?、usage、transcript 进度；内容读取经树断言，兄弟/孙辈访问拒绝）。',
+      { agentId: z.string().min(1).max(128) },
+      (args, ctx) =>
+        guard(async () => {
+          const manager = resolveSubagentManager(ctx);
+          if (manager === undefined) return subagentManagerMissing();
+          const agentId = String(args['agentId']);
+          await manager.assertDirectParent(agentId, 'main'); // 树断言：caller 恒 'main'；不存在→3004，越权→1007
+          const record = await manager.get(agentId);
+          if (record === null) {
+            return fail('HARNESS-3004', `subagent "${agentId}" not found`, { agentId });
+          }
+          return ok({
+            agentId,
+            status: record['status'],
+            ...(record['result'] !== undefined && record['result'] !== null ? { result: record['result'] } : {}),
+            ...(record['error'] !== undefined && record['error'] !== null ? { error: record['error'] } : {}),
+            usage: { in: record['usageIn'] ?? null, out: record['usageOut'] ?? null },
+            iterations: typeof record['iterations'] === 'number' ? record['iterations'] : null,
+          });
+        }),
+    ),
+    defineTool(
+      'subagent_result',
+      '读取子代理最终结果（wait=true 时等待至终态再返回，最长 timeoutMs，缺省 120s；内容读取经树断言）。',
+      {
+        agentId: z.string().min(1).max(128),
+        wait: z.boolean().optional(),
+        timeoutMs: z.number().int().min(1).max(SUBAGENT_WAIT_MAX_MS).optional(),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const manager = resolveSubagentManager(ctx);
+          if (manager === undefined) return subagentManagerMissing();
+          const agentId = String(args['agentId']);
+          await manager.assertDirectParent(agentId, 'main'); // 树断言：不存在→3004，越权→1007
+          const timeoutMs =
+            typeof args['timeoutMs'] === 'number' ? args['timeoutMs'] : SUBAGENT_WAIT_DEFAULT_MS;
+          // 等待面优先委托 manager.waitFor（超时抛 HARNESS-2001 RPC_TIMEOUT，结构视图缺省时
+          // 回退本层轮询，行为一致）；wait=false 只读当前快照。
+          const withWait = manager as SubagentManagerLike & {
+            waitFor?: (id: string, timeoutMs?: number) => Promise<Record<string, unknown>>;
+          };
+          let record: Record<string, unknown> | null;
+          if (args['wait'] === true) {
+            if (typeof withWait.waitFor === 'function') {
+              record = await withWait.waitFor(agentId, timeoutMs);
+            } else {
+              // 回退轮询：与 manager.waitFor 同语义（超时 → HARNESS-2001，不存在 → HARNESS-3004）
+              const deadline = Date.now() + timeoutMs;
+              record = await manager.get(agentId);
+              while (record !== null && !isTerminalSubagentStatus(record['status'])) {
+                if (Date.now() >= deadline) {
+                  return fail(
+                    'HARNESS-2001',
+                    `subagent "${agentId}" did not reach a terminal state within ${timeoutMs}ms`,
+                    { agentId, status: record['status'], timeoutMs },
+                  );
+                }
+                await sleep(SUBAGENT_POLL_INTERVAL_MS);
+                record = await manager.get(agentId);
+              }
+            }
+          } else {
+            record = await manager.get(agentId);
+          }
+          if (record === null) {
+            return fail('HARNESS-3004', `subagent "${agentId}" not found`, { agentId });
+          }
+          return ok({
+            agentId,
+            status: record['status'],
+            ...(record['result'] !== undefined && record['result'] !== null ? { result: record['result'] } : {}),
+            ...(record['error'] !== undefined && record['error'] !== null ? { error: record['error'] } : {}),
+          });
+        }),
+    ),
+    defineTool(
+      'subagent_list',
+      '列出子代理（可按 parentId / status 过滤；树形可观测与审计用）。',
+      {
+        parentId: z.string().min(1).max(128).optional(),
+        status: z.enum(SUBAGENT_STATUSES).optional(),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const manager = resolveSubagentManager(ctx);
+          if (manager === undefined) return subagentManagerMissing();
+          const filter: { parentId?: string; status?: string } = {};
+          if (args['parentId'] !== undefined) filter.parentId = String(args['parentId']);
+          if (args['status'] !== undefined) filter.status = String(args['status']);
+          const agents = await manager.list(Object.keys(filter).length > 0 ? filter : undefined);
+          return ok({ agents, total: agents.length });
+        }),
+    ),
+    defineTool(
+      'subagent_cancel',
+      '取消子代理（queued/running → cancelled；终态幂等返回 cancelled=false；协作式中断 runner）。',
+      { agentId: z.string().min(1).max(128) },
+      (args, ctx) =>
+        guard(async () => {
+          const manager = resolveSubagentManager(ctx);
+          if (manager === undefined) return subagentManagerMissing();
+          const agentId = String(args['agentId']);
+          const cancelled = (await manager.cancel(agentId)) === true;
+          return ok({ agentId, cancelled });
+        }),
+    ),
+    defineTool(
+      'subagent_transcript',
+      '读取子代理完整消息轨迹 transcript（审计用；内容读取经树断言，兄弟/孙辈访问拒绝）。',
+      { agentId: z.string().min(1).max(128) },
+      (args, ctx) =>
+        guard(async () => {
+          const manager = resolveSubagentManager(ctx);
+          if (manager === undefined) return subagentManagerMissing();
+          const agentId = String(args['agentId']);
+          await manager.assertDirectParent(agentId, 'main'); // 树断言：不存在→3004，越权→1007
+          // transcript 读取面：优先 manager.transcript(agentId)（若实现提供）；
+          // 缺省回退 get(agentId) 记录上的 transcript 字段（容错延迟绑定，形状不变）。
+          const withTranscript = manager as SubagentManagerLike & {
+            transcript?: (id: string) => Promise<unknown>;
+          };
+          if (typeof withTranscript.transcript === 'function') {
+            return ok({ agentId, transcript: (await withTranscript.transcript(agentId)) ?? [] });
+          }
+          const record = await manager.get(agentId);
+          if (record === null) {
+            return fail('HARNESS-3004', `subagent "${agentId}" not found`, { agentId });
+          }
+          return ok({ agentId, transcript: record['transcript'] ?? [] });
         }),
     ),
   ];

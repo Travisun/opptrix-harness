@@ -43,8 +43,14 @@ import { registerFileRoutes } from '../../api/files.js';
 import { registerLlmRoutes } from '../../api/llm.js';
 import { registerMcpRoutes } from '../../api/mcp.js';
 import { registerNotificationRoutes } from '../../api/notifications.js';
+import { runAgentLoop, type AgentLoopToolRuntime } from '../agents/runner.js';
+import { SubagentManager } from '../agents/manager.js';
+import { SubagentStore } from '../agents/store.js';
+import { currentSystemRuntime, type SystemToolRuntime } from '../mcp/system-server.js';
+import { SYSTEM_TOOLS_CONTAINER_KEY } from '../mcp/system-tools.js';
 import { registerPluginRoutes } from '../../api/plugins.js';
 import { registerSkillRoutes } from '../../api/skills.js';
+import { registerSubagentRoutes } from '../../api/subagents.js';
 import { registerTaskRoutes } from '../../api/tasks.js';
 import { HOST_METHODS, KERNEL_TOPICS } from '../../extension-host/protocol.js';
 import type { ExtensionManager } from '../extensions/manager.js';
@@ -64,7 +70,7 @@ import type { EventBus } from '../events/bus.js';
 import type { HookManager } from '../hooks/manager.js';
 import { EVENT_NS } from '../hooks/points.js';
 import { LlmGateway } from '../llm/gateway.js';
-import type { LlmChatInput, LlmProviderConfig, LlmStreamEvent } from '../llm/types.js';
+import type { LlmChatInput, LlmProviderConfig, LlmStreamEvent, LlmChatResult } from '../llm/types.js';
 import { createMcpBridge, McpConfigStore, McpRegistry, MCP_CLIENT_PERMISSION } from '../mcp/index.js';
 import { NotificationStore, NotificationManager, createConsoleDriver, createWebhookDriver, inboxDriver } from '../notification/index.js';
 import { createEmailDriver } from '../notification/drivers/email.js';
@@ -352,6 +358,69 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     logger,
   });
   kernel.container.instance(CONTAINER_KEYS.llm, gateway);
+
+  // -------------------------------------------------------------------------
+  // agents —— LLM 子代理运行时（严格父子树；工具循环 = 系统 MCP 工具目录）
+  // -------------------------------------------------------------------------
+  // 系统工具运行时由 Kernel 在 /mcp 接线时创建并 attach（共享槽）；
+  // core-services 装配早于该时点，故此处只做懒解析（调用期必然已 attach）
+  const agentToolsRuntime: AgentLoopToolRuntime = {
+    listSchemas: () => {
+      const rt = currentSystemRuntime();
+      return rt ? rt.listTools().map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) : [];
+    },
+    execute: async (name: string, args: unknown, ctx: { agentId: string; depth: number }) => {
+      const rt = currentSystemRuntime();
+      if (rt === undefined) return { isError: true, error: 'system tool runtime is not attached yet' };
+      return rt.call(name, args ?? {}, { agentId: ctx.agentId, depth: ctx.depth });
+    },
+  };
+  const subagentStore = new SubagentStore(db);
+  const subagentManager = new SubagentManager({
+    store: subagentStore,
+    runner: async (input, onEvent) => {
+      // 模型解析链：显式 model → settings 'subagents.defaultModel' → 第一可用 provider 缺省模型
+      let model = input.model;
+      if (model === undefined || model === '') {
+        const configured = (await settings.get('subagents.defaultModel', '' as unknown)) as string;
+        if (typeof configured === 'string' && configured !== '') model = configured;
+      }
+      if (model === undefined || model === '') {
+        const providers = await gateway.getProviders();
+        model = providers.find((p) => p.models.length > 0)?.models[0];
+      }
+      const result = await runAgentLoop(
+        {
+          gateway: {
+            chat: (chatInput) =>
+              gateway.chat({ ...(chatInput as LlmChatInput), stream: false }) as Promise<LlmChatResult>,
+          },
+          tools: agentToolsRuntime satisfies AgentLoopToolRuntime,
+          logger,
+        },
+        {
+          agentId: input.agentId,
+          depth: input.depth,
+          systemPrompt: input.systemPrompt,
+          prompt: input.prompt,
+          model,
+          toolNames: input.toolNames,
+          maxIterations: input.maxIterations,
+          signal: input.signal,
+        },
+      );
+      await onEvent({
+        type: 'done',
+        result: result.finalText,
+        usageIn: result.usage.inputTokens,
+        usageOut: result.usage.outputTokens,
+        transcript: result.messages,
+      } as never);
+    },
+    notify: { send: (i) => notifyManager.send(i as never) },
+    logger,
+  });
+  kernel.container.instance('subagents.manager', subagentManager);
 
   /** gateway.chat(stream:true) 的同步生成器适配：解包 Promise 后 yield* 委派给协议 adapter 流 */
   async function* gatewayStream(input: LlmChatInput): AsyncGenerator<LlmStreamEvent, void, unknown> {
@@ -704,6 +773,7 @@ export function createCoreServices(kernel: Kernel): CoreServices {
       });
       registerChatRoutes(app, { checker, service: chatService, connectors: platformConnectors });
       registerTaskRoutes(app, { checker, manager: taskManager });
+      registerSubagentRoutes(app, { checker, manager: subagentManager });
       // LLM 网关 REST（/api/v1/llm/*）：providers 管理的持久化即 settings 读写；
       // secrets 注入使 PUT 支持 apiKey 明文 → 自动转存（键 'llm.<name>'）
       registerLlmRoutes(app, {

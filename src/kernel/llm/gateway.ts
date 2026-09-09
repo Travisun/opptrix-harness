@@ -35,6 +35,11 @@ const ADAPTERS: Readonly<Record<LlmProtocol, LlmAdapter>> = {
 export class LlmGateway {
   constructor(private readonly deps: LlmGatewayDeps) {}
 
+  /** 供应商配置目录（子代理/管理面的模型解析链用） */
+  getProviders(): Promise<LlmProviderConfig[]> {
+    return this.deps.getProviders();
+  }
+
   /** 按模型路由执行一次对话；stream=true 时返回流事件迭代器（首个事件在首次 next 时产生） */
   async chat(input: LlmChatInput): Promise<LlmChatResult | AsyncGenerator<LlmStreamEvent>> {
     const providers = await this.deps.getProviders();

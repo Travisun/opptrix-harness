@@ -308,6 +308,36 @@ const m015ExtensionsTrust: Migration = {
   },
 };
 
+/** 016 — subagents：子代理记录（严格父子树；prompt/tool_names/transcript 为 TEXT，JSON 字符串）。 */
+const m016Subagents: Migration = {
+  name: '016_subagents',
+  up: async (knex: Knex): Promise<void> => {
+    await knex.schema.createTable('subagents', (t) => {
+      t.text('id').primary();
+      t.text('parent_id').notNullable(); // 'main' = 主会话；否则为父 subagent id
+      t.integer('depth').notNullable(); // 树深度：main 直接子代 = 1
+      t.text('model'); // 模型标识（可空 = 用 LLM 网关默认）
+      t.text('system_prompt'); // 系统提示词（可空）
+      t.text('prompt').notNullable(); // 任务提示词
+      t.text('tool_names'); // JSON 字符串（工具白名单数组）
+      t.text('status').notNullable().defaultTo('running'); // queued | running | done | failed | cancelled
+      t.text('result'); // 最终结果文本
+      t.text('error'); // 失败原因
+      t.text('transcript'); // JSON 字符串（消息数组）
+      t.integer('usage_in'); // 输入 token 用量
+      t.integer('usage_out'); // 输出 token 用量
+      t.integer('created_at'); // UTC epoch ms
+      t.integer('started_at'); // UTC epoch ms
+      t.integer('finished_at'); // UTC epoch ms
+      t.index(['parent_id'], 'subagents_parent_id_index');
+      t.index(['status'], 'subagents_status_index');
+    });
+  },
+  down: async (knex: Knex): Promise<void> => {
+    await knex.schema.dropTableIfExists('subagents');
+  },
+};
+
 /** 内核全部迁移（按版本号升序执行；回滚时逆序）。 */
 export const KERNEL_MIGRATIONS: Migration[] = [
   m001Settings,
@@ -325,4 +355,5 @@ export const KERNEL_MIGRATIONS: Migration[] = [
   m013Tasks,
   m014Deliveries,
   m015ExtensionsTrust,
+  m016Subagents,
 ];

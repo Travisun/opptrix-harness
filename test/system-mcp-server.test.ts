@@ -29,6 +29,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 process.env['HARNESS_WORKER_MODE'] = 'dev';
 
 import { KERNEL_TOPICS } from '../src/extension-host/protocol.js';
+import { SUBAGENT_MANAGER_CONTAINER_KEYS, createSystemTools, type SystemToolContext } from '../src/kernel/mcp/system-tools.js';
+import { HarnessError } from '../src/kernel/errors/HarnessError.js';
 import { CONTAINER_KEYS, Kernel } from '../src/kernel/Kernel.js';
 import { loadConfig } from '../src/kernel/config/index.js';
 import { createMcpBridge } from '../src/kernel/mcp/bridge.js';
@@ -524,5 +526,310 @@ describe('h.mcp 桥合并：serverId=system 的目录合并与路由', () => {
     expect(runtime.size).toBeGreaterThanOrEqual(30);
     expect(runtime.listTools().length).toBe(runtime.size);
     expect(currentSystemRuntime()?.size).toBe(runtime.size);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// subagent_* 系统工具（追加域；桩 SubagentManager 验证委派/等待/树断言语义）
+// ---------------------------------------------------------------------------
+
+describe('subagent_* 系统工具（桩 SubagentManager：容错延迟绑定）', () => {
+  /** 结构对齐 src/kernel/agents/manager.ts 契约面的桩记录（SubagentRecord 形状） */
+  type StubRecord = {
+    id: string;
+    parentId: string;
+    depth: number;
+    status: string;
+    result: string | null;
+    error: string | null;
+    usageIn: number | null;
+    usageOut: number | null;
+    transcript: unknown[] | null;
+  };
+
+  const doneRecord: StubRecord = {
+    id: 'sa-stub-1',
+    parentId: 'main',
+    depth: 1,
+    status: 'done',
+    result: 'sub-agent final answer',
+    error: null,
+    usageIn: 11,
+    usageOut: 7,
+    transcript: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'sub-agent final answer' }],
+  };
+
+  /** 桩管理器：每个用例按需重写 mock 实现（beforeAll 登记进容器，容错延迟绑定键） */
+  const subagentStub = {
+    spawn: vi.fn(async (input: Record<string, unknown>) => ({
+      id: 'sa-stub-1',
+      parentId: input['parentId'],
+      depth: 1,
+      status: 'running',
+      prompt: input['prompt'],
+      model: input['model'] ?? null,
+      result: null,
+      error: null,
+      usageIn: null,
+      usageOut: null,
+      transcript: null,
+    })),
+    cancel: vi.fn(async (_id: string) => true),
+    get: vi.fn(async (id: string): Promise<StubRecord | null> =>
+      id === 'sa-stub-1' ? doneRecord : id === 'sa-stub-running' ? { ...doneRecord, id, status: 'running', result: null } : null,
+    ),
+    list: vi.fn(async (filter?: { parentId?: string; status?: string }) =>
+      [doneRecord, { ...doneRecord, id: 'sa-child-2', parentId: 'sa-stub-1', depth: 2, status: 'running' }].filter(
+        (r) =>
+          (filter?.parentId === undefined || r.parentId === filter.parentId) &&
+          (filter?.status === undefined || r.status === filter.status),
+      ),
+    ),
+    assertDirectParent: vi.fn(async (_childId: string, _callerId: string) => {}),
+    waitFor: vi.fn(async (id: string, timeoutMs?: number): Promise<StubRecord> => {
+      const rec = await subagentStub.get(id);
+      if (rec === null) {
+        throw new HarnessError('EXT_NOT_FOUND', { message: `subagent "${id}" not found` });
+      }
+      if (!['done', 'failed', 'cancelled'].includes(rec.status)) {
+        throw new HarnessError('RPC_TIMEOUT', {
+          message: `waitFor: subagent "${id}" did not reach a terminal state within ${timeoutMs}ms`,
+          detail: { id, timeoutMs, status: rec.status },
+        });
+      }
+      return rec;
+    }),
+  };
+
+  beforeAll(() => {
+    // 容错延迟绑定：桩登记在首选键上（真实 Kernel 接线后同键注册会被此处覆盖，仅影响本文件用例）
+    kernel.container.instance(SUBAGENT_MANAGER_CONTAINER_KEYS[0], subagentStub);
+  });
+
+  it('容错延迟绑定：管理器未登记 → ok:false HARNESS-9001（目录单元面，不硬失败）', async () => {
+    const tool = createSystemTools().find((t) => t.name === 'subagent_spawn');
+    expect(tool).toBeDefined();
+    const result = await tool!.execute(
+      { prompt: 'p' },
+      { kernel: { container: { has: () => false, resolve: () => undefined } } } as unknown as SystemToolContext,
+    );
+    expect(result['ok']).toBe(false);
+    expect((result['error'] as Record<string, unknown>)['code']).toBe('HARNESS-9001');
+  });
+
+  it('tools/list：含全部 6 个 subagent_* 工具（≥5，含非空中文描述与 object schema）', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      const listed = await client.listTools();
+      const names = new Set(listed.tools.map((t) => t.name));
+      for (const required of [
+        'subagent_spawn',
+        'subagent_status',
+        'subagent_result',
+        'subagent_list',
+        'subagent_cancel',
+        'subagent_transcript',
+      ]) {
+        expect(names.has(required)).toBe(true);
+      }
+      const subTools = listed.tools.filter((t) => t.name.startsWith('subagent_'));
+      expect(subTools.length).toBeGreaterThanOrEqual(5);
+      expect(subTools.every((t) => typeof t.description === 'string' && t.description.length > 0)).toBe(true);
+      expect(subTools.every((t) => (t.inputSchema as { type?: string }).type === 'object')).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('subagent_spawn：桩收到 parentId=main（depth=1 委派语义）与可选参透传 → {agentId,status}', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      subagentStub.spawn.mockClear();
+      const spawned = await callSystem(client, 'subagent_spawn', {
+        prompt: '调研子代理树形委派机制',
+        systemPrompt: 'be concise',
+        model: 'stub-model-x',
+        toolNames: ['skills_list', 'files_list'],
+        maxIterations: 5,
+      });
+      expect(spawned['ok']).toBe(true);
+      expect(spawned['agentId']).toBe('sa-stub-1');
+      expect(spawned['status']).toBe('running');
+      expect(spawned['depth']).toBe(1);
+      // MCP 层视为主会话：parentId 恒 'main'（depth=1）；可选参原样透传给管理器
+      expect(subagentStub.spawn).toHaveBeenCalledTimes(1);
+      expect(subagentStub.spawn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          parentId: 'main',
+          prompt: '调研子代理树形委派机制',
+          systemPrompt: 'be concise',
+          model: 'stub-model-x',
+          toolNames: ['skills_list', 'files_list'],
+          maxIterations: 5,
+        }),
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('subagent_spawn：prompt 超 64KB（字节口径）→ HARNESS-1005；缺 prompt → schema 拒绝 isError', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      // 40000 个多字节字符 = 120000 UTF-8 字节 > 65536（zod 字符上限 65536 之内，命中字节精确校验）
+      const tooBig = await callSystem(client, 'subagent_spawn', { prompt: '好'.repeat(40_000) });
+      expect(tooBig['ok']).toBe(false);
+      expect((tooBig['error'] as Record<string, unknown>)['code']).toBe('HARNESS-1005');
+
+      const missing = (await client.callTool({ name: 'subagent_spawn', arguments: {} })) as { isError?: boolean };
+      expect(missing.isError).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('subagent_status：树断言以 (agentId, main) 调用并归一透传字段；缺 agent → HARNESS-3004', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      subagentStub.assertDirectParent.mockClear();
+      const status = await callSystem(client, 'subagent_status', { agentId: 'sa-stub-1' });
+      expect(status['ok']).toBe(true);
+      expect(status['status']).toBe('done');
+      expect(status['result']).toBe('sub-agent final answer');
+      expect(status['usage']).toEqual({ in: 11, out: 7 });
+      // 树断言调用形状：childId 在前、caller（主会话恒 'main'）在后
+      expect(subagentStub.assertDirectParent).toHaveBeenCalledWith('sa-stub-1', 'main');
+
+      const missing = await callSystem(client, 'subagent_status', { agentId: 'sa-nope' });
+      expect(missing['ok']).toBe(false);
+      expect((missing['error'] as Record<string, unknown>)['code']).toBe('HARNESS-3004');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('subagent_result：wait=false 立即返回快照（running 无 result）；wait=true 委托 waitFor 至终态', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      const snapshot = await callSystem(client, 'subagent_result', { agentId: 'sa-stub-running' });
+      expect(snapshot['ok']).toBe(true);
+      expect(snapshot['status']).toBe('running');
+      expect(snapshot).not.toHaveProperty('result');
+
+      subagentStub.waitFor.mockClear();
+      const final = await callSystem(client, 'subagent_result', { agentId: 'sa-stub-1', wait: true, timeoutMs: 5_000 });
+      expect(final['ok']).toBe(true);
+      expect(final['status']).toBe('done');
+      expect(final['result']).toBe('sub-agent final answer');
+      expect(subagentStub.waitFor).toHaveBeenCalledWith('sa-stub-1', 5_000);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('subagent_result：wait=true 超时未达终态 → ok:false HARNESS-2001（透传管理器 RPC_TIMEOUT）', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      const timedOut = await callSystem(client, 'subagent_result', {
+        agentId: 'sa-stub-running',
+        wait: true,
+        timeoutMs: 300,
+      });
+      expect(timedOut['ok']).toBe(false);
+      expect((timedOut['error'] as Record<string, unknown>)['code']).toBe('HARNESS-2001');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('跨代/兄弟读取拒绝：树断言抛 FORBIDDEN → status/result/transcript 三面透传 HARNESS-1007', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      subagentStub.assertDirectParent.mockImplementationOnce(async () => {
+        throw new HarnessError('FORBIDDEN', {
+          message: 'cross-generation or sibling access is not allowed (strict parent-child tree)',
+          detail: { childId: 'sa-child-2', callerId: 'main' },
+        });
+      });
+      subagentStub.assertDirectParent.mockImplementationOnce(async () => {
+        throw new HarnessError('FORBIDDEN', { message: 'forbidden' });
+      });
+      subagentStub.assertDirectParent.mockImplementationOnce(async () => {
+        throw new HarnessError('FORBIDDEN', { message: 'forbidden' });
+      });
+
+      for (const tool of ['subagent_status', 'subagent_result', 'subagent_transcript']) {
+        const denied = await callSystem(client, tool, { agentId: 'sa-child-2' });
+        expect(denied['ok']).toBe(false);
+        expect((denied['error'] as Record<string, unknown>)['code']).toBe('HARNESS-1007');
+      }
+      // 工具层不绕过树断言：拒绝发生时管理器读取面零调用
+      expect(subagentStub.get).not.toHaveBeenCalledWith('sa-child-2');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('subagent_list 过滤透传 / subagent_cancel 幂等返回 / subagent_transcript 审计读取', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      subagentStub.list.mockClear();
+      const listed = await callSystem(client, 'subagent_list', { parentId: 'main', status: 'done' });
+      expect(listed['ok']).toBe(true);
+      expect(subagentStub.list).toHaveBeenCalledWith({ parentId: 'main', status: 'done' });
+      expect(listed['total']).toBe(1);
+      expect((listed['agents'] as Array<Record<string, unknown>>)[0]['id']).toBe('sa-stub-1');
+
+      subagentStub.cancel.mockReset().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+      const cancelled = await callSystem(client, 'subagent_cancel', { agentId: 'sa-stub-running' });
+      expect(cancelled['ok']).toBe(true);
+      expect(cancelled['cancelled']).toBe(true);
+      const idempotent = await callSystem(client, 'subagent_cancel', { agentId: 'sa-stub-running' });
+      expect(idempotent['ok']).toBe(true);
+      expect(idempotent['cancelled']).toBe(false); // 终态幂等：确无取消发生
+
+      const traced = await callSystem(client, 'subagent_transcript', { agentId: 'sa-stub-1' });
+      expect(traced['ok']).toBe(true);
+      expect(Array.isArray(traced['transcript'])).toBe(true);
+      expect((traced['transcript'] as unknown[]).length).toBe(2);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('容错面补充：桩缺 waitFor → 本层回退轮询至终态；桩提供 transcript 方法 → 优先方法读取', async () => {
+    const client = await connectClient(rootToken);
+    try {
+      // 摘除 waitFor（模拟结构视图缺省的延迟绑定实现）：get 先 running 后 done，
+      // 覆盖 subagent_result 的本层轮询回退（与 manager.waitFor 同语义）
+      const withoutWait: Partial<typeof subagentStub> = { ...subagentStub };
+      delete withoutWait.waitFor;
+      kernel.container.instance(SUBAGENT_MANAGER_CONTAINER_KEYS[0], withoutWait);
+      let polls = 0;
+      subagentStub.get.mockImplementation(async (id: string) => {
+        polls += 1;
+        return polls === 1
+          ? { ...doneRecord, id, status: 'running', result: null }
+          : { ...doneRecord, id };
+      });
+      const polled = await callSystem(client, 'subagent_result', { agentId: 'sa-stub-1', wait: true, timeoutMs: 2_000 });
+      expect(polled['ok']).toBe(true);
+      expect(polled['status']).toBe('done');
+      expect(polled['result']).toBe('sub-agent final answer');
+      expect(polls).toBeGreaterThanOrEqual(2);
+
+      // transcript 可选方法面：管理器实现提供 transcript(id) 时优先走方法（而非记录字段）
+      (withoutWait as Record<string, unknown>)['transcript'] = async (id: string) => [{ role: 'user', content: id }];
+      const traced = await callSystem(client, 'subagent_transcript', { agentId: 'sa-stub-1' });
+      expect(traced['ok']).toBe(true);
+      expect(traced['transcript']).toEqual([{ role: 'user', content: 'sa-stub-1' }]);
+    } finally {
+      // 还原完整桩与 get 基线实现（mock 实现跨用例存续）
+      subagentStub.get.mockImplementation(async (id: string) =>
+        id === 'sa-stub-1' ? doneRecord : id === 'sa-stub-running' ? { ...doneRecord, id, status: 'running', result: null } : null,
+      );
+      kernel.container.instance(SUBAGENT_MANAGER_CONTAINER_KEYS[0], subagentStub);
+      await client.close();
+    }
   });
 });

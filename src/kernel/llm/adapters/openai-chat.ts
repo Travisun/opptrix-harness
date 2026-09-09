@@ -3,6 +3,8 @@
  *
  * - 消息互转：system/user/assistant 直传；tool 消息 ↔ `role:'tool'`（tool_call_id），
  *   assistant 富形状 toolCalls ↔ `tool_calls`（type:function）。
+ * - 非流式：`choices[0].message.tool_calls`（type:function）→ `LlmChatResult.toolCalls`
+ *   结构化提取（id/name/argsJson）；流式仍以 `tool_call_delta` 增量透传。
  * - 流式：`stream_options:{ include_usage: true }` 保证最后一个 chunk 携带 usage；
  *   工具调用增量以 `tool_call_delta` 透传（index 取自 chunk 内声明）。
  * - 超时：client `timeout` + 每请求 `AbortSignal.timeout(timeoutMs)` 双保险。
@@ -21,6 +23,7 @@ import {
   type LlmChatResult,
   type LlmMessage,
   type LlmProviderConfig,
+  type LlmResultToolCall,
   type LlmStreamEvent,
 } from '../types.js';
 
@@ -89,7 +92,16 @@ export const openaiChatAdapter: LlmAdapter = {
       const usage = res.usage
         ? { inputTokens: res.usage.prompt_tokens, outputTokens: res.usage.completion_tokens }
         : undefined;
-      return { text: res.choices[0]?.message.content ?? '', usage, raw: res };
+      // 结构化工具调用提取（function 类型；custom 等其他类型不在 harness 工具规约内，跳过）
+      const toolCalls: LlmResultToolCall[] = (res.choices[0]?.message.tool_calls ?? [])
+        .filter((tc): tc is OpenAI.Chat.ChatCompletionMessageFunctionToolCall => tc.type === 'function')
+        .map((tc) => ({ id: tc.id, name: tc.function.name, argsJson: tc.function.arguments }));
+      return {
+        text: res.choices[0]?.message.content ?? '',
+        usage,
+        raw: res,
+        ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      };
     } catch (e) {
       wrapProviderError(e);
     }
