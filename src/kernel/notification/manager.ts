@@ -7,6 +7,7 @@
  * 3. 生成 uuid → persist（channels 字段落"本次投递计划"JSON，secret 类字段脱敏为 '***'）；
  * 4. publish('notifications', 'notification.created', record)（SSE 实时推送，入库即 inbox）；
  * 5. 对投递计划逐个投递：registry.getNotificationDriver → deliver(payload, target)。
+<<<<<<< Updated upstream
  *    投递计划 = 显式传入的 input.channels（优先）；未显式传入且注入了 getRoutes 时，
  *    读取默认路由规则（settings 'notify.routes'）按 level 匹配追加 channels。
  *    投递统一走指数退避重试（retry.ts 的 withDeliveryRetry）：口径按
@@ -14,6 +15,15 @@
  *    每驱动缺省表——webhook 3 次 500ms/1s/2s、email 2 次 2s/4s、其余不重试）；
  *    VALIDATION_FAILED 等不可重试错误（HarnessError.retryable=false）立即抛出不重试。
  *    单渠道失败**不抛出**：logger.error 记录 + 失败计数，deliver 前后计 duration（含重试）；
+=======
+ *    投递计划 = 显式传入的 input.channels（优先）；未显式传入时先读默认路由规则
+ *    （settings 'notify.routes'，经 deps.getRoutes 注入）按 level 匹配追加 channels；
+ *    路由也没有配置（未注入/无命中/读取失败）且注入了 deps.getChannelConfigs 时，
+ *    自动回落为**全部启用的渠道配置**（多渠道管理：settings 'notify.channelConfigs'
+ *    里 enabled=true 的 webhook/email/console 实例，driver=type、target=配置原值）——
+ *    用户创建多个 webhook/email 后，所有通知自动分发到全部启用渠道。
+ *    单渠道失败**不抛出**：logger.error 记录 + 失败计数，deliver 前后计 duration；
+>>>>>>> Stashed changes
  *    未知驱动名同样跳过不抛；
  * 6. 每渠道结果经可选的 deps.recordDelivery 回调落投递流水（集成方写 deliveries 表，
  *    kind='notification'，target 脱敏摘要；同 chat 桥 DeliveryRecord 形状），随后把
@@ -37,6 +47,7 @@ import type { Logger } from 'pino';
 import { z } from 'zod';
 
 import { HOOK_POINTS } from '../hooks/index.js';
+<<<<<<< Updated upstream
 import {
   normalizeRetryOverride,
   resolveChannelRetry,
@@ -44,6 +55,10 @@ import {
   type DeliveryRetryConfig,
   type SleepFn,
 } from './retry.js';
+=======
+import type { NotificationChannelConfig } from './channel-store.js';
+import { parseChannelConfigs } from './channel-store.js';
+>>>>>>> Stashed changes
 import type { NotificationRecord, NotificationStore } from './store.js';
 
 /** notification 域 hook 埋点（收编进 HOOK_POINTS 前的本地单一事实来源） */
@@ -122,6 +137,7 @@ export interface NotificationManagerDeps {
    */
   getRoutes?: () => Promise<unknown>;
   /**
+<<<<<<< Updated upstream
    * 重试口径覆盖读取器（可选；集成方接 settings('notify.retry')）。返回值经
    * normalizeRetryOverride 校验：形状 {retries, baseMs} 合法即整体替代每驱动缺省
    * 口径（见 retry.ts）；未注入/读取失败/形状非法均回落默认，仅 warn 不阻断。
@@ -138,6 +154,15 @@ export interface NotificationManagerDeps {
    * 记录器即可断言退避序列而无需真实等待。
    */
   sleep?: SleepFn;
+=======
+   * 渠道实例配置读取器（可选；集成方接 NotificationChannelStore.list()，settings
+   * 'notify.channelConfigs'）。多渠道管理回落计划的数据源：send 未显式传入 channels
+   * 且路由规则未命中任何投递渠道时，自动投递到**全部 enabled=true** 的渠道实例
+   * （driver=type、target=配置原值，逐条经 parseChannelConfigs 校验、非法条目跳过）。
+   * 读取失败/形状非法仅 warn 不阻断（通知照常入库）。
+   */
+  getChannelConfigs?: () => Promise<NotificationChannelConfig[]>;
+>>>>>>> Stashed changes
 }
 
 /** send() 入参 */
@@ -293,10 +318,14 @@ export class NotificationManager {
       };
     }
 
-    // 3. 投递计划：显式传入的 channels 优先；未显式传入且注入了 getRoutes 时
-    //    读默认路由规则按 level 匹配（规则读取失败/非法仅 warn，不阻断创建）
-    const plan =
-      parsed.data.channels ?? (await this.#routedChannelsFor(value.level));
+    // 3. 投递计划：显式传入的 channels 优先；未显式传入时先读默认路由规则按
+    //    level 匹配（规则读取失败/非法仅 warn）；路由未命中任何渠道且注入了
+    //    getChannelConfigs 时，回落为全部启用的渠道实例（多渠道自动分发）
+    let plan = parsed.data.channels;
+    if (plan === undefined) {
+      plan = await this.#routedChannelsFor(value.level);
+      if (plan.length === 0) plan = await this.#enabledChannelPlan();
+    }
 
     // 4. persist：channels 字段落"本次投递计划"（secret 类字段脱敏；驱动仍收原始 target）
     const record: NotificationRecord = {
@@ -464,5 +493,32 @@ export class NotificationManager {
       plan.push(...rule.channels);
     }
     return plan;
+  }
+
+  /**
+   * 多渠道回落计划：读 deps.getChannelConfigs()（NotificationChannelStore.list()），
+   * 取全部 enabled=true 的渠道实例 → { driver: type, target }。逐条经
+   * parseChannelConfigs 校验（非法条目跳过并 warn）；读取失败 warn + 返回 []
+   * （通知照常入库，只是不外发）。
+   */
+  async #enabledChannelPlan(): Promise<NotificationChannel[]> {
+    const getChannelConfigs = this.deps.getChannelConfigs;
+    if (getChannelConfigs === undefined) return [];
+    let raw: NotificationChannelConfig[];
+    try {
+      raw = await getChannelConfigs();
+    } catch (e) {
+      this.deps.logger.warn({ err: e }, '[notification] channel configs read failed, fallback plan skipped');
+      return [];
+    }
+    const valid = parseChannelConfigs(raw);
+    const configs = valid.filter((c) => c.enabled);
+    if (valid.length < raw.length) {
+      this.deps.logger.warn(
+        { total: raw.length, valid: valid.length },
+        '[notification] some channel configs invalid, skipped from fallback plan',
+      );
+    }
+    return configs.map((c) => ({ driver: c.type, target: c.target }));
   }
 }
