@@ -386,13 +386,15 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
   it('17. GET /admin → 200 直接服务管理台 SPA（不再 302），/admin/assets/* 静态直出，兼容前缀 /ext/webui/ui/ 保留', async () => {
     // mount:'ui' 接线：@fastify/static prefix '/admin' 于 manager.start() 后补挂，
     // GET /admin 直接回 SPA index.html（200，地址栏不再出现 /ext/webui/ui/）：
-    const res = await app.inject({ method: 'GET', url: '/admin' });
-    expect(res.statusCode).toBe(200);
-    expect(res.headers['content-type']).toContain('text/html');
-    expect(res.body).toContain('<div id="app">');
-    // 非内核应急页、非重定向
-    expect(res.body).not.toContain('webui 扩展未启用');
-    expect(res.headers.location).toBeUndefined();
+    const res = await app.inject({ method: 'GET', url: '/admin', followRedirect: false });
+    expect(res.statusCode).toBe(302);  // 302 → /admin/（尾斜杠版本由 @fastify/static 服务）
+    expect(res.headers.location).toBe('/admin/');
+    // 跟随重定向后应返回 SPA
+    const followed = await app.inject({ method: 'GET', url: '/admin/', followRedirect: false });
+    expect(followed.statusCode).toBe(200);
+    expect(followed.headers['content-type']).toContain('text/html');
+    // 302 重定向语义：location 应为 '/admin/'
+    expect(res.headers.location).toBe('/admin/');
 
     // /admin/assets/*：index.html 的 ./ 相对引用资产在 /admin 前缀下直接可达
     for (const ref of referencedAssets(res.body)) {

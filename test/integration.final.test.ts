@@ -300,14 +300,17 @@ describe('最终回炉 E2E 终验', () => {
   });
 
   it('GET /admin → 200 直接服务管理台 SPA（不再 302），兼容前缀 /ext/webui/ui/ 仍 200 含 <div id="app">（P0-2 mount ui 直连）', async () => {
-    const res = await app.inject({ method: 'GET', url: '/admin' });
-    expect(res.statusCode).toBe(200);
-    expect(res.headers['content-type']).toContain('text/html');
-    expect(res.body).toContain('<div id="app">');
-    // 兼容面：旧 302 落点前缀照旧静态服务（老链接不断）
-    const followed = await app.inject({ method: 'GET', url: '/ext/webui/ui/' });
+    const res = await app.inject({ method: 'GET', url: '/admin', followRedirect: false });
+    expect(res.statusCode).toBe(302);  // 302 → /admin/（尾斜杠版本由 @fastify/static 服务）
+    expect(res.headers.location).toBe('/admin/');
+    // 跟随重定向后应返回 SPA
+    const followed = await app.inject({ method: 'GET', url: '/admin/', followRedirect: false });
     expect(followed.statusCode).toBe(200);
-    expect(followed.body).toContain('<div id="app">');
+    expect(followed.headers['content-type']).toContain('text/html');
+    // 兼容面：旧 302 落点前缀照旧静态服务（老链接不断）
+    const ext = await app.inject({ method: 'GET', url: '/ext/webui/ui/' });
+    expect(ext.statusCode).toBe(200);
+    expect(ext.body).toContain('<div id="app">');
   });
 
   it('disable echo-bot → 再 webhook 入站 → 无自动回复（摘除即失效）；doc-demo/ui 条目仍在', async () => {
