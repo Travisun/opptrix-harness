@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   PackageOpenIcon,
+  PlusIcon,
   RefreshCwIcon,
   SearchIcon,
   ShieldCheckIcon,
@@ -15,6 +16,8 @@ import { toast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { EmptyState, errText, isApiError, isAdminRole, useMe } from '@/pages/_shared';
+import { CreateSkillDialog } from '@/pages/Skills/CreateSkillDialog';
+import { DeleteSkillDialog } from '@/pages/Skills/DeleteSkillDialog';
 import { SkillCard } from '@/pages/Skills/SkillCard';
 import { SkillDetailSheet } from '@/pages/Skills/SkillDetailSheet';
 import {
@@ -30,10 +33,14 @@ import {
  *
  * - GET  /api/v1/skills        列表（一次性返回，数据量小 → 前端过滤，不含正文）；
  * - GET  /api/v1/skills/:id    详情（含正文 body；点卡片经 Sheet 惰性拉取）；
+ * - POST /api/v1/skills        新建技能（admin/root；「新建技能」弹窗，写数据卷后
+ *                              内核自动 refresh → 成功后重载列表）；
+ * - DELETE /api/v1/skills/:id  删除技能（admin/root；仅数据卷来源，卡片行操作 +
+ *                              confirm 弹窗；builtin/extension 来源隐藏删除）；
  * - POST /api/v1/skills/refresh 重扫技能库（admin/root；403 → 隐藏按钮并提示）。
  *
- * 工具条：刷新（重扫 + 重载列表）+ 来源 Select（全部/内置/数据卷/扩展）+
- * 标签 Select（从数据聚合）+ 搜索框（前端过滤 name/description）。
+ * 工具条：新建技能（admin）+ 刷新（重扫 + 重载列表）+ 来源 Select（全部/内置/
+ * 数据卷/扩展）+ 标签 Select（从数据聚合）+ 搜索框（前端过滤 name/description）。
  * 顶部计数与 refresh 的 bySource 同源（对同一份 entries 聚合）。
  */
 
@@ -55,10 +62,15 @@ export default function SkillsPage(): React.ReactNode {
   const [search, setSearch] = useState('');
   /** 详情抽屉目标（列表条目即时呈现元信息，正文由 Sheet 内部拉取） */
   const [detailTarget, setDetailTarget] = useState<SkillEntryView | null>(null);
+  /** 「新建技能」弹窗开关（admin） */
+  const [createOpen, setCreateOpen] = useState(false);
+  /** 删除确认弹窗目标（null = 关闭；仅数据卷来源可删） */
+  const [deleteTarget, setDeleteTarget] = useState<SkillEntryView | null>(null);
 
-  /** 角色：refresh 要求 admin/root（与内核 requireAdmin 对齐） */
+  /** 角色：refresh/新建/删除要求 admin/root（与内核 requireAdmin 对齐） */
   const { me, loading: meLoading } = useMe();
   const rescanBlocked = forbidden || (me !== null && !isAdminRole(me.role));
+  const canManage = me !== null && isAdminRole(me.role);
 
   const load = useCallback(async (): Promise<void> => {
     setError(null);
@@ -135,10 +147,16 @@ export default function SkillsPage(): React.ReactNode {
           <p className="text-muted-foreground text-sm">Agent Skills 技能库：提示词包的发现、查看与刷新。</p>
         </div>
         <div className="flex items-center gap-2">
+          {canManage && (
+            <Button size="sm" onClick={() => setCreateOpen(true)}>
+              <PlusIcon aria-hidden />
+              新建技能
+            </Button>
+          )}
           {rescanBlocked ? (
             <span
               className="text-muted-foreground inline-flex items-center gap-1.5 text-xs"
-              title="POST /api/v1/skills/refresh requires role admin or root"
+              title="skills write requires role admin or root"
             >
               <ShieldCheckIcon className="size-3.5" aria-hidden />
               重扫技能库需要 admin / root 角色
@@ -269,13 +287,25 @@ export default function SkillsPage(): React.ReactNode {
       {!loading && error === null && filtered.length > 0 && (
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {filtered.map((skill) => (
-            <SkillCard key={skill.id} skill={skill} onOpen={() => setDetailTarget(skill)} />
+            <SkillCard
+              key={skill.id}
+              skill={skill}
+              onOpen={() => setDetailTarget(skill)}
+              // 行操作「删除」：仅数据卷来源 + admin（builtin 只读、extension 驻留内存，均不可删）
+              onDelete={canManage && skill.source === 'data' ? () => setDeleteTarget(skill) : undefined}
+            />
           ))}
         </div>
       )}
 
       {/* 详情抽屉 */}
       <SkillDetailSheet skill={detailTarget} onOpenChange={(open) => !open && setDetailTarget(null)} />
+
+      {/* 新建技能（admin；POST 成功后内核已 refresh → 直接重载列表） */}
+      <CreateSkillDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={() => void load()} />
+
+      {/* 删除确认（admin；仅数据卷来源；DELETE 成功后内核已 refresh → 重载列表） */}
+      <DeleteSkillDialog target={deleteTarget} onClose={() => setDeleteTarget(null)} onDeleted={() => void load()} />
     </div>
   );
 }

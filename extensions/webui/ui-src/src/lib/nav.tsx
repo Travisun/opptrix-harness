@@ -57,9 +57,9 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       {
         path: '/extensions',
-        label: '扩展',
+        label: '系统扩展',
         icon: Blocks,
-        title: '扩展',
+        title: '系统扩展',
         description: '扩展的启停、重载、贡献点与路由查看管理。',
         batch: 'W2',
       },
@@ -113,9 +113,9 @@ export const NAV_GROUPS: NavGroup[] = [
       },
       {
         path: '/plugins',
-        label: '插件',
+        label: 'LLM 插件',
         icon: Puzzle,
-        title: '插件包',
+        title: 'LLM 插件包',
         description: '声明式插件包：技能 + MCP 服务器 + 提示词 + 脚本。',
         batch: 'T1',
       },

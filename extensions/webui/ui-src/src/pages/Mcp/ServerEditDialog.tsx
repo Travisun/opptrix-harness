@@ -5,9 +5,12 @@
  * transport / command / url / args / env / timeoutMs 属身份与拓扑字段，不可变 ——
  * 变更拓扑须删除后重建（连接语义才有一致定义）。因此本 Dialog 仅编辑：
  * - 名称（必填 1..200）；
- * - headers（仅 streamable-http / sse；整表替换语义 —— 清空即移除全部头）。
+ * - headers（仅 streamable-http / sse；整表替换语义 —— 清空即移除全部头）；
+ *   支持键值对编辑器与「粘贴 JSON」两种输入（粘贴 `{"Authorization":"Bearer ..."}`
+ *   形状 → 解析填充键值对行；解析失败内联报错，不 toast）。
  */
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { BracesIcon, ListIcon } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -23,6 +26,7 @@ import { Label } from '@/components/ui/label';
 import { toast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import {
+  HeadersJsonPaste,
   KeyValueEditor,
   entriesOf,
   recordOfEntries,
@@ -43,6 +47,8 @@ export function ServerEditDialog({
 }): React.ReactNode {
   const [name, setName] = useState('');
   const [headerEntries, setHeaderEntries] = useState<KeyValueEntry[]>([]);
+  /** headers 输入模式：key-value 编辑器 | 粘贴 JSON */
+  const [headerMode, setHeaderMode] = useState<'editor' | 'paste'>('editor');
   const [submitting, setSubmitting] = useState(false);
 
   // 打开（目标变化）时用目标当前值重置表单
@@ -50,6 +56,7 @@ export function ServerEditDialog({
     if (server !== null) {
       setName(server.name);
       setHeaderEntries(entriesOf(server.headers).length > 0 ? entriesOf(server.headers) : [{ key: '', value: '' }]);
+      setHeaderMode('editor');
     }
   }, [server]);
 
@@ -121,15 +128,47 @@ export function ServerEditDialog({
 
           {isRemote ? (
             <div className="flex flex-col gap-2">
-              <Label>headers（可选，随每次请求发送，可含 Authorization）</Label>
-              <KeyValueEditor
-                entries={headerEntries}
-                onChange={setHeaderEntries}
-                disabled={submitting}
-                keyPlaceholder="键，如 Authorization"
-                valuePlaceholder="值，如 Bearer xxx"
-                addLabel="添加请求头"
-              />
+              <div className="flex items-center justify-between gap-2">
+                <Label>headers（可选，随每次请求发送，可含 Authorization）</Label>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setHeaderMode(headerMode === 'editor' ? 'paste' : 'editor')}
+                  disabled={submitting}
+                >
+                  {headerMode === 'editor' ? (
+                    <>
+                      <BracesIcon aria-hidden />
+                      粘贴 JSON
+                    </>
+                  ) : (
+                    <>
+                      <ListIcon aria-hidden />
+                      键值对编辑
+                    </>
+                  )}
+                </Button>
+              </div>
+              {headerMode === 'editor' ? (
+                <KeyValueEditor
+                  entries={headerEntries}
+                  onChange={setHeaderEntries}
+                  disabled={submitting}
+                  keyPlaceholder="键，如 Authorization"
+                  valuePlaceholder="值，如 Bearer xxx"
+                  addLabel="添加请求头"
+                />
+              ) : (
+                <HeadersJsonPaste
+                  disabled={submitting}
+                  onParsed={(value) => {
+                    setHeaderEntries(entriesOf(value).length > 0 ? entriesOf(value) : [{ key: '', value: '' }]);
+                    setHeaderMode('editor');
+                    toast.success(`已解析 ${Object.keys(value).length} 个请求头`, '确认无误后点「保存」（整表替换语义）');
+                  }}
+                />
+              )}
               <p className="text-muted-foreground text-xs">保存为整表替换：删除行即移除该头；下次连接生效。</p>
             </div>
           ) : (

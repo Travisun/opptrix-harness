@@ -630,9 +630,21 @@ export class ExtensionManager {
   /**
    * 重载扩展：disable → enable；enable 失败时保持 disabled
    * （内核侧已回滚、enabled=0、last_error 已记录），原始错误向调用方抛出。
+   *
+   * reload 仅对 enabled 扩展有意义：disabled（或未知/无表行）扩展 reload → no-op
+   * （保持当前 disabled 状态原样返回，不做隐式 disable→enable 的「重载即启用」）。
+   * 已停用的扩展要重新激活必须走显式 enable（含第三方信任闸的人工确认语义）。
    */
   async reload(id: string): Promise<void> {
     return this.#withLock(id, async () => {
+      const row = this.#rowCache.get(id) ?? (await this.#getRow(id));
+      if (row === undefined || !row.enabled) {
+        this.deps.logger.info(
+          { extId: id },
+          'extension reload skipped: extension is not enabled (reload is a no-op for disabled extensions)',
+        );
+        return;
+      }
       try {
         await this.#disableLocked(id);
       } catch (cause) {

@@ -12,7 +12,13 @@
  *   list/get/register/refresh 四 handler、单 body 超 128KB → RPC_PAYLOAD_TOO_LARGE、
  *   未知 id → EXT_NOT_FOUND；
  * - REST：真实 fastify 注入 + 真 SkillRegistry——401、列表与过滤、详情含正文、
- *   404 形状、refresh 角色门禁（normal 403 / admin 200 { total, bySource }）。
+ *   404 形状、refresh 角色门禁（normal 403 / admin 200 { total, bySource }）；
+ * - writer（受控写面）：writeSkill 落盘往返（frontmatter 形状 / scanSkillDir 可见）、
+ *   重复 id / 非法 id / 空·超限正文 → BAD_REQUEST；deleteSkill 的 data 删除、
+ *   builtin FORBIDDEN、未知 EXT_NOT_FOUND、builtin 遮蔽态 force 语义；
+ * - REST 写面（注入 writer）：POST 201 { id, path } + 写后立即可 GET（含正文）、
+ *   重复 id 400、正文超限 400、id 非法 400、角色门禁（normal 403 / 无 token 401）、
+ *   DELETE data 源 200 → 404 消失、builtin/extension 源 403、未知 id 404。
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -28,7 +34,7 @@ import { KERNEL_TOPICS } from '../src/extension-host/protocol.js';
 import { loadConfig } from '../src/kernel/config/index.js';
 import { err } from '../src/kernel/errors/index.js';
 import { createHttpServer } from '../src/kernel/http/server.js';
-import { createSkillsBridge, SkillRegistry, scanSkillDir } from '../src/kernel/skills/index.js';
+import { createSkillsBridge, deleteSkill, SkillRegistry, scanSkillDir, writeSkill as writeSkillPack } from '../src/kernel/skills/index.js';
 import type { SkillEntry, SkillRegistryLike } from '../src/kernel/skills/types.js';
 
 const logger = pino({ level: 'silent' });
@@ -520,5 +526,287 @@ describe('skills REST — /api/v1/skills*', () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/skills?source=somewhere', headers: AUTH_ADMIN });
     expect(res.statusCode).toBe(400);
     expect(res.json().code).toBe('HARNESS-1009');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E. writer — writeSkill / deleteSkill（受控写面，data 源目录）
+// ---------------------------------------------------------------------------
+
+describe('skills writer — writeSkill / deleteSkill', () => {
+  let dir = '';
+  let dataDir = '';
+  let builtinRoot = '';
+
+  /** writeSkillPack 的最小输入 */
+  const packInput = (extra: Partial<Parameters<typeof writeSkillPack>[1]> = {}): Parameters<typeof writeSkillPack>[1] => ({
+    id: 'weekly-report',
+    name: 'weekly-report',
+    description: '生成团队周报',
+    body: '# 周报\n\n汇总本周进展并输出 Markdown。\n',
+    ...extra,
+  });
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opptrix-skills-writer-'));
+    dataDir = path.join(dir, 'data');
+    builtinRoot = path.join(dir, 'builtin-skills');
+    fs.mkdirSync(builtinRoot, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('writeSkill 往返：SKILL.md 落盘（frontmatter 形状：name/description/version=1.0.0/author/tags + 正文）→ scanSkillDir 可见', async () => {
+    const result = await writeSkillPack({ dataDir }, packInput({ tags: ['docs', 'report'], author: 'alice' }));
+    expect(result.id).toBe('weekly-report');
+    expect(result.path).toBe(path.join(dataDir, 'skills', 'weekly-report'));
+
+    // frontmatter 形状断言：读文件头（--- ... --- 包裹的 YAML + 正文原样）
+    const raw = await fs.promises.readFile(path.join(result.path, 'SKILL.md'), 'utf8');
+    expect(raw.startsWith('---')).toBe(true);
+    const parsed = matter(raw);
+    expect(parsed.data).toMatchObject({
+      name: 'weekly-report', // frontmatter name 恒写目录 id（注册 id 不变量）
+      description: '生成团队周报',
+      version: '1.0.0',
+      author: 'alice',
+    });
+    expect(parsed.data.tags).toEqual(['docs', 'report']);
+    expect(parsed.content).toBe('# 周报\n\n汇总本周进展并输出 Markdown。\n');
+
+    // 与注册表读语义对齐：scanSkillDir 能发现且 id = 目录 id = frontmatter name
+    const entries = await scanSkillDir(path.join(dataDir, 'skills'), 'data');
+    expect(entries.map((e) => e.id)).toEqual(['weekly-report']);
+    expect(entries[0]).toMatchObject({ source: 'data', description: '生成团队周报', version: '1.0.0' });
+  });
+
+  it('writeSkill：可选字段缺省（无 tags/author）→ frontmatter 不含这两个键', async () => {
+    const result = await writeSkillPack({ dataDir }, packInput());
+    const parsed = matter(await fs.promises.readFile(path.join(result.path, 'SKILL.md'), 'utf8'));
+    expect('author' in parsed.data).toBe(false);
+    expect('tags' in parsed.data).toBe(false);
+    expect(parsed.data.version).toBe('1.0.0');
+  });
+
+  it('writeSkill：重复 id（目录已存在且非本写入创建）→ BAD_REQUEST "skill id already exists"', async () => {
+    await writeSkillPack({ dataDir }, packInput({ description: 'first' }));
+    await expect(writeSkillPack({ dataDir }, packInput({ description: 'second' }))).rejects.toMatchObject({
+      code: err('BAD_REQUEST').code,
+      message: 'skill id already exists',
+    });
+  });
+
+  it('writeSkill：id 非法 / name 空 / description 空·超限 / body 空·超 128KB → BAD_REQUEST（不落盘）', async () => {
+    await expect(writeSkillPack({ dataDir }, packInput({ id: 'Bad_Id' }))).rejects.toMatchObject({ code: err('BAD_REQUEST').code });
+    await expect(writeSkillPack({ dataDir }, packInput({ name: '   ' }))).rejects.toMatchObject({ code: err('BAD_REQUEST').code });
+    await expect(writeSkillPack({ dataDir }, packInput({ description: '' }))).rejects.toMatchObject({ code: err('BAD_REQUEST').code });
+    await expect(writeSkillPack({ dataDir }, packInput({ description: 'x'.repeat(1025) }))).rejects.toMatchObject({
+      code: err('BAD_REQUEST').code,
+    });
+    await expect(writeSkillPack({ dataDir }, packInput({ body: ' \n\t ' }))).rejects.toMatchObject({ code: err('BAD_REQUEST').code });
+    await expect(writeSkillPack({ dataDir }, packInput({ body: `a${'a'.repeat(128 * 1024)}` }))).rejects.toMatchObject({
+      code: err('BAD_REQUEST').code,
+      message: expect.stringContaining('exceeds 131072 bytes'),
+    });
+    // 全部失败 → 不产生任何目录
+    expect(fs.existsSync(path.join(dataDir, 'skills'))).toBe(false);
+  });
+
+  it('deleteSkill：data 源删除（目录消失；再删 → EXT_NOT_FOUND；未知 id → EXT_NOT_FOUND）', async () => {
+    await writeSkillPack({ dataDir }, packInput({ id: 'doomed-pack' }));
+    const skillDir = path.join(dataDir, 'skills', 'doomed-pack');
+    await expect(deleteSkill({ dataDir }, 'doomed-pack')).resolves.toBeUndefined();
+    expect(fs.existsSync(skillDir)).toBe(false);
+    // 目录已消失 → 再删按不存在收口；从未存在的 id 同样 EXT_NOT_FOUND
+    await expect(deleteSkill({ dataDir }, 'doomed-pack')).rejects.toMatchObject({ code: err('EXT_NOT_FOUND').code });
+    await expect(deleteSkill({ dataDir }, 'ghost-pack')).rejects.toMatchObject({ code: err('EXT_NOT_FOUND').code });
+  });
+
+  it('deleteSkill：builtin 源（builtinRoot 命中）→ FORBIDDEN', async () => {
+    writeSkill(builtinRoot, 'builtin-pack', { fm: { description: 'builtin source' } });
+    await expect(deleteSkill({ dataDir, builtinRoot }, 'builtin-pack')).rejects.toMatchObject({
+      code: err('FORBIDDEN').code,
+      message: expect.stringContaining('builtin'),
+    });
+    expect(fs.existsSync(path.join(builtinRoot, 'builtin-pack'))).toBe(true); // 原样保留
+  });
+
+  it('deleteSkill：builtin 遮蔽（builtin+data 并存）→ 默认 FORBIDDEN；force=true 仅删 data 副本', async () => {
+    writeSkill(builtinRoot, 'shadowed', { fm: { description: 'builtin wins' } });
+    await writeSkillPack({ dataDir }, packInput({ id: 'shadowed', description: 'data copy' }));
+
+    await expect(deleteSkill({ dataDir, builtinRoot }, 'shadowed')).rejects.toMatchObject({ code: err('FORBIDDEN').code });
+    expect(fs.existsSync(path.join(dataDir, 'skills', 'shadowed'))).toBe(true);
+    expect(fs.existsSync(path.join(builtinRoot, 'shadowed'))).toBe(true);
+
+    await expect(deleteSkill({ dataDir, builtinRoot }, 'shadowed', { force: true })).resolves.toBeUndefined();
+    expect(fs.existsSync(path.join(dataDir, 'skills', 'shadowed'))).toBe(false); // data 副本被删
+    expect(fs.existsSync(path.join(builtinRoot, 'shadowed'))).toBe(true); // builtin 原样保留
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F. REST 写面 — POST / DELETE /api/v1/skills（admin 门禁 + writer 注入）
+// ---------------------------------------------------------------------------
+
+describe('skills REST write face — POST/DELETE /api/v1/skills', () => {
+  let dir = '';
+  let builtinRoot = '';
+  let dataRoot = '';
+  let registry: SkillRegistry;
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opptrix-skills-write-'));
+    builtinRoot = path.join(dir, 'builtin-skills');
+    dataRoot = path.join(dir, 'skills'); // writer 的 cfg.dataDir = dir → data 源根 = <dir>/skills
+    writeSkill(builtinRoot, 'builtin-skill', { fm: { description: 'builtin source skill' } });
+
+    registry = new SkillRegistry({
+      roots: [
+        { root: builtinRoot, source: 'builtin' },
+        { root: dataRoot, source: 'data' },
+      ],
+      logger,
+    });
+    registry.registerContributed('ext-rest', [
+      { id: 'ext-only-skill', name: 'ext-only-skill', description: 'from extension', body: 'hi\n' },
+    ]);
+
+    const config = loadConfig({ NODE_ENV: 'test', HARNESS_LOG_LEVEL: 'error', HARNESS_DATA_DIR: dir });
+    ({ app } = createHttpServer({
+      config,
+      logger: pino({ level: 'silent' }),
+      isReady: () => true,
+      state: () => 'ready',
+      registerExtra: (a) => {
+        registerSkillRoutes(a, {
+          checker,
+          registry,
+          // 与 core-services 总装一致：data 源写删 + builtin 源判定
+          writer: {
+            write: (input) => writeSkillPack({ dataDir: dir }, input),
+            remove: (id, opts) => deleteSkill({ dataDir: dir, builtinRoot }, id, opts),
+          },
+        });
+      },
+    }));
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('POST /api/v1/skills：admin → 201 { id, path }；写后已 refresh（列表可见 source=data、GET :id 含正文）', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skills',
+      headers: AUTH_ADMIN,
+      payload: {
+        id: 'team-retro',
+        name: 'team-retro',
+        description: '组织迭代回顾',
+        body: '# 回顾\n\n收集做得好/做得差的事项。\n',
+        tags: ['agile'],
+        author: 'alice',
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toEqual({ id: 'team-retro', path: path.join(dataRoot, 'team-retro') });
+
+    // 写后自动 refresh：无需手动 POST /refresh 即可读
+    const detail = await app.inject({ method: 'GET', url: '/api/v1/skills/team-retro', headers: AUTH_NORMAL });
+    expect(detail.statusCode).toBe(200);
+    const detailBody = detail.json() as SkillEntry & { body: string };
+    expect(detailBody).toMatchObject({ id: 'team-retro', source: 'data', version: '1.0.0', author: 'alice' });
+    expect(detailBody.body).toBe('# 回顾\n\n收集做得好/做得差的事项。\n');
+
+    const list = await app.inject({ method: 'GET', url: '/api/v1/skills?source=data', headers: AUTH_NORMAL });
+    expect((list.json() as SkillEntry[]).map((e) => e.id)).toEqual(['team-retro']);
+  });
+
+  it('POST /api/v1/skills：重复 id → 400 BAD_REQUEST（已存在即拒，不覆盖）', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skills',
+      headers: AUTH_ADMIN,
+      payload: { id: 'team-retro', name: 'team-retro', description: 'second write', body: 'nope\n' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: 'HARNESS-1008', message: 'skill id already exists' });
+  });
+
+  it('POST /api/v1/skills：正文超 128KB → 400；id 形态非法 → 400 VALIDATION_FAILED', async () => {
+    const oversize = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skills',
+      headers: AUTH_ADMIN,
+      payload: { id: 'too-big', name: 'too-big', description: 'oversize body', body: `a${'a'.repeat(128 * 1024)}` },
+    });
+    expect(oversize.statusCode).toBe(400);
+    expect(oversize.json().code).toBe('HARNESS-1008'); // 字节级复核在 writer
+
+    const badId = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skills',
+      headers: AUTH_ADMIN,
+      payload: { id: 'Bad_Id', name: 'x', description: 'd', body: 'b\n' },
+    });
+    expect(badId.statusCode).toBe(400);
+    expect(badId.json().code).toBe('HARNESS-1009');
+    expect(fs.existsSync(path.join(dataRoot, 'too-big'))).toBe(false);
+    expect(fs.existsSync(path.join(dataRoot, 'Bad_Id'))).toBe(false);
+  });
+
+  it('POST /api/v1/skills：无 token → 401；normal 角色 → 403 HARNESS-1007', async () => {
+    const anon = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skills',
+      payload: { id: 'anon-skill', name: 'anon-skill', description: 'd', body: 'b\n' },
+    });
+    expect(anon.statusCode).toBe(401);
+    expect(anon.json().code).toBe('HARNESS-1006');
+
+    const denied = await app.inject({
+      method: 'POST',
+      url: '/api/v1/skills',
+      headers: AUTH_NORMAL,
+      payload: { id: 'normal-skill', name: 'normal-skill', description: 'd', body: 'b\n' },
+    });
+    expect(denied.statusCode).toBe(403);
+    expect(denied.json().code).toBe('HARNESS-1007');
+  });
+
+  it('DELETE /api/v1/skills/:id：data 源 → 200 { ok, id } 且删后 GET 404；builtin/extension 源 → 403；未知 id → 404；normal → 403', async () => {
+    const denied = await app.inject({ method: 'DELETE', url: '/api/v1/skills/team-retro', headers: AUTH_NORMAL });
+    expect(denied.statusCode).toBe(403);
+    expect(denied.json().code).toBe('HARNESS-1007');
+
+    const builtin = await app.inject({ method: 'DELETE', url: '/api/v1/skills/builtin-skill', headers: AUTH_ADMIN });
+    expect(builtin.statusCode).toBe(403);
+    expect(builtin.json()).toMatchObject({ code: 'HARNESS-1007' });
+    expect(fs.existsSync(path.join(builtinRoot, 'builtin-skill'))).toBe(true);
+
+    const ext = await app.inject({ method: 'DELETE', url: '/api/v1/skills/ext-only-skill', headers: AUTH_ADMIN });
+    expect(ext.statusCode).toBe(403);
+
+    const ghost = await app.inject({ method: 'DELETE', url: '/api/v1/skills/ghost-skill', headers: AUTH_ADMIN });
+    expect(ghost.statusCode).toBe(404);
+    expect(ghost.json().code).toBe('HARNESS-3004');
+
+    const ok = await app.inject({ method: 'DELETE', url: '/api/v1/skills/team-retro', headers: AUTH_ADMIN });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json()).toEqual({ ok: true, id: 'team-retro' });
+    expect(fs.existsSync(path.join(dataRoot, 'team-retro'))).toBe(false);
+
+    // 删后自动 refresh：详情 404、data 源列表为空
+    const detail = await app.inject({ method: 'GET', url: '/api/v1/skills/team-retro', headers: AUTH_ADMIN });
+    expect(detail.statusCode).toBe(404);
+    const list = await app.inject({ method: 'GET', url: '/api/v1/skills?source=data', headers: AUTH_NORMAL });
+    expect(list.json()).toEqual([]);
   });
 });

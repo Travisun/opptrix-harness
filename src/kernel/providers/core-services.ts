@@ -72,7 +72,7 @@ import {
 } from '../plugins/index.js';
 import type { McpRegistryLike, PluginMcpServerConfig, ScriptRunnerLike } from '../plugins/types.js';
 import type { SandboxManager } from '../sandbox/manager.js';
-import { createSkillsBridge, SkillRegistry } from '../skills/index.js';
+import { createSkillsBridge, deleteSkill, SkillRegistry, writeSkill } from '../skills/index.js';
 import { TaskManager, TaskStore, TaskWorkerPool } from '../tasks/index.js';
 import type { SecretsService } from '../storage/secrets.js';
 import type { SettingsService } from '../storage/settings.js';
@@ -615,8 +615,18 @@ export function createCoreServices(kernel: Kernel): CoreServices {
         secrets,
       });
       // Skills / MCP / 插件 REST（/api/v1/skills* · /api/v1/mcp/* · /api/v1/plugins*）：
-      // 与扩展桥共用同一批 registry/configStore 实例（单一事实来源）
-      registerSkillRoutes(app, { checker, registry: skillsRegistry });
+      // 与扩展桥共用同一批 registry/configStore 实例（单一事实来源）。
+      // writer：受控写面（POST/DELETE /api/v1/skills，admin）→ data 源目录
+      // `<dataDir>/skills/<id>/`；builtinRoot 供删除时判定 builtin 源（只读不可删）。
+      registerSkillRoutes(app, {
+        checker,
+        registry: skillsRegistry,
+        writer: {
+          write: (input) => writeSkill({ dataDir: config.dataDir }, input),
+          remove: (id, opts) =>
+            deleteSkill({ dataDir: config.dataDir, builtinRoot: join(REPO_ROOT, 'skills') }, id, opts),
+        },
+      });
       registerMcpRoutes(app, { checker, registry: mcpRegistry, configStore: mcpConfigStore });
       // plugins 路由自带 `app.register(multipart)`（与 files 路由同款手法）。同一 fastify
       // 实例上两次注册同一个 fp 包装插件会撞装饰器（FST_ERR_DEC_ALREADY_PRESENT）——

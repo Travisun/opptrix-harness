@@ -4,6 +4,8 @@
  * 组成：
  * - `scanSkillDir`（loader.ts）：扫一层子目录解析 SKILL.md；
  * - `SkillRegistry`（registry.ts）：多根聚合 + 扩展贡献的纯读模型；
+ * - `writeSkill` / `deleteSkill`（writer.ts）：受控写面——data 源（`<dataDir>/skills`）
+ *   的 SKILL.md 组装落盘与删除（builtin 源只读；REST admin 门禁在 api/skills.ts）；
  * - `createSkillsBridge`（本文件）：扩展注入桥——四个 handler（skills.list /
  *   skills.get / skills.register / skills.refresh）与 KERNEL_TOPICS.skills* 对齐，
  *   由总控接线合入 bridgeHandlers（与 kernel-handlers.ts 的 topic 表并表）。
@@ -27,6 +29,13 @@ import {
 
 export { SkillRegistry, type SkillDuplicate } from './registry.js';
 export { scanSkillDir, loadSkillEntry, readSkillBody } from './loader.js';
+export {
+  deleteSkill,
+  writeSkill,
+  type SkillWriterConfig,
+  type SkillWriteResult,
+  type WriteSkillInput,
+} from './writer.js';
 export {
   SKILL_BODY_MAX_BYTES,
   SKILL_DESCRIPTION_MAX_CHARS,

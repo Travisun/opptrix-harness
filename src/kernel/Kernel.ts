@@ -61,6 +61,7 @@ import { registerExtAssets, type ExtAssetDir } from './extensions/assets.js';
 import { HOST_METHODS } from '../extension-host/protocol.js';
 import { createWorkerFactory } from '../extension-host/worker-factory.js';
 import { bindFacadeKernel, FACADE_CONTAINER_KEYS } from './Facades.js';
+import { attachSystemRuntime, SystemMcpServer, SYSTEM_TOOLS_CONTAINER_KEY } from './mcp/system-server.js';
 import { createBootLogger } from './logging/index.js';
 import { createSqliteLogSink, type SqliteLogSink } from './logging/sqlite-sink.js';
 import { SandboxManager, createDockerClient, type DockerClient } from './sandbox/index.js';
@@ -782,6 +783,26 @@ export class Kernel {
           });
           // 核心领域 API（files / notifications / chat / tasks）在系统与 Cron API 之后挂载
           core.registerRoutes(extra);
+
+          // ---- 系统操作 MCP Server（/mcp，无状态 Streamable HTTP）----
+          // 全部系统操作以标准 MCP 工具暴露（目录见 mcp/system-tools.ts）：外部 LLM/系统
+          // 经 /mcp（Bearer/query token → root|admin 或 'mcp:call' scope）调用；内部扩展
+          // 经 h.mcp 桥（serverId='system'）调用——运行时同时挂入容器（规范事实来源）与
+          // 进程槽（桥的默认解析路径），桥在请求期懒读，挂入时序无关。/mcp 独立前缀，
+          // 与 auth mount（/api/v1/auth|users）、/ext/* 通配、/api/v1/mcp/* 互不冲突。
+          const systemMcp = new SystemMcpServer({
+            kernel: this,
+            checker: authChecker,
+            updater,
+            cronHistory: (jobId, limit) => cronStore.history(jobId, limit),
+          });
+          this.container.instance(SYSTEM_TOOLS_CONTAINER_KEY, systemMcp.runtime);
+          attachSystemRuntime(systemMcp.runtime);
+          const mcpEndpointOptions = { schema: { tags: ['mcp'] } };
+          extra.post('/mcp', mcpEndpointOptions, (request, reply) => systemMcp.handleRequest(request, reply));
+          // GET/DELETE：无状态模式无会话流（独立 SSE 流 / 会话关闭不存在）→ 统一 405
+          extra.get('/mcp', mcpEndpointOptions, (request, reply) => systemMcp.handleRequest(request, reply));
+          extra.delete('/mcp', mcpEndpointOptions, (request, reply) => systemMcp.handleRequest(request, reply));
 
           // 沙箱工作区 API（/api/v1/sandbox/*）与升级 API（/api/v1/system/update*，阶段 11）
           registerSandboxRoutes(extra, { checker: authChecker, manager: sandbox });

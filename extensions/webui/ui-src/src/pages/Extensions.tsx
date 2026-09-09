@@ -211,8 +211,8 @@ export default function ExtensionsPage(): React.ReactNode {
       {/* 页头 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
-          <h2 className="text-lg font-semibold tracking-tight">扩展</h2>
-          <p className="text-muted-foreground text-sm">扩展的启停、重载、卸载与贡献点查看。</p>
+          <h2 className="text-lg font-semibold tracking-tight">系统扩展</h2>
+          <p className="text-muted-foreground text-sm">系统扩展的启停、重载、卸载与贡献点查看。</p>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => void handleRescan()} disabled={rescanning}>

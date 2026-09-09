@@ -12,15 +12,18 @@
  * mcpServerConfigSchema）同规则的手工镜像（id 形态、stdio 必 command、remote 必 http(s)
  * url、timeoutMs ∈ [1000, 600000] 等）。
  */
-import { BanIcon, CheckCircle2Icon, CircleDashedIcon, PlusIcon, Trash2Icon, TriangleAlertIcon } from 'lucide-react';
+import { BanIcon, CheckCircle2Icon, CircleDashedIcon, ClipboardPasteIcon, PlusIcon, Trash2Icon, TriangleAlertIcon } from 'lucide-react';
+import { useState } from 'react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/utils';
 import { errCode, errDetailText, errText } from '@/pages/_shared';
+import { parseHeadersJson } from '@/pages/Mcp/json-import';
 
 // ---------------------------------------------------------------------------
 // REST 形状（内核 src/kernel/mcp/types.ts 的最小视图）
@@ -351,6 +354,64 @@ export function KeyValueEditor({
 // ---------------------------------------------------------------------------
 // 小型展示件
 // ---------------------------------------------------------------------------
+
+/**
+ * headers「粘贴 JSON」区块：textarea 粘贴 `{"X-API-Key":"...","Authorization":"Bearer ..."}`
+ * 形状 → 解析填充键值对行；解析失败**内联报错**（role=alert，不 toast）。
+ * 解析成功回调整个 Record（整表替换语义由调用方决定），并清空输入。
+ */
+export function HeadersJsonPaste({
+  onParsed,
+  disabled,
+}: {
+  onParsed: (value: Record<string, string>) => void;
+  disabled?: boolean;
+}): React.ReactNode {
+  const [text, setText] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const parse = (): void => {
+    const res = parseHeadersJson(text);
+    if (!res.ok) {
+      setError(res.message);
+      return;
+    }
+    setError(null);
+    setText('');
+    onParsed(res.value);
+  };
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-dashed p-3">
+      <Textarea
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          if (error !== null) setError(null);
+        }}
+        placeholder={'{"Authorization":"Bearer xxx","X-API-Key":"yyy"}'}
+        disabled={disabled}
+        className="min-h-20 font-mono text-xs"
+        spellCheck={false}
+        aria-label="粘贴 headers JSON"
+      />
+      {error !== null && (
+        <p className="text-destructive text-xs" role="alert">
+          {error}
+        </p>
+      )}
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="w-fit"
+        onClick={parse}
+        disabled={disabled || text.trim() === ''}
+      >
+        <ClipboardPasteIcon aria-hidden />
+        解析并填充
+      </Button>
+    </div>
+  );
+}
 
 /** 标签-值元信息行（Dialog / 详情头共用） */
 export function MetaRow({ label, children }: { label: string; children: React.ReactNode }): React.ReactNode {

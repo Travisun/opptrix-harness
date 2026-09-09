@@ -737,6 +737,48 @@ describe('ExtensionManager', () => {
     expect((await rowOf(h, 'r'))?.enabled).toBe(0);
   });
 
+  it('reload 语义：disabled 扩展 reload → no-op（保持 disabled，不 load、不激活、不隐式启用）', async () => {
+    const h = await buildHarness({
+      dirs: { r: manifestOf({ id: 'r', permissions: ['http'] }) },
+      enabledInDb: [],
+      contributions: { r: contribsOf({ routes: [{ method: 'GET', path: '/v1' }] }) },
+    });
+    await h.manager.start();
+    expect(h.manager.list().find((s) => s.id === 'r')?.enabled).toBe(false);
+
+    await h.manager.reload('r'); // 对 disabled 扩展重载必须是 no-op，而非「disable→enable」的隐式启用
+
+    const summary = h.manager.list().find((s) => s.id === 'r');
+    expect(summary?.enabled).toBe(false);
+    expect(h.worker.loads).toEqual([]); // 扩展从未被激活（无 load RPC）
+    expect(h.worker.unloads).toEqual([]);
+    expect(h.manager.getRoutes()).toEqual([]);
+    expect((await rowOf(h, 'r'))?.enabled).toBe(0);
+  });
+
+  it('reload 语义：enable → disable → reload → 仍为 disabled（用户报告的「重载即启用」回归）', async () => {
+    const h = await buildHarness({
+      dirs: { r: manifestOf({ id: 'r', permissions: ['http'] }) },
+      enabledInDb: ['r'],
+      contributions: { r: contribsOf({ routes: [{ method: 'GET', path: '/v1' }] }) },
+    });
+    await h.manager.start();
+    expect(h.manager.list().find((s) => s.id === 'r')?.enabled).toBe(true);
+    await h.manager.disable('r');
+    expect(h.manager.list().find((s) => s.id === 'r')?.enabled).toBe(false);
+
+    await h.manager.reload('r');
+
+    const summary = h.manager.list().find((s) => s.id === 'r');
+    expect(summary?.enabled).toBe(false);
+    expect(h.manager.getRoutes()).toEqual([]);
+    // reload 之前恰好一次 unload（disable 产生），之后不得再出现新的 load
+    const unloadCount = h.worker.unloads.filter((id) => id === 'r').length;
+    expect(unloadCount).toBe(1);
+    expect(h.worker.loads).toEqual(['r']);
+    expect((await rowOf(h, 'r'))?.enabled).toBe(0);
+  });
+
   it('worker 崩溃：指数退避重启 worker + 按拓扑重启用原 enabled 扩展 + onWorkerRestart 回调', async () => {
     const h = await buildHarness({
       dirs: { a: manifestOf({ id: 'a' }) },

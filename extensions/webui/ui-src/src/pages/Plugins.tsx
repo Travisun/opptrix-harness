@@ -92,8 +92,8 @@ export default function PluginsPage(): React.ReactNode {
       {/* 页头 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
-          <h2 className="text-lg font-semibold tracking-tight">插件包</h2>
-          <p className="text-muted-foreground text-sm">声明式插件包的安装、聚合刷新、贡献明细查看与卸载。</p>
+          <h2 className="text-lg font-semibold tracking-tight">LLM 插件</h2>
+          <p className="text-muted-foreground text-sm">声明式 LLM 插件的安装、聚合刷新、贡献明细查看与卸载。</p>
         </div>
         <div className="flex items-center gap-2">
           <Button size="sm" onClick={() => setInstallOpen(true)}>

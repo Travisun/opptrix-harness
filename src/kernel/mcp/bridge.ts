@@ -12,13 +12,18 @@
  * - `mcp.servers.list`  {} → { id, name, transport, enabled, state, toolCount }[]
  *   （刻意裁剪：不含 command/args/env/url/headers——env/headers 可含凭据，永不下发扩展）
  * - `mcp.tools.list`    { serverId? } → (McpToolInfo & { serverId })[]
+ *   （serverId==='system' 时返回系统操作工具目录；缺省 = 外部 server 工具 + system 目录合并）
  * - `mcp.tools.call`    { serverId, toolName, args?, timeoutMs? } → McpCallToolResult
+ *   （serverId==='system' 时路由到系统工具目录执行器，返回 {ok,...} 结果对象——
+ *   系统工具执行身份固定为内核 admin，见 system-tools.ts 的信任模型说明）
  */
 import { z } from 'zod';
 
 import { KERNEL_TOPICS } from '../../extension-host/protocol.js';
 import { err } from '../errors/index.js';
 import type { McpRegistry } from './registry.js';
+import { SYSTEM_SERVER_ID } from './system-tools.js';
+import { currentSystemRuntime, type SystemToolRuntime } from './system-server.js';
 
 /** 扩展访问 MCP 客户端所需 manifest 权限（manifest.permissions 声明） */
 export const MCP_CLIENT_PERMISSION = 'mcp:client';
@@ -33,6 +38,12 @@ export interface McpBridgeDeps {
   registry: Pick<McpRegistry, 'listTools' | 'callTool' | 'list'>;
   /** 权限闸（集成方注入 kernel-handlers 同款闭包）：不通过即抛 FORBIDDEN */
   requirePermission: (extId: string, topic: string, permission: string) => void;
+  /**
+   * 系统工具目录执行器的懒解析（可选；Kernel /mcp 接线后容器内才存在）。
+   * 提供后 mcp.tools.list 追加 serverId='system' 的系统操作工具，mcp.tools.call
+   * 对 serverId==='system' 的调用路由到目录执行器（admin 身份执行）。
+   */
+  systemRuntime?: () => SystemToolRuntime | undefined;
 }
 
 /** mcp.tools.list 线格式 */
@@ -91,6 +102,30 @@ export function createMcpBridge(deps: McpBridgeDeps): McpBridgeHandlers {
     toolCount: summary.toolCount,
   });
 
+  /** 系统工具目录条目的目录合并投影（serverId='system'，描述标注「系统操作」） */
+  const resolveSystemRuntime = deps.systemRuntime ?? currentSystemRuntime;
+  const systemToolEntries = (): Array<{ serverId: string; name: string; description: string; inputSchema: unknown }> => {
+    const runtime = resolveSystemRuntime();
+    if (runtime === undefined) return [];
+    return runtime.listTools().map((tool) => ({
+      serverId: SYSTEM_SERVER_ID,
+      name: tool.name,
+      description: `${tool.description}（系统操作）`,
+      inputSchema: tool.inputSchema,
+    }));
+  };
+
+  /** system 调用路由的运行时解析（未接线 → INTERNAL，提示装配缺失） */
+  const requireSystemRuntime = (): SystemToolRuntime => {
+    const runtime = resolveSystemRuntime();
+    if (runtime === undefined) {
+      throw err('INTERNAL', {
+        message: 'system tool runtime is not available (kernel /mcp wiring missing)',
+      });
+    }
+    return runtime;
+  };
+
   return {
     [KERNEL_TOPICS.mcpServersList]: async (payload, from) => {
       void payload;
@@ -109,9 +144,14 @@ export function createMcpBridge(deps: McpBridgeDeps): McpBridgeHandlers {
           detail: parsed.error.issues,
         });
       }
-      return await deps.registry.listTools(
+      // system 目录优先路由：serverId==='system' → 仅系统工具（不触达外部 registry）；
+      // 缺省 → 外部 server 工具 + 系统工具合并；其余 serverId → 仅该 server 的工具
+      if (parsed.data.serverId === SYSTEM_SERVER_ID) return systemToolEntries();
+      const remote = await deps.registry.listTools(
         parsed.data.serverId !== undefined ? { serverId: parsed.data.serverId } : undefined,
       );
+      if (parsed.data.serverId !== undefined) return remote;
+      return [...remote, ...systemToolEntries()];
     },
 
     [KERNEL_TOPICS.mcpToolsCall]: async (payload, from) => {
@@ -122,6 +162,10 @@ export function createMcpBridge(deps: McpBridgeDeps): McpBridgeHandlers {
           message: 'mcp.tools.call requires payload { serverId: string, toolName: string, args?: object, timeoutMs?: number }',
           detail: parsed.error.issues,
         });
+      }
+      // serverId==='system' → 目录执行器（admin 身份；结果恒为 {ok,...} 形状，不抛）
+      if (parsed.data.serverId === SYSTEM_SERVER_ID) {
+        return await requireSystemRuntime().call(parsed.data.toolName, parsed.data.args ?? {});
       }
       return await deps.registry.callTool(
         parsed.data.serverId,

@@ -1,15 +1,27 @@
 /**
  * Skills/SkillCard — 技能卡片：名称 / 描述 / version / author / tags chips /
  * 来源徽标 / 正文大小 / 附属文件数；整卡可点（键盘 Enter/Space 等效）打开详情。
+ * 行操作「删除」仅在调用方传入 onDelete 时渲染（数据卷来源 + admin；builtin/
+ * extension 来源隐藏），点击不触发整卡的 onOpen。
  */
-import { FileCodeIcon } from 'lucide-react';
+import { FileCodeIcon, Trash2Icon } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { formatBytes } from '@/pages/_shared';
 import { SourceBadge, type SkillEntryView } from './shared';
 
-export function SkillCard({ skill, onOpen }: { skill: SkillEntryView; onOpen: () => void }): React.ReactNode {
+export function SkillCard({
+  skill,
+  onOpen,
+  onDelete,
+}: {
+  skill: SkillEntryView;
+  onOpen: () => void;
+  /** 传入才渲染行操作「删除」（数据卷来源 + admin 由调用方判定） */
+  onDelete?: () => void;
+}): React.ReactNode {
   return (
     <Card
       role="button"
@@ -38,6 +50,25 @@ export function SkillCard({ skill, onOpen }: { skill: SkillEntryView; onOpen: ()
               </Badge>
             )}
             {!skill.enabled && <Badge variant="warning">已停用</Badge>}
+            {onDelete !== undefined && (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`删除技能 ${skill.name}`}
+                title="删除该技能（数据卷目录）"
+                className="text-muted-foreground hover:text-destructive ml-auto"
+                onClick={(e) => {
+                  e.stopPropagation(); // 不触发整卡 onOpen
+                  onDelete();
+                }}
+                onKeyDown={(e) => {
+                  // 键盘等效点击时不冒泡给整卡（避免同时打开详情）
+                  if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+                }}
+              >
+                <Trash2Icon aria-hidden />
+              </Button>
+            )}
           </div>
           <p className="text-muted-foreground truncate font-mono text-xs" title={skill.id}>
             {skill.id}
