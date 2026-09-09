@@ -10,6 +10,9 @@ import {
   ScrollText,
   Settings,
   Users,
+  Sparkles,
+  Network,
+  Puzzle,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -91,6 +94,30 @@ export const NAV_GROUPS: NavGroup[] = [
         title: '沙箱',
         description: '容器工作区列表、执行命令与文件浏览。',
         batch: 'W4',
+      },
+      {
+        path: '/skills',
+        label: 'Skills',
+        icon: Sparkles,
+        title: 'Skills 技能',
+        description: 'Agent Skills 技能库：提示词包的发现、查看与刷新。',
+        batch: 'T1',
+      },
+      {
+        path: '/mcp',
+        label: 'MCP',
+        icon: Network,
+        title: 'MCP 服务器',
+        description: 'Model Context Protocol 服务器接入、工具目录与调用。',
+        batch: 'T1',
+      },
+      {
+        path: '/plugins',
+        label: '插件',
+        icon: Puzzle,
+        title: '插件包',
+        description: '声明式插件包：技能 + MCP 服务器 + 提示词 + 脚本。',
+        batch: 'T1',
       },
       {
         path: '/users',

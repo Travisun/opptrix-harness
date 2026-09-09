@@ -9,6 +9,9 @@ import CronPage from '@/pages/Cron';
 import DashboardPage from '@/pages/Dashboard';
 import ExtensionsPage from '@/pages/Extensions';
 import FilesTasksPage from '@/pages/FilesTasks';
+import SkillsPage from '@/pages/Skills';
+import McpPage from '@/pages/Mcp';
+import PluginsPage from '@/pages/Plugins';
 import LogsPage from '@/pages/Logs';
 import LoginPage from '@/pages/Login';
 import NotificationsPage from '@/pages/Notifications';
@@ -119,6 +122,9 @@ export function AppRoutes(): ReactNode {
               <Route path="/cron" element={<CronPage />} />
               <Route path="/notifications" element={<NotificationsPage />} />
               <Route path="/files-tasks" element={<FilesTasksPage />} />
+              <Route path="/skills" element={<SkillsPage />} />
+              <Route path="/mcp" element={<McpPage />} />
+              <Route path="/plugins" element={<PluginsPage />} />
               <Route path="/sandbox" element={<SandboxPage />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="/api-keys" element={<ApiKeysPage />} />
