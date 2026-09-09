@@ -84,6 +84,29 @@ export interface LlmAdapter {
   stream(cfg: LlmProviderConfig, apiKey: string, input: LlmChatInput): AsyncGenerator<LlmStreamEvent>;
 }
 
+/** 网关依赖（含 HA 回退开关探测）。由 gateway.ts 转出口（保持既有 import 路径不变） */
+export interface LlmGatewayDeps {
+  getProviders(): Promise<LlmProviderConfig[]>;
+  resolveSecret(ref: string): Promise<string | null>;
+  logger: import('pino').Logger;
+  /**
+   * HA 自动回退开关探测（可选；**缺省 undefined = 关闭**）。返回非 true / 自身抛错一律视为关闭。
+   * 集成层闭包接 settings('llm.ha.enabled')（REST 面 GET/PUT /api/v1/llm/ha 持久化同一键）；
+   * core-services 装配归集成改动，见 src/api/llm.ts 模块注释的接线说明。
+   */
+  haEnabled?: () => Promise<boolean>;
+}
+
+/** HA 回退链中的单次尝试记录（gateway LLM_PROVIDER_ERROR 的 detail.attempts 项） */
+export interface LlmHaAttempt {
+  /** 尝试的 provider 名（配置序） */
+  provider: string;
+  /** 尝试的模型（回退链为该 provider 的 models[0] 缺省模型；provider 无模型时空串） */
+  model: string;
+  /** 失败归因（HarnessError 的 code/message；message 不含密钥材料） */
+  error: { code: string; message: string };
+}
+
 /** providerParams 缺省白名单 */
 export const DEFAULT_PARAM_ALLOWLIST: readonly string[] = ['user', 'metadata'];
 

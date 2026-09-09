@@ -28,9 +28,31 @@ import { z } from 'zod';
 import { extractToken } from '../auth/authProxy.js';
 import type { AuthIdentity, AuthVerifyInput } from '../auth/types.js';
 import { err, HarnessError } from '../errors/index.js';
-import type { Kernel, UpdaterFacade } from '../Kernel.js';
+import { CONTAINER_KEYS, type Kernel, type UpdaterFacade } from '../Kernel.js';
 import type { CronRunEntry } from '../cron/store.js';
-import { createSystemTools, SYSTEM_TOOLS_CONTAINER_KEY, type SystemTool, type SystemToolContext } from './system-tools.js';
+import {
+  createExtractTools,
+  createSystemTools,
+  SYSTEM_TOOLS_CONTAINER_KEY,
+  type SystemTool,
+  type SystemToolContext,
+} from './system-tools.js';
+import type { FileExtractService } from '../fileextract/service.js';
+
+/**
+ * 系统工具目录：内置目录 + fileextract 域的 files_extract（容器 'fileextract.service'
+ * 懒解析——core-services 已登记该服务，裸装配缺失时工具收敛为 HARNESS-9001 结果对象）。
+ * SystemToolRuntime（执行）与 buildMcpServer（SDK 注册）共用同一清单，防目录漂移。
+ */
+function buildSystemToolCatalog(kernel: Kernel): SystemTool[] {
+  return createSystemTools(
+    createExtractTools(() => ({
+      service: kernel.container.has(CONTAINER_KEYS.fileExtract)
+        ? kernel.container.resolve<FileExtractService>(CONTAINER_KEYS.fileExtract)
+        : undefined,
+    })),
+  );
+}
 
 /** 对外声明的 server 信息（tools/list 的 serverVersion 之外，也用于客户端识别） */
 const SERVER_INFO = { name: 'opptrix-harness', version: '0.1.0' } as const;
@@ -74,10 +96,15 @@ export class SystemToolRuntime {
     /** cron 执行历史读取（cronHistory 绑定，Kernel registerExtra 闭包内注入） */
     cronHistory: (jobId: string, limit?: number) => Promise<CronRunEntry[]>;
   }) {
-    this.#tools = createSystemTools();
+    this.#tools = buildSystemToolCatalog(deps.kernel);
     this.#kernel = deps.kernel;
     this.#updater = deps.updater;
     this.#cronHistory = deps.cronHistory;
+  }
+
+  /** 完整工具目录（buildMcpServer 注册 SDK 工具与运行时执行共用同一清单） */
+  get catalog(): SystemTool[] {
+    return this.#tools;
   }
 
   /** 工具目录投影（MCP tools/list / 桥合并共用同一顺序） */
@@ -179,7 +206,7 @@ export class SystemMcpServer {
    */
   buildMcpServer(): McpServer {
     const server = new McpServer(SERVER_INFO, { capabilities: { tools: {} } });
-    for (const tool of createSystemTools()) {
+    for (const tool of this.#runtime.catalog) {
       server.registerTool(
         tool.name,
         { description: tool.description, inputSchema: tool.input },

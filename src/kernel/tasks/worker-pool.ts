@@ -15,6 +15,8 @@
  */
 import { Worker } from 'node:worker_threads';
 
+import { EXTRACT_TASK_NAME } from '../fileextract/types.js';
+
 import { err } from '../errors/index.js';
 import type { WorkerOutbound } from './task-worker.js';
 
@@ -32,8 +34,8 @@ export interface TaskWorkerPoolDeps {
   logger: import('pino').Logger;
 }
 
-/** v1 内置任务名（阶段 9 扩展执行器接入后扩充） */
-export const BUILTIN_TASK_NAMES = ['echo'] as const;
+/** 内置任务名：'echo' 自测管道 + 'file-extract'（FileExtractService 的任务池面） */
+export const BUILTIN_TASK_NAMES = ['echo', EXTRACT_TASK_NAME] as const;
 
 /** 未注册任务的标准文案（池侧门禁与工作线程侧兜底保持一致） */
 export const TASK_NOT_REGISTERED_MESSAGE = 'task type not registered (extension executors arrive in stage 9)';
@@ -125,7 +127,7 @@ export class TaskWorkerPool {
 
   /**
    * 派发任务：
-   * - 未知 name → 立即 onFailed（不占用线程；v1 仅内置 'echo'）；
+   * - 未知 name → 立即 onFailed（不占用线程；内置清单见 BUILTIN_TASK_NAMES）；
    * - 有空闲线程立即执行；否则进入 FIFO 队列，线程空闲时按先到先执行；
    * - 返回的 Promise 在任务终态（或判失败）时 resolve，永不 reject。
    */

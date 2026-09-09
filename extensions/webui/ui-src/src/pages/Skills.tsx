@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  FileUpIcon,
   PackageOpenIcon,
   PencilIcon,
   PlusIcon,
@@ -17,11 +18,14 @@ import { toast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { EmptyState, errText, isApiError, isAdminRole, useMe } from '@/pages/_shared';
+import { BatchImportDialog } from '@/pages/Skills/BatchImportDialog';
 import { CreateSkillDialog } from '@/pages/Skills/CreateSkillDialog';
 import { DeleteSkillDialog } from '@/pages/Skills/DeleteSkillDialog';
 import { EditSkillDialog } from '@/pages/Skills/EditSkillDialog';
 import { SkillCard } from '@/pages/Skills/SkillCard';
 import { SkillDetailSheet } from '@/pages/Skills/SkillDetailSheet';
+import { buildSkillDrafts, type SkillDraft } from '@/pages/Skills/dragdrop';
+import { EXTRACT_ENDPOINT_UNAVAILABLE, readDroppedFiles } from '@/pages/Skills/batchImport';
 import {
   SKILL_SOURCE_META,
   SKILL_SOURCE_OPTIONS,
@@ -42,6 +46,11 @@ import {
  * - DELETE /api/v1/skills/:id  删除技能（admin/root；仅数据卷来源，卡片行操作 +
  *                              confirm 弹窗；builtin/extension 来源隐藏删除）；
  * - POST /api/v1/skills/refresh 重扫技能库（admin/root；403 → 隐藏按钮并提示）。
+ *
+ * 拖拽批量创建（admin/root）：页面级拖拽区（dragover 高亮）接收 .md/.markdown/
+ * .txt/.pdf 等多文件 → batchImport 读取/提取文本（二进制走 POST /api/v1/extract，
+ * 未接线则降级提示）→ dragdrop 纯函数构建待创建清单（frontmatter 识别 / 文件名
+ * + 首段 / id 去重）→ BatchImportDialog 二次确认 → 逐文件创建 + 进度 + 汇总。
  *
  * 工具条：新建技能（admin）+ 刷新（重扫 + 重载列表）+ 来源 Select（全部/内置/
  * 数据卷/扩展）+ 标签 Select（从数据聚合）+ 搜索框（前端过滤 name/description）。
@@ -72,6 +81,11 @@ export default function SkillsPage(): React.ReactNode {
   const [deleteTarget, setDeleteTarget] = useState<SkillEntryView | null>(null);
   /** 编辑弹窗目标（null = 关闭；仅数据卷来源可编辑，builtin/extension 隐藏入口） */
   const [editTarget, setEditTarget] = useState<SkillEntryView | null>(null);
+  /** 拖拽批量导入：dragover 高亮 / 读取提取忙态 / 待创建清单 */
+  const [dragActive, setDragActive] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
+  const [batchDrafts, setBatchDrafts] = useState<SkillDraft[] | null>(null);
+  const [batchOpen, setBatchOpen] = useState(false);
 
   /** 角色：refresh/新建/删除要求 admin/root（与内核 requireAdmin 对齐） */
   const { me, loading: meLoading } = useMe();
@@ -118,6 +132,73 @@ export default function SkillsPage(): React.ReactNode {
     [skills],
   );
 
+  /** 既有 id 集合（拖拽批量导入的 slug 去重基线） */
+  const existingIds = useMemo(() => (skills ?? []).map((s) => s.id), [skills]);
+
+  // -------------------------------------------------------------------------
+  // 拖拽批量导入（admin/root）：页面级拖拽区 → 读取/提取 → 待创建清单弹窗
+  // -------------------------------------------------------------------------
+
+  const isFileDrag = useCallback((e: React.DragEvent<HTMLDivElement>): boolean =>
+    Array.from(e.dataTransfer?.types ?? []).includes('Files'), []);
+
+  const handleDragEnter = useCallback(
+    (e: React.DragEvent<HTMLDivElement>): void => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      setDragActive(true);
+    },
+    [isFileDrag],
+  );
+
+  const handleDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>): void => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault(); // 允许 drop（压掉浏览器默认「打开文件」）
+      e.dataTransfer.dropEffect = 'copy';
+      setDragActive(true);
+    },
+    [isFileDrag],
+  );
+
+  const handleDragLeave = useCallback(
+    (e: React.DragEvent<HTMLDivElement>): void => {
+      if (!isFileDrag(e)) return;
+      // 仅在真正离开页面根（relatedTarget 不在容器内）时熄灭高亮
+      if (e.relatedTarget === null || !e.currentTarget.contains(e.relatedTarget as Node)) setDragActive(false);
+    },
+    [isFileDrag],
+  );
+
+  /** drop → 读取/提取文本 → 构建待创建清单（frontmatter/首段/id 去重）→ 二次确认弹窗 */
+  const handleDrop = useCallback(
+    async (e: React.DragEvent<HTMLDivElement>): Promise<void> => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      setDragActive(false);
+      // 弹窗已打开（确认/进行中）时忽略新拖入，避免污染进行中的批量状态
+      if (importBusy || batchOpen) return;
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length === 0) return;
+      if (!canManage) {
+        toast.error('无权批量导入', '批量创建技能需要 admin / root 角色');
+        return;
+      }
+      setImportBusy(true);
+      try {
+        const inputs = await readDroppedFiles(files);
+        if (inputs.some((i) => i.error === EXTRACT_ENDPOINT_UNAVAILABLE)) {
+          toast.info('文本提取端点未接线', 'PDF / DOCX 等二进制文件暂时无法导入，.md / .txt 不受影响');
+        }
+        setBatchDrafts(buildSkillDrafts(inputs, existingIds));
+        setBatchOpen(true);
+      } finally {
+        setImportBusy(false);
+      }
+    },
+    [isFileDrag, canManage, existingIds, importBusy, batchOpen],
+  );
+
   /** 按来源分布计数（与 refresh 的 bySource 同一聚合口径） */
   const counts = useMemo(() => {
     const bySource: Record<SkillSourceView, number> = { builtin: 0, data: 0, extension: 0 };
@@ -145,12 +226,36 @@ export default function SkillsPage(): React.ReactNode {
   }, []);
 
   return (
-    <div className="flex flex-col gap-6">
+    <div
+      className={cn('relative flex flex-col gap-6', dragActive && 'bg-primary/5 rounded-lg')}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={(e) => void handleDrop(e)}
+    >
+      {/* 拖入高亮覆盖层（拖拽文件悬停 / 读取提取中） */}
+      {(dragActive || importBusy) && (
+        <div
+          className="border-primary/50 bg-background/80 pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed"
+          aria-hidden
+        >
+          <FileUpIcon className="text-primary size-8" />
+          <p className="text-foreground text-sm font-medium">
+            {importBusy ? '正在读取文件（二进制文档提取文本中）…' : '松开以批量创建技能'}
+          </p>
+          <p className="text-muted-foreground text-xs">支持 .md / .markdown / .txt 与 .pdf / .docx 等文档，可多选</p>
+        </div>
+      )}
+
       {/* 页头 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
           <h2 className="text-lg font-semibold tracking-tight">Skills 技能</h2>
-          <p className="text-muted-foreground text-sm">Agent Skills 技能库：提示词包的发现、查看与刷新。</p>
+          <p className="text-muted-foreground text-sm">
+            Agent Skills 技能库：提示词包的发现、查看与刷新。支持把{' '}
+            <code className="bg-muted rounded px-1 py-0.5 font-mono text-xs">.md / .txt / .pdf</code>{' '}
+            等文件直接拖入页面批量创建技能。
+          </p>
         </div>
         <div className="flex items-center gap-2">
           {canManage && (
@@ -328,6 +433,17 @@ export default function SkillsPage(): React.ReactNode {
 
       {/* 编辑（admin；仅数据卷来源；保存 = DELETE+POST，内核均已 refresh → 重载列表） */}
       <EditSkillDialog target={editTarget} onClose={() => setEditTarget(null)} onSaved={() => void load()} />
+
+      {/* 拖拽批量创建（admin；待创建清单二次确认 → 逐文件创建 → 汇总 + 重载列表） */}
+      <BatchImportDialog
+        open={batchOpen}
+        drafts={batchDrafts ?? []}
+        onOpenChange={(next) => {
+          setBatchOpen(next);
+          if (!next) setBatchDrafts(null);
+        }}
+        onCreated={() => void load()}
+      />
     </div>
   );
 }

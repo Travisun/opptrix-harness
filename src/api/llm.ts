@@ -13,6 +13,15 @@
  *                                secrets（键 `llm.<name>`）并以 apiKeySecretRef 引用落盘
  *                                （明文不进配置存储）；未接线时含 apiKey 的项 → 400。
  * - GET  /api/v1/llm/models      供应商模型聚合视图（任意已认证身份；缺省 → 501）
+ * - GET  /api/v1/llm/ha          HA 自动回退开关查询（admin）。deps.getHa 未注入 → {enabled:false}
+ *                                （**HA 默认关闭**）；已接线 → {enabled: <settings 'llm.ha.enabled'>}
+ * - PUT  /api/v1/llm/ha          覆写 HA 自动回退开关（admin）body {enabled: boolean} →
+ *                                deps.setHa 持久化 settings('llm.ha.enabled') → {ok:true,enabled}；
+ *                                deps.setHa 未注入 → 501 NOT_IMPLEMENTED。
+ *                                集成接线点（core-services，本文件不含装配）：gateway deps 的
+ *                                haEnabled 闭包应接同一 settings 键——
+ *                                `haEnabled: async () => settings.get('llm.ha.enabled', false)`、
+ *                                `getHa/setHa: settings.get/set('llm.ha.enabled', …)`。
  *
  * 约定：
  * - 鉴权：token 经 extractToken（Authorization: Bearer 优先，其次 ?token=）交 deps.checker
@@ -87,6 +96,14 @@ export interface LlmRoutesDeps {
    * 明文的项 → 400 VALIDATION_FAILED（明文密钥不落配置存储）。
    */
   secrets?: { set(name: string, value: string): Promise<void> };
+  /**
+   * LLM 高可用（HA）自动回退开关（可选）：读当前开关 / 持久化到 settings
+   * ('llm.ha.enabled')。未接线时 GET /llm/ha 返回 {enabled:false}（默认关闭）、
+   * PUT /llm/ha 返回 501 NOT_IMPLEMENTED。集成层须把同一键闭包接进 gateway
+   * deps.haEnabled（见 LlmGatewayDeps.haEnabled 注释）。
+   */
+  getHa?: () => Promise<boolean>;
+  setHa?: (enabled: boolean) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +155,9 @@ const providerConfigSchema = z
 
 /** PUT /api/v1/llm/providers 请求体：供应商配置数组（允许空数组 = 清空全部供应商） */
 const providersBodySchema = z.array(providerConfigSchema).max(64);
+
+/** PUT /api/v1/llm/ha 请求体：HA 自动回退开关 */
+const haBodySchema = z.object({ enabled: z.boolean() });
 
 // ---------------------------------------------------------------------------
 // SSE 辅助
@@ -412,6 +432,36 @@ export function registerLlmRoutes(app: FastifyInstance, deps: LlmRoutesDeps): vo
       }
       await deps.providersAdmin.set(stored);
       return { ok: true };
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET/PUT /api/v1/llm/ha — HA 自动回退开关（admin；持久化 settings 'llm.ha.enabled'）
+  // -------------------------------------------------------------------------
+
+  // GET ha — 开关查询（getHa 未接线 → {enabled:false}：HA 默认关闭）
+  app.get('/api/v1/llm/ha', routeOptions, async (request) => {
+    await requireAdmin(request);
+    if (deps.getHa === undefined) return { enabled: false };
+    return { enabled: await deps.getHa() };
+  });
+
+  // PUT ha — 覆写开关（setHa 未接线 → 501；集成层须把同一键接进 gateway deps.haEnabled）
+  app.put(
+    '/api/v1/llm/ha',
+    { ...routeOptions, errorHandler: mapBodyParseError },
+    async (request) => {
+      await requireAdmin(request);
+      if (deps.setHa === undefined) throw notWired('llm ha toggle');
+      const parsed = haBodySchema.safeParse(request.body);
+      if (!parsed.success) {
+        throw err('VALIDATION_FAILED', {
+          message: 'body must be { enabled: boolean } — persisted to settings key llm.ha.enabled',
+          detail: parsed.error.issues,
+        });
+      }
+      await deps.setHa(parsed.data.enabled);
+      return { ok: true, enabled: parsed.data.enabled };
     },
   );
 

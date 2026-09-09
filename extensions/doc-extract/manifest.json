@@ -1,0 +1,9 @@
+{
+  "id": "doc-extract",
+  "api": 1,
+  "version": "1.0.0",
+  "main": "index.js",
+  "builtin": true,
+  "permissions": ["http", "files:read"],
+  "displayName": "文档提取"
+}

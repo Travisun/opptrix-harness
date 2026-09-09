@@ -3,7 +3,8 @@
  *
  * 路由（全部要求已认证；dispatch/cancel 仅 admin/root，查询任意角色）：
  * - POST /api/v1/tasks/dispatch      派发任务 → 201 TaskRecord
- *                                    （v1 仅开放内置 'echo'；其他 name → 400 HARNESS-1008
+ *                                    （仅开放内置任务名（BUILTIN_TASK_NAMES：'echo' /
+ *                                    'file-extract'）；其他 name → 400 HARNESS-1008
  *                                    BAD_REQUEST "task type not registered"）
  * - GET  /api/v1/tasks               列表（?extId=&status=&limit=，limit 缺省 50）
  * - GET  /api/v1/tasks/:id           读取单个任务（未找到 → 404 HARNESS-3004 形状）
@@ -19,6 +20,7 @@ import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from
 import { z } from 'zod';
 
 import { extractToken } from '../kernel/auth/authProxy.js';
+import { BUILTIN_TASK_NAMES } from '../kernel/tasks/worker-pool.js';
 import type { TaskManager } from '../kernel/tasks/manager.js';
 import { TASK_STATUSES } from '../kernel/tasks/store.js';
 import { err, HarnessError } from '../kernel/errors/index.js';
@@ -134,11 +136,12 @@ export function registerTaskRoutes(app: FastifyInstance, deps: TaskRoutesDeps): 
         throw err('VALIDATION_FAILED', { detail: parsed.error.issues });
       }
       const { name } = parsed.data;
-      if (name !== 'echo') {
-        // v1 仅开放内置 echo；真实扩展执行器在阶段 9 接入
+      if (!(BUILTIN_TASK_NAMES as readonly string[]).includes(name)) {
+        // 仅开放内置任务名（'echo' 自测管道 + 'file-extract' 提取执行器）；扩展任务经
+        // extId + host.taskRun 派发给扩展线程，不走本 REST 面
         throw err('BAD_REQUEST', {
-          message: `task type not registered: "${name}" (v1 ships the built-in "echo" task only; extension task executors are not available in v1 (planned))`,
-          detail: { name, registered: ['echo'] },
+          message: `task type not registered: "${name}" (registered built-in tasks: ${BUILTIN_TASK_NAMES.map((n) => `"${n}"`).join(', ')})`,
+          detail: { name, registered: [...BUILTIN_TASK_NAMES] },
         });
       }
       const record = await deps.manager.dispatch({

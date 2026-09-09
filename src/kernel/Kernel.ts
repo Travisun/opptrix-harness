@@ -125,6 +125,13 @@ export const CONTAINER_KEYS = {
   mcpRegistry: 'mcp.registry',
   /** PluginRegistry（插件包发现/聚合/贡献注入；REST /api/v1/plugins* 与扩展桥 plugins.* 共用） */
   pluginsRegistry: 'plugins.registry',
+  // ---- 记忆 / 语音识别 / 文件提取（OS 能力层，createCoreServices 总装配登记）----
+  /** MemoryManager（全局 LLM 记忆系统；REST /api/v1/memory* 与扩展桥 memory.* 共用） */
+  memoryManager: 'memory.manager',
+  /** AsrManager（语音识别状态机；REST /api/v1/asr* 与扩展桥 asr.* 共用） */
+  asrManager: 'asr.manager',
+  /** FileExtractService（文件内容提取；REST /api/v1/extract* 与扩展桥 extract.* 共用） */
+  fileExtract: 'fileextract.service',
   /** skills/mcp/plugins 三桥 handler 并表（createKernelHandlers 的 extraBridges 懒解析源） */
   extBridges: 'ext.bridges',
   // ---- 扩展子系统（阶段 9 总装配登记，见 #runBoot 的扩展接线段）----

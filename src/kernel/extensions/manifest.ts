@@ -121,6 +121,10 @@ const PERMISSION_WHITELIST: ReadonlySet<string> = new Set([
   'mcp:client',
   // 插件目录读面（plugins.list 桥 topic）
   'plugins',
+  // 全局记忆系统（memory.search/add/extract/list/forget 桥 topics 的统一权限闸）
+  'memory',
+  // 语音识别（asr.status/asr.transcribe 桥 topics 的统一权限闸）
+  'asr',
 ]);
 
 /** net:out:<domain> 的域名形状（hostname：点分字母数字连字符段，允许单段如 localhost） */

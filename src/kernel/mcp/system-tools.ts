@@ -234,8 +234,93 @@ function sleep(ms: number): Promise<void> {
 /**
  * 构建系统工具目录（每次调用返回全新数组；定义本身无状态，可安全复用）。
  * execute 的入参已在 runtime/SDK 层校验，此处再以 guard 兜底保证「工具不抛」。
+ *
+ * @param extra 集成方追加的工具（如 createExtractTools 产出的 files_extract；
+ *   由 Kernel /mcp 接线处合并，保持既有目录零破坏）。
  */
-export function createSystemTools(): SystemTool[] {
+export function createSystemTools(extra: SystemTool[] = []): SystemTool[] {
+  return [...createBuiltinSystemTools(), ...extra];
+}
+
+// ---------------------------------------------------------------------------
+// 文件提取工具（fileextract 域；经 createExtractTools 注入 createSystemTools）
+// ---------------------------------------------------------------------------
+
+/**
+ * files_extract 工具的依赖注入面（**直接注入模式**：内核装配不经过容器登记，
+ * 集成方在 /mcp 接线处传 `() => ({ service })`；fileextract 服务未装配时返回
+ * `{ service: undefined }`，工具收敛为 {ok:false,error:HARNESS-9001}，不影响其余工具）。
+ */
+export type ExtractToolsDeps = {
+  service?: {
+    extractFile(
+      fileId: string,
+      opts?: { ocr?: 'auto' | 'never' | 'always'; deep?: boolean },
+    ): Promise<{
+      fileId: string;
+      engine: string;
+      ocrUsed: boolean;
+      pages?: number;
+      charCount: number;
+      text: string;
+      warnings: string[];
+      needsOcr?: boolean;
+      durationMs: number;
+    }>;
+  };
+};
+
+/** files_extract 返回文本的截断上限（32KB，与扩展桥 extract.file 一致；全文已落 file_extracts） */
+const EXTRACT_TOOL_TEXT_MAX_BYTES = 32 * 1024;
+
+/**
+ * 构建文件提取工具目录（当前仅 files_extract；集成方：
+ * `createSystemTools(createExtractTools(() => ({ service: fileExtractService })))`）。
+ */
+export function createExtractTools(getDeps: () => ExtractToolsDeps | undefined): SystemTool[] {
+  return [
+    defineTool(
+      'files_extract',
+      '提取已上传文件的文本内容（txt/md/csv/json/html/pdf/word/excel/ppt，图片与扫描件按 OCR 模型可用性识别；'
+      + '全文同时落库（file_extracts）供 files_read 关联读取；返回文本截断到 32KB）。',
+      {
+        fileId: z.string().min(1).max(128),
+        ocr: z.enum(['auto', 'never', 'always']).optional(),
+        deep: z.boolean().optional(),
+      },
+      (args, _ctx) =>
+        guard(async () => {
+          void _ctx;
+          const service = getDeps()?.service;
+          if (!service) {
+            return fail(
+              'HARNESS-9001',
+              'file extract service is not registered in this kernel assembly (see src/kernel/fileextract/service.ts / createExtractTools)',
+            );
+          }
+          const result = await service.extractFile(String(args['fileId']), {
+            ...(args['ocr'] !== undefined ? { ocr: args['ocr'] as 'auto' | 'never' | 'always' } : {}),
+            ...(args['deep'] !== undefined ? { deep: args['deep'] === true } : {}),
+          });
+          const truncated = Buffer.byteLength(result.text, 'utf8') > EXTRACT_TOOL_TEXT_MAX_BYTES;
+          return ok({
+            fileId: result.fileId,
+            engine: result.engine,
+            ocrUsed: result.ocrUsed,
+            pages: result.pages ?? null,
+            charCount: result.charCount,
+            needsOcr: result.needsOcr ?? false,
+            warnings: result.warnings,
+            truncated,
+            text: truncated ? result.text.slice(0, EXTRACT_TOOL_TEXT_MAX_BYTES) : result.text,
+          });
+        }),
+    ),
+  ];
+}
+
+/** 内置目录（不含集成方追加项；createSystemTools 的实现主体） */
+function createBuiltinSystemTools(): SystemTool[] {
   return [
     // ------------------------------------------------------------ skills ----
     defineTool(

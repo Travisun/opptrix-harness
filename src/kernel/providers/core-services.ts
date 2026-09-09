@@ -25,9 +25,13 @@
  *   McpConfigStore(dataDir) + McpRegistry ← configStore / logger；PluginRegistry ←
  *   dataDir / logger / skillsRegistry（直接透传） / mcpRegistry 适配器（configStore +
  *   connect 编排，id 冠前缀归一）/ scriptRunner（沙箱容器执行，未启用 → NOT_IMPLEMENTED）
- * - 三桥（skills.* / mcp.* / plugins.*）并表登记容器 'ext.bridges'，由 Kernel 经
- *   createKernelHandlers({ extraBridges }) 懒合入 worker→kernel 分发表；权限由桥工厂
- *   自查（'skills' / 'mcp:client' / 'plugins'），kernel-handlers 的 TOPIC_PERMISSIONS
+ * - MemoryManager ← MemoryStore(db) + createMemoryExtractor({ gateway })；AsrManager ←
+ *   modelDir(<dataDir>/models/asr)；FileExtractService ← files / db / 任务池适配器
+ *   （TaskManager.dispatch('file-extract') → 线程池，完成态经事件总线回流）
+ * - 三桥（skills.* / mcp.* / plugins.*）+ 三能力桥（memory.* / asr.* / extract.*）并表
+ *   登记容器 'ext.bridges'，由 Kernel 经 createKernelHandlers({ extraBridges }) 懒合入
+ *   worker→kernel 分发表；权限由桥工厂自查（'skills' / 'mcp:client' / 'plugins' /
+ *   'memory' / 'asr' / 'files:read'），kernel-handlers 的 TOPIC_PERMISSIONS
  *   矩阵刻意不重复收口（避免双闸口径漂移）。
  */
 import { cpSync, readFileSync } from 'node:fs';
@@ -38,9 +42,12 @@ import type { FastifyInstance } from 'fastify';
 import type { Knex } from 'knex';
 import type { Logger } from 'pino';
 
+import { registerAsrRoutes } from '../../api/asr.js';
 import { registerChatRoutes } from '../../api/chat.js';
+import { registerExtractRoutes } from '../../api/extract.js';
 import { registerFileRoutes } from '../../api/files.js';
 import { registerLlmRoutes } from '../../api/llm.js';
+import { registerMemoryRoutes } from '../../api/memory.js';
 import { registerMcpRoutes } from '../../api/mcp.js';
 import { registerNotificationRoutes } from '../../api/notifications.js';
 import { runAgentLoop, type AgentLoopToolRuntime } from '../agents/runner.js';
@@ -72,6 +79,15 @@ import { EVENT_NS } from '../hooks/points.js';
 import { LlmGateway } from '../llm/gateway.js';
 import type { LlmChatInput, LlmProviderConfig, LlmStreamEvent, LlmChatResult } from '../llm/types.js';
 import { createMcpBridge, McpConfigStore, McpRegistry, MCP_CLIENT_PERMISSION } from '../mcp/index.js';
+import {
+  createMemoryBridge,
+  createMemoryExtractor,
+  DEFAULT_MEMORY_SETTINGS,
+  MEMORY_SETTINGS_KEY,
+  MemoryManager,
+  MemoryStore,
+  mergeMemorySettings,
+} from '../memory/index.js';
 import { NotificationStore, NotificationManager, createConsoleDriver, createWebhookDriver, inboxDriver } from '../notification/index.js';
 import { createEmailDriver } from '../notification/drivers/email.js';
 import {
@@ -81,6 +97,9 @@ import {
   PluginRegistry,
 } from '../plugins/index.js';
 import type { McpRegistryLike, PluginMcpServerConfig, ScriptRunnerLike } from '../plugins/types.js';
+import { createFileExtractBridge, EXTRACT_TASK_NAME, FileExtractService } from '../fileextract/index.js';
+import type { ExtractResult, ExtractTaskArgs, ExtractTaskPool } from '../fileextract/types.js';
+import { createAsrBridge, AsrManager } from '../asr/index.js';
 import type { SandboxManager } from '../sandbox/manager.js';
 import { createSkillsBridge, deleteSkill, SkillRegistry, writeSkill } from '../skills/index.js';
 import { TaskManager, TaskStore, TaskWorkerPool } from '../tasks/index.js';
@@ -99,6 +118,9 @@ const DELIVERIES_TABLE = 'deliveries';
 
 /** TaskManager 默认任务超时（毫秒）：派发任务超过该时长由 sweep 判 failed('timeout') */
 const CORE_TASK_TIMEOUT_MS = 600_000;
+
+/** 提取任务池派发的等待上限（毫秒）：与提取主线程整体超时（EXTRACT_SYNC_TIMEOUT_MS）同量级 */
+const EXTRACT_POOL_WAIT_MS = 300_000;
 
 // ---- Skills / MCP / 插件（OS 能力目录）----
 
@@ -358,6 +380,100 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     logger,
   });
   kernel.container.instance(CONTAINER_KEYS.llm, gateway);
+
+  // -------------------------------------------------------------------------
+  // memory — 全局 LLM 记忆系统（内核全局库 memories 表 + FTS5；LLM 抽取管线走网关）。
+  // REST /api/v1/memory*（settings 面读 settings 'memory.settings'，PUT 联动容量上限）
+  // 与扩展桥 memory.*（manifest 'memory' 权限）共用同一 manager。
+  // -------------------------------------------------------------------------
+  const memoryManager = new MemoryManager({
+    store: new MemoryStore(db),
+    extractor: createMemoryExtractor({ gateway }),
+  });
+  kernel.container.instance(CONTAINER_KEYS.memoryManager, memoryManager);
+  // 容量上限以持久化设置为准（缺省 10000；PUT /api/v1/memory/settings 运行期再联动）。
+  // settings 预读失败不阻塞装配（按缺省容量运行，REST 层读取设置另有兜底）。
+  void settings
+    .get<unknown>(MEMORY_SETTINGS_KEY, DEFAULT_MEMORY_SETTINGS)
+    .then((raw) => {
+      memoryManager.setMaxMemories(mergeMemorySettings(raw).maxMemories);
+    })
+    .catch((cause: unknown) => {
+      logger.warn({ err: cause }, '[core-services] memory settings preload failed (defaults apply)');
+    });
+
+  // -------------------------------------------------------------------------
+  // asr — 语音识别（Whisper；模型目录 <dataDir>/models/asr，boot 期后台静默下载）。
+  // env 透传：HARNESS_ASR_ENABLED=false 整体关闭；HARNESS_ASR_AUTO_DOWNLOAD=0 关自动下载；
+  // HARNESS_ASR_MODEL / 镜像链 base 由 downloader/manager 自行读取，不在此重复裁决。
+  // -------------------------------------------------------------------------
+  const asrManager = new AsrManager({
+    modelDir: join(config.dataDir, 'models', 'asr'),
+    logger,
+    // 缺省开启后台静默下载（env HARNESS_ASR_AUTO_DOWNLOAD=0 显式关闭）
+    autoDownload: process.env['HARNESS_ASR_AUTO_DOWNLOAD'] !== '0',
+  });
+  kernel.container.instance(CONTAINER_KEYS.asrManager, asrManager);
+
+  // -------------------------------------------------------------------------
+  // fileextract — 文件内容提取（级联引擎 + OCR 升级 + file_extracts 惰性落库）。
+  // OCR 模型目录 <dataDir>/models/ocr；HARNESS_OCR_AUTO_DOWNLOAD=1 才允许提取时自动下载
+  // （缺省关，模型四件套不外联）。CPU 密集提取优先派任务线程池（name 'file-extract'，
+  // task-worker fn 表注册执行器），派发失败由服务回退主线程执行并附警告。
+  // -------------------------------------------------------------------------
+  /**
+   * TaskManager → ExtractTaskPool 适配器：dispatch 落库 + 线程池执行（REST /api/v1/tasks
+   * 同款管线，任务可观测可取消），完成态经事件总线回流为池结果。run 的 reject 语义
+   * 供 FileExtractService 回退主线程执行（附警告），不存在未处理 rejection。
+   */
+  const extractTaskPool: ExtractTaskPool = {
+    run(_jobId: string, args: ExtractTaskArgs): Promise<ExtractResult> {
+      return taskManager.dispatch({ name: EXTRACT_TASK_NAME, args }).then(
+        (record) =>
+          new Promise<ExtractResult>((resolve, reject) => {
+            let offDone: () => void = () => {};
+            let offFailed: () => void = () => {};
+            const settle = (finish: () => void): void => {
+              clearTimeout(timer);
+              offDone();
+              offFailed();
+              finish();
+            };
+            const timer = setTimeout(() => {
+              settle(() =>
+                reject(new Error(`file-extract task ${record.id} timed out after ${EXTRACT_POOL_WAIT_MS}ms`)),
+              );
+            }, EXTRACT_POOL_WAIT_MS);
+            offDone = eventBus.on('task.completed', (payload) => {
+              const p = (payload ?? {}) as { id?: unknown; result?: unknown };
+              if (p.id !== record.id) return;
+              settle(() => resolve(p.result as ExtractResult));
+            });
+            offFailed = eventBus.on('task.failed', (payload) => {
+              const p = (payload ?? {}) as { id?: unknown; error?: unknown };
+              if (p.id !== record.id) return;
+              settle(() =>
+                reject(
+                  new Error(
+                    typeof p.error === 'string' && p.error !== '' ? p.error : 'file-extract task failed',
+                  ),
+                ),
+              );
+            });
+          }),
+      );
+    },
+  };
+
+  const fileExtractService = new FileExtractService({
+    dataDir: config.dataDir,
+    autoDownload: process.env['HARNESS_OCR_AUTO_DOWNLOAD'] === '1',
+    logger,
+    files: fileService,
+    db,
+    taskPool: extractTaskPool,
+  });
+  kernel.container.instance(CONTAINER_KEYS.fileExtract, fileExtractService);
 
   // -------------------------------------------------------------------------
   // agents —— LLM 子代理运行时（严格父子树；工具循环 = 系统 MCP 工具目录）
@@ -729,6 +845,20 @@ export function createCoreServices(kernel: Kernel): CoreServices {
       requirePermission: (extId, topic, permission) => requireExtPermission(extId, topic, permission),
     }),
     ...gatedBridge(createPluginsBridge({ registry: pluginsRegistry }), PLUGINS_PERMISSION),
+    // memory / asr / extract 三桥（OS 能力层）：自带扩展端点闸，权限经 requirePermission
+    // 闭包以 'memory' / 'asr' / 'files:read' 收口（权限名在 extensions/manifest.ts 白名单）。
+    ...createMemoryBridge({
+      manager: memoryManager,
+      requirePermission: (extId, topic, permission) => requireExtPermission(extId, topic, permission),
+    }),
+    ...createAsrBridge({
+      manager: asrManager,
+      requirePermission: (extId, topic, permission) => requireExtPermission(extId, topic, permission),
+    }),
+    ...createFileExtractBridge({
+      service: fileExtractService,
+      requirePermission: (extId, topic, permission) => requireExtPermission(extId, topic, permission),
+    }),
   });
 
   return {
@@ -802,6 +932,22 @@ export function createCoreServices(kernel: Kernel): CoreServices {
         },
       });
       registerMcpRoutes(app, { checker, registry: mcpRegistry, configStore: mcpConfigStore });
+      // 记忆 / 语音识别 / 文件提取 REST（/api/v1/memory* · /api/v1/asr* · /api/v1/extract*）。
+      // 三组前缀独立，与 auth mount（/api/v1/auth|users）、/api/v1/system|cron|sandbox 等互不冲突。
+      registerMemoryRoutes(app, { checker, manager: memoryManager, settings });
+      // asr 二进制直传（application/octet-stream）需要 **Buffer** 解析器，而根上下文稍后由
+      // ExtRouteRegistry 再注册同 content-type 的 **string** 解析器（同一 fastify 上下文每个
+      // content-type 仅允许一个 parser，后注册者直接抛错）——挂到**兄弟封装上下文**隔离：
+      // asr 子上下文自带 Buffer parser，根上下文维持 ExtRouteRegistry 的注册权。
+      app.register((asrCtx) => {
+        registerAsrRoutes(asrCtx, { checker, manager: asrManager });
+      });
+      // extract 路由自注册 multipart（extract.ts 内部 `app.register(multipart)`）：与 files/
+      // plugins 同款手法挂到兄弟封装上下文——根上下文一旦被注册 multipart parser，会污染
+      // 其后加载的子上下文（extensions 安装路由的 installCtx 克隆父表后二次注册即抛错）。
+      app.register((extractCtx) => {
+        registerExtractRoutes(extractCtx, { checker, service: fileExtractService, files: fileService });
+      });
       // plugins 路由自带 `app.register(multipart)`（与 files 路由同款手法）。同一 fastify
       // 实例上两次注册同一个 fp 包装插件会撞装饰器（FST_ERR_DEC_ALREADY_PRESENT）——
       // 这里挂到子上下文隔离：multipart 装饰器只对本上下文路由可见，路由照常暴露。
@@ -817,6 +963,9 @@ export function createCoreServices(kernel: Kernel): CoreServices {
 
     async start(): Promise<void> {
       await taskManager.start();
+      // ASR boot 钩子：autoDownload 开启且模型未缓存时后台静默下载（fire-and-forget，
+      // 失败只落状态与日志——绝不阻塞内核启动）
+      asrManager.init();
       // skills / plugins 聚合：磁盘扫描 + 贡献重建（目录缺失即空库，绝不抛）
       await skillsRegistry.refresh();
       await pluginsRegistry.refresh();
@@ -833,6 +982,18 @@ export function createCoreServices(kernel: Kernel): CoreServices {
 
     async stop(): Promise<void> {
       await taskManager.stop();
+      // ASR pipeline 卸载（幂等；失败不阻断关停）
+      try {
+        await asrManager.unloadEngine();
+      } catch (cause) {
+        logger.warn({ err: cause }, 'core-services: asr engine unload during shutdown warned');
+      }
+      // OCR 引擎单例释放（幂等不抛；失败不阻断关停）
+      try {
+        await fileExtractService.close();
+      } catch (cause) {
+        logger.warn({ err: cause }, 'core-services: fileextract ocr close during shutdown warned');
+      }
       // 优雅断开全部 MCP 连接（stdio 子进程/HTTP 会话）；配置损坏等异常不阻断关停
       try {
         for (const cfg of await mcpConfigStore.load()) {

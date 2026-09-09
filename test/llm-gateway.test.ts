@@ -11,7 +11,12 @@
  * LlmChatResult.toolCalls 非流式结构化工具调用提取（openai-chat tool_calls / openai-responses
  * function_call / anthropic tool_use；无调用时缺省不出现；gateway 全链路透传）、
  * gateway 路由（模型未找到 LLM_MODEL_NOT_FOUND、secret 缺失 LLM_NOT_CONFIGURED、
- * 多 provider 取第一个、全链路参数透传与流式生成器透出）。
+ * 多 provider 取第一个、全链路参数透传与流式生成器透出）、
+ * HA 自动回退（默认关闭：deps 缺省/显式 false/探测抛错 → 主路由失败原样抛、零回退；
+ * 开启：主 provider 失败 → 按配置序自下一个 provider 的 models[0] 缺省模型回退成功、
+ * 全部失败 → LLM_PROVIDER_ERROR（detail.attempts 完整尝试链、顺序=配置序跳过当前）、
+ * 模型未命中 → 自第一个 provider 回退、secret 缺失（LLM_NOT_CONFIGURED）记入尝试链、
+ * stream:true 仅路由级失败参与回退、每次尝试经 logger.warn 审计）。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import pino from 'pino';
@@ -117,11 +122,13 @@ const CHAT_INPUT: LlmChatInput = {
 function makeGateway(
   providers: LlmProviderConfig[],
   secrets: Record<string, string | null> = { 'secret://llm/mock': 'sk-test' },
+  haEnabled?: () => Promise<boolean>,
 ): LlmGateway {
   return new LlmGateway({
     getProviders: async () => providers,
     resolveSecret: async (ref) => secrets[ref] ?? null,
     logger: pino({ level: 'silent' }),
+    ...(haEnabled !== undefined ? { haEnabled } : {}),
   });
 }
 
@@ -651,5 +658,279 @@ describe('LlmChatResult.toolCalls — 三协议非流式结构化提取', () => 
     const gw = makeGateway([provider()]);
     const res = (await gw.chat(CHAT_INPUT)) as LlmChatResult;
     expect(res.toolCalls).toEqual([{ id: 'call_9', name: 'lookup', argsJson: '{}' }]);
+  });
+});
+
+// ---------- LlmGateway — HA 自动回退（默认关闭） ----------
+
+describe('LlmGateway — HA 自动回退（默认关闭）', () => {
+  const HA_INPUT: LlmChatInput = { model: 'm1', messages: [{ role: 'user', content: 'hi' }] };
+  const HA_SECRETS = {
+    'secret://llm/p1': 'sk-1',
+    'secret://llm/p2': 'sk-2',
+    'secret://llm/p3': 'sk-3',
+  };
+
+  function haProvider(name: string, models: string[]): LlmProviderConfig {
+    return provider({ name, baseUrl: `https://${name}.local/v1`, apiKeySecretRef: `secret://llm/${name}`, models });
+  }
+
+  function upstreamFail(): Response {
+    return new Response(JSON.stringify({ error: { message: 'upstream down' } }), {
+      status: 500,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  function upstreamOk(text: string): Response {
+    return jsonResponse({
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+    });
+  }
+
+  it('HA 关闭（deps 缺省未注入 haEnabled）→ 主 provider 失败原样抛 LLM_PROVIDER_ERROR，零回退', async () => {
+    const calls = stubFetch(() => upstreamFail());
+    const gw = makeGateway([haProvider('p1', ['m1']), haProvider('p2', ['m2'])], HA_SECRETS);
+    let caught: unknown;
+    try {
+      await gw.chat(HA_INPUT);
+    } catch (e) {
+      caught = e;
+    }
+    const he = caught as HarnessError;
+    expect(he.code).toBe('HARNESS-5002');
+    expect(he.retryable).toBe(true);
+    // 未回退：只打了主 provider 一次
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe('https://p1.local/v1/chat/completions');
+  });
+
+  it('HA 关闭（haEnabled()===false）→ 同样保持单 provider 语义，原样抛不回退', async () => {
+    const calls = stubFetch(() => upstreamFail());
+    const gw = makeGateway([haProvider('p1', ['m1']), haProvider('p2', ['m2'])], HA_SECRETS, async () => false);
+    let caught: unknown;
+    try {
+      await gw.chat(HA_INPUT);
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as HarnessError).code).toBe('HARNESS-5002');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('HA 开启 → 主 provider 上游失败 → 自动切下一 provider 的缺省模型成功（两次 fetch 上游）', async () => {
+    const calls = stubFetch((url) => (url.startsWith('https://p1.local') ? upstreamFail() : upstreamOk('from-p2')));
+    const gw = makeGateway(
+      [haProvider('p1', ['m1']), haProvider('p2', ['m2', 'm2b'])],
+      HA_SECRETS,
+      async () => true,
+    );
+    const res = (await gw.chat(HA_INPUT)) as LlmChatResult;
+    expect(res.text).toBe('from-p2');
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.url).toBe('https://p1.local/v1/chat/completions');
+    // 回退尝试用 provider2 的 models[0] 缺省模型 + 该 provider 自己的密钥
+    expect(calls[1]?.url).toBe('https://p2.local/v1/chat/completions');
+    expect(calls[1]?.body.model).toBe('m2');
+    expect(calls[1]?.headers.get('authorization')).toBe('Bearer sk-2');
+  });
+
+  it('HA 开启 → 全部 provider 失败 → LLM_PROVIDER_ERROR，detail.attempts 为完整尝试链（配置序）', async () => {
+    const calls = stubFetch(() => upstreamFail());
+    const gw = makeGateway(
+      [haProvider('p1', ['m1']), haProvider('p2', ['m2']), haProvider('p3', ['m3'])],
+      HA_SECRETS,
+      async () => true,
+    );
+    let caught: unknown;
+    try {
+      await gw.chat(HA_INPUT);
+    } catch (e) {
+      caught = e;
+    }
+    const he = caught as HarnessError;
+    expect(he.code).toBe('HARNESS-5002');
+    expect(he.detail).toEqual({
+      model: 'm1',
+      attempts: [
+        { provider: 'p1', model: 'm1', error: { code: 'HARNESS-5002', message: expect.any(String) } },
+        { provider: 'p2', model: 'm2', error: { code: 'HARNESS-5002', message: expect.any(String) } },
+        { provider: 'p3', model: 'm3', error: { code: 'HARNESS-5002', message: expect.any(String) } },
+      ],
+    });
+    expect(calls).toHaveLength(3);
+  });
+
+  it('attempt 顺序 = 配置序且跳过当前模型所在 provider 之前的候选（m2 命中 p2 → 只试 p2/p3）', async () => {
+    const calls = stubFetch(() => upstreamFail());
+    const gw = makeGateway(
+      [haProvider('p1', ['m1']), haProvider('p2', ['m2']), haProvider('p3', ['m3'])],
+      HA_SECRETS,
+      async () => true,
+    );
+    let caught: unknown;
+    try {
+      await gw.chat({ ...HA_INPUT, model: 'm2' });
+    } catch (e) {
+      caught = e;
+    }
+    const he = caught as HarnessError;
+    expect(he.code).toBe('HARNESS-5002');
+    const attempts = (he.detail as { attempts: Array<{ provider: string }> }).attempts;
+    expect(attempts.map((a) => a.provider)).toEqual(['p2', 'p3']);
+    expect(calls.map((c) => c.url)).toEqual(['https://p2.local/v1/chat/completions', 'https://p3.local/v1/chat/completions']);
+  });
+
+  it('HA 开启 → 模型未在任何 provider 声明 → 自第一个 provider 的缺省模型回退成功（非 LLM_MODEL_NOT_FOUND）', async () => {
+    const calls = stubFetch(() => upstreamOk('from-p1-default'));
+    const gw = makeGateway([haProvider('p1', ['m1']), haProvider('p2', ['m2'])], HA_SECRETS, async () => true);
+    const res = (await gw.chat({ ...HA_INPUT, model: 'no-such-model' })) as LlmChatResult;
+    expect(res.text).toBe('from-p1-default');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body.model).toBe('m1');
+  });
+
+  it('HA 开启 → 主 provider secret 缺失（LLM_NOT_CONFIGURED）记入尝试链并继续回退到下一个', async () => {
+    // p1 密钥不可解析（不发起 fetch）；p2/p3 上游 500 → 尝试链 [5001, 5002, 5002]
+    const calls = stubFetch(() => upstreamFail());
+    const gw = makeGateway(
+      [haProvider('p1', ['m1']), haProvider('p2', ['m2']), haProvider('p3', ['m3'])],
+      { 'secret://llm/p2': 'sk-2', 'secret://llm/p3': 'sk-3' },
+      async () => true,
+    );
+    let caught: unknown;
+    try {
+      await gw.chat(HA_INPUT);
+    } catch (e) {
+      caught = e;
+    }
+    const he = caught as HarnessError;
+    expect(he.code).toBe('HARNESS-5002');
+    expect(he.detail).toEqual({
+      model: 'm1',
+      attempts: [
+        { provider: 'p1', model: 'm1', error: { code: 'HARNESS-5001', message: expect.stringContaining('secret://llm/p1') } },
+        { provider: 'p2', model: 'm2', error: { code: 'HARNESS-5002', message: expect.any(String) } },
+        { provider: 'p3', model: 'm3', error: { code: 'HARNESS-5002', message: expect.any(String) } },
+      ],
+    });
+    // p1 密钥缺失不发起上游请求：只有 p2/p3 两次 fetch
+    expect(calls).toHaveLength(2);
+  });
+
+  it('HA 开启但 haEnabled() 自身抛错 → 视为关闭（原样抛，不回退）', async () => {
+    const calls = stubFetch(() => upstreamFail());
+    const gw = makeGateway([haProvider('p1', ['m1']), haProvider('p2', ['m2'])], HA_SECRETS, async () => {
+      throw new Error('settings read exploded');
+    });
+    let caught: unknown;
+    try {
+      await gw.chat(HA_INPUT);
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as HarnessError).code).toBe('HARNESS-5002');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('HA 开启 → stream:true 主 provider 正常 → 生成器直接透出（回退不干预流式）', async () => {
+    const calls = stubFetch(() =>
+      sseResponse([
+        openAiChunk('m1', { choices: [{ index: 0, delta: { content: 'hi' } }] }),
+        openAiChunk('m1', { choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+        'data: [DONE]\n\n',
+      ]),
+    );
+    const gw = makeGateway([haProvider('p1', ['m1']), haProvider('p2', ['m2'])], HA_SECRETS, async () => true);
+    const result = await gw.chat({ ...HA_INPUT, stream: true });
+    const events = await collect(result as AsyncGenerator<LlmStreamEvent>);
+    expect(events).toEqual([
+      { type: 'delta', text: 'hi' },
+      { type: 'done', usage: { inputTokens: 1, outputTokens: 1 } },
+    ]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe('https://p1.local/v1/chat/completions');
+  });
+
+  it('HA 开启 → stream:true 主 provider secret 缺失（路由级失败）→ 回退到下一 provider 的流', async () => {
+    const calls = stubFetch(() =>
+      sseResponse([
+        openAiChunk('m2', { choices: [{ index: 0, delta: { content: 'p2-hello' } }] }),
+        'data: [DONE]\n\n',
+      ]),
+    );
+    const gw = makeGateway(
+      [haProvider('p1', ['m1']), haProvider('p2', ['m2'])],
+      { 'secret://llm/p2': 'sk-2' },
+      async () => true,
+    );
+    const result = await gw.chat({ ...HA_INPUT, stream: true });
+    const events = await collect(result as AsyncGenerator<LlmStreamEvent>);
+    expect(events).toEqual([{ type: 'delta', text: 'p2-hello' }, { type: 'done' }]);
+    // 回退流使用 provider2 的缺省模型与端点；p1 因密钥缺失未发起 fetch
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe('https://p2.local/v1/chat/completions');
+    expect(calls[0]?.body.model).toBe('m2');
+  });
+
+  it('每次回退尝试经 logger.warn 审计（begin → succeeded / begin → failed）', async () => {
+    stubFetch((url) => (url.startsWith('https://p1.local') ? upstreamFail() : upstreamOk('from-p2')));
+    const warn = vi.fn();
+    const gw = new LlmGateway({
+      getProviders: async () => [haProvider('p1', ['m1']), haProvider('p2', ['m2'])],
+      resolveSecret: async (ref) => HA_SECRETS[ref] ?? null,
+      logger: { debug: vi.fn(), warn } as unknown as import('pino').Logger,
+      haEnabled: async () => true,
+    });
+    const res = (await gw.chat(HA_INPUT)) as LlmChatResult;
+    expect(res.text).toBe('from-p2');
+    const messages = warn.mock.calls.map((c) => c[1] as string);
+    expect(messages).toEqual([
+      'llm gateway: primary provider failed; HA failover begins',
+      'llm gateway: HA failover succeeded',
+    ]);
+  });
+
+  it('HA 开启 → 回退链上无 models 的 provider 记入尝试链（合成 5003）并被跳过；getProviders 透出配置目录', async () => {
+    const calls = stubFetch(() => upstreamFail());
+    const noModels = haProvider('p2', []);
+    const gw = makeGateway(
+      [haProvider('p1', ['m1']), noModels, haProvider('p3', ['m3'])],
+      HA_SECRETS,
+      async () => true,
+    );
+    expect(await gw.getProviders()).toHaveLength(3);
+    let caught: unknown;
+    try {
+      await gw.chat(HA_INPUT);
+    } catch (e) {
+      caught = e;
+    }
+    const he = caught as HarnessError;
+    expect(he.code).toBe('HARNESS-5002');
+    expect(he.detail).toEqual({
+      model: 'm1',
+      attempts: [
+        { provider: 'p1', model: 'm1', error: { code: 'HARNESS-5002', message: expect.any(String) } },
+        { provider: 'p2', model: '', error: { code: 'HARNESS-5003', message: expect.stringContaining('no models') } },
+        { provider: 'p3', model: 'm3', error: { code: 'HARNESS-5002', message: expect.any(String) } },
+      ],
+    });
+    // 无 models 的 provider 不发起上游请求：只有 p1/p3 两次 fetch
+    expect(calls).toHaveLength(2);
+  });
+
+  it('未知协议（配置脏数据）→ TypeError 原样抛，HA 开启也不回退（保持改动前失败面）', async () => {
+    const calls = stubFetch(() => upstreamOk('should-not-happen'));
+    const badProtocol = {
+      name: 'p1',
+      protocol: 'not-a-protocol',
+      baseUrl: 'https://p1.local/v1',
+      apiKeySecretRef: 'secret://llm/p1',
+      models: ['m1'],
+    } as unknown as LlmProviderConfig;
+    const gw = makeGateway([badProtocol, haProvider('p2', ['m2'])], HA_SECRETS, async () => true);
+    await expect(gw.chat(HA_INPUT)).rejects.toThrow(TypeError);
+    expect(calls).toHaveLength(0);
   });
 });

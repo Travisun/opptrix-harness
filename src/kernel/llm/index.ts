@@ -14,6 +14,7 @@ export {
   type LlmAdapter,
   type LlmChatInput,
   type LlmChatResult,
+  type LlmHaAttempt,
   type LlmMessage,
   type LlmProtocol,
   type LlmProviderConfig,
