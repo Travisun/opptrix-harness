@@ -1077,7 +1077,7 @@ export class Kernel {
             admin.get(
               '/admin',
               { schema: { hide: true } },
-              async (_request, reply) => reply.sendFile('index.html'),
+              async (_request, reply) => reply.redirect('/admin/'),
             );
           });
         }
