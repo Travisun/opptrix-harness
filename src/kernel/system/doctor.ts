@@ -132,16 +132,16 @@ function checkNodeVersion(): DoctorCheck {
   };
 }
 
-/** 空闲内存：os.freemem() < 256MB 为告警级失败 */
+/** 总内存 ≥ 2GB 为通过（macOS os.freemem() 不含 inactive/cache 可回收内存，恒为低值，不作为判断依据） */
 function checkMemory(): DoctorCheck {
   const id = 'memory';
-  const free = os.freemem();
-  if (free < MIN_FREE_MEM_BYTES) {
+  const total = os.totalmem();
+  if (total < 2 * 1024 ** 3) {
     return {
       id,
       ok: false,
-      detail: `warn: low free memory — ${bytesToMb(free)}MB free (recommended >= ${bytesToMb(MIN_FREE_MEM_BYTES)}MB)`,
+      detail: `total memory ${bytesToMb(total)}MB < 2GB minimum`,
     };
   }
-  return { id, ok: true, detail: `${bytesToMb(free)}MB free memory` };
+  return { id, ok: true, detail: `${bytesToMb(total)}MB total memory` };
 }
