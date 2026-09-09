@@ -2,12 +2,14 @@ import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
   BellIcon,
+  KeyRoundIcon,
   Loader2Icon,
   LogOutIcon,
   MenuIcon,
   MessageSquareIcon,
   MonitorIcon,
   MoonIcon,
+  SettingsIcon,
   SunIcon,
 } from 'lucide-react';
 
@@ -40,7 +42,8 @@ import { cn } from '@/lib/utils';
  *
  * 左区：移动端汉堡（AppShell 的 Sheet 抽屉经 onMobileNavOpen 打开）+ 当前页面标题；
  * 右区：实时连接徽标｜通知中心（未读 badge）｜主题切换（三态下拉）｜
- *       聊天面板开关（未读 badge；桌面内联第三栏 / 移动全屏 Sheet）｜用户菜单（身份/退出）。
+ *       聊天面板开关（未读 badge；桌面内联第三栏 / 移动全屏 Sheet）｜
+ *       用户菜单（角色徽标 / 个人设置 / API Keys / 退出登录）。
  * 未读约定：通知中心与聊天面板的未读徽标分开显示、互不合并。
  */
 
@@ -54,6 +57,11 @@ const ROLE_LABELS: Record<string, string> = {
 function roleLabel(role: string | undefined): string {
   if (role === undefined || role === '') return '成员';
   return ROLE_LABELS[role] ?? role;
+}
+
+/** 角色徽标配色：管理类角色（root/owner/admin）红、普通角色灰 */
+function isPrivilegedRole(role: string | undefined): boolean {
+  return role === 'root' || role === 'owner' || role === 'admin';
 }
 
 const MODE_OPTIONS: Array<{ value: ThemeMode; label: string; icon: typeof SunIcon }> = [
@@ -236,17 +244,46 @@ function UserMenu(): React.ReactNode {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon-sm" aria-label="用户菜单" className="rounded-full">
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label="用户菜单"
+          className="ring ring-border rounded-full transition hover:ring-primary"
+        >
           <Avatar className="size-7">
             <AvatarFallback className="text-xs font-medium">{initial}</AvatarFallback>
           </Avatar>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-44">
-        <DropdownMenuLabel className="flex flex-col gap-0.5">
-          <span className="truncate text-sm">{session?.username ?? '未登录'}</span>
-          <span className="text-muted-foreground text-xs font-normal">{roleLabel(session?.role)}</span>
+        <DropdownMenuLabel className="flex min-w-0 flex-col gap-0.5">
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate text-sm">{session?.username ?? '未登录'}</span>
+            <Badge
+              variant={isPrivilegedRole(session?.role) ? 'destructive' : 'secondary'}
+              className="h-4 shrink-0 rounded-full px-1.5 text-[10px] font-normal"
+            >
+              {roleLabel(session?.role)}
+            </Badge>
+          </span>
         </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onSelect={() => {
+            navigate('/settings');
+          }}
+        >
+          <SettingsIcon aria-hidden />
+          个人设置
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={() => {
+            navigate('/api-keys');
+          }}
+        >
+          <KeyRoundIcon aria-hidden />
+          API Keys
+        </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
           onSelect={() => {

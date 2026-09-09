@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
+import { Pagination } from '@/components/pagination';
 import {
   Select,
   SelectContent,
@@ -42,6 +43,9 @@ const LEVEL_FILTERS: Array<{ value: string; label: string }> = [
 /** 条数档位 */
 const LIMIT_OPTIONS = [100, 200, 500];
 
+/** 表格客户端分页：每页条数 */
+const LOG_PAGE_SIZE = 20;
+
 /** 自动轮询周期（毫秒） */
 const POLL_INTERVAL_MS = 30_000;
 
@@ -73,6 +77,8 @@ export default function LogsPage(): React.ReactNode {
   const [limit, setLimit] = useState(200);
   const [auto, setAuto] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null); // 展开的 data 行（按行内容 key）
+  /** 客户端分页（一次性拉取后前端切片） */
+  const [page, setPage] = useState(1);
 
   const loadRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
@@ -105,6 +111,11 @@ export default function LogsPage(): React.ReactNode {
     void load();
   }, [load]);
 
+  // 级别过滤 / 条数档位变化后回到第一页
+  useEffect(() => {
+    setPage(1);
+  }, [levelFilter, limit]);
+
   useEffect(() => {
     loadRef.current = () => load({ silent: true });
   }, [load]);
@@ -117,6 +128,12 @@ export default function LogsPage(): React.ReactNode {
   }, [auto]);
 
   const showForbidden = forbidden;
+
+  // 客户端分页：page 越界（过滤/刷新后变少）时收敛到有效页
+  const logTotal = (rows ?? []).length;
+  const logTotalPages = Math.max(1, Math.ceil(logTotal / LOG_PAGE_SIZE));
+  const safePage = Math.min(page, logTotalPages);
+  const pagedRows = (rows ?? []).slice((safePage - 1) * LOG_PAGE_SIZE, safePage * LOG_PAGE_SIZE);
 
   return (
     <div className="flex flex-col gap-6">
@@ -200,33 +217,42 @@ export default function LogsPage(): React.ReactNode {
                 当前过滤条件下没有日志。
               </p>
             ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="w-8" aria-label="展开" />
-                    <TableHead className="w-44">时间</TableHead>
-                    <TableHead className="w-20">级别</TableHead>
-                    <TableHead className="w-36">Scope</TableHead>
-                    <TableHead>消息</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {rows.map((row, i) => {
-                    const hasData = row.data !== null && row.data !== undefined;
-                    const rowKey = `${row.ts}|${row.scope}|${row.message}`;
-                    const isOpen = expanded === rowKey;
-                    return (
-                      <LogRowGroup
-                        key={`${rowKey}-${i}`}
-                        row={row}
-                        hasData={hasData}
-                        open={isOpen}
-                        onToggle={() => setExpanded(isOpen ? null : rowKey)}
-                      />
-                    );
-                  })}
-                </TableBody>
-              </Table>
+              <>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-8" aria-label="展开" />
+                      <TableHead className="w-44">时间</TableHead>
+                      <TableHead className="w-20">级别</TableHead>
+                      <TableHead className="w-36">Scope</TableHead>
+                      <TableHead>消息</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {pagedRows.map((row, i) => {
+                      const hasData = row.data !== null && row.data !== undefined;
+                      const rowKey = `${row.ts}|${row.scope}|${row.message}`;
+                      const isOpen = expanded === rowKey;
+                      return (
+                        <LogRowGroup
+                          key={`${rowKey}-${i}`}
+                          row={row}
+                          hasData={hasData}
+                          open={isOpen}
+                          onToggle={() => setExpanded(isOpen ? null : rowKey)}
+                        />
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+                <Pagination
+                  page={safePage}
+                  pageSize={LOG_PAGE_SIZE}
+                  total={logTotal}
+                  onPageChange={setPage}
+                  className="border-t"
+                />
+              </>
             )}
           </CardContent>
         </Card>

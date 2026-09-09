@@ -10,7 +10,7 @@
  * 4. enable doc-demo + echo-bot；GET /api/v1/ui 含 doc-demo（P0-3 contributions.ui 透传）；
  * 5. 建 general 频道 → webhook 入站消息 → echo-bot 自动回复出现（轮询 messages）；
  * 6. 上传 txt → POST /ext/doc-demo/parse → 200 统计 + 通知已发（notifications 列表）；
- * 7. GET /admin → 302 → follow /ext/webui/ui/ → 200 含 <div id="app">（P0-2）；
+ * 7. GET /admin → 200 直接服务管理台 SPA（不再 302）；兼容前缀 /ext/webui/ui/ 仍 200 含 <div id="app">（P0-2）；
  * 8. disable echo-bot → 再 webhook 入站 → 无自动回复；
  * 9. shutdown 干净（state stopped、manager stop 幂等）。
  *
@@ -299,10 +299,12 @@ describe('最终回炉 E2E 终验', () => {
     });
   });
 
-  it('GET /admin → 302 → follow /ext/webui/ui/ → 200 含 <div id="app">（P0-2 mount ui 接管）', async () => {
+  it('GET /admin → 200 直接服务管理台 SPA（不再 302），兼容前缀 /ext/webui/ui/ 仍 200 含 <div id="app">（P0-2 mount ui 直连）', async () => {
     const res = await app.inject({ method: 'GET', url: '/admin' });
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('/ext/webui/ui/');
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('text/html');
+    expect(res.body).toContain('<div id="app">');
+    // 兼容面：旧 302 落点前缀照旧静态服务（老链接不断）
     const followed = await app.inject({ method: 'GET', url: '/ext/webui/ui/' });
     expect(followed.statusCode).toBe(200);
     expect(followed.body).toContain('<div id="app">');

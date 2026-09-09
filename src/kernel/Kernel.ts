@@ -19,6 +19,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import fastifyStatic from '@fastify/static';
 import type { Knex } from 'knex';
 import type { Logger } from 'pino';
 import { Container } from './Container.js';
@@ -894,21 +895,13 @@ export class Kernel {
           // manager.start() 之后（listen 前直接在 app 上补挂，fastify 允许该时序）。
 
           // ---- builtin mount:'ui'（/admin 接线）----
-          // AGENTS.md 内置扩展白名单：webui → /admin。仅注册一条静态入口路由，
-          // 请求期查 manager（enabled + manifest.mount==='ui' 的扩展，首个命中）：
-          // 命中 → 302 重定向到 /ext/{id}/ui/（资产由补挂的静态插件服务）；
-          // 无已启用 ui-mount 扩展 → 404（与内核现状兼容，/ 根路径的应急页语义不变）。
-          extra.get('/admin', async (_request, reply) => {
-            const uiMount = extManager?.list().find((s) => {
-              if (!s.enabled) return false;
-              const m = extManager.getManifest(s.id);
-              return m?.builtin === true && m?.mount === 'ui';
-            });
-            if (uiMount === undefined) {
-              throw err('ROUTE_NOT_FOUND', { detail: { method: 'GET', url: '/admin' } });
-            }
-            return reply.redirect(`/ext/${uiMount.id}/ui/`, 302);
-          });
+          // AGENTS.md 内置扩展白名单：webui → /admin。/admin 不再 302 → /ext/webui/ui/：
+          // 静态服务在 boot 期 manager.start() 之后、UI 资产补挂处以 @fastify/static
+          // prefix '/admin' 直接注册（GET /admin → 200 index.html；/admin/assets/**
+          // 直出静态资产；见下方 registerExtAssets 旁的 adminUiRoot 注册块）。
+          // 兼容面保留：/ext/{id}/ui/** 静态前缀照旧服务（老链接不断）。此处不再注册
+          // 任何 /admin 路由（与补挂的静态路由同实例同路径会撞 FST_ERR_DUPLICATED_ROUTE）；
+          // 无 ui-mount 扩展时 /admin 自然 404（与内核现状兼容，/ 根路径应急页语义不变）。
 
           // ---- builtin mount:'auth'（阶段 10）----
           // auth 内置扩展声明相对路径（'/auth/*'、'/users*'），内核按 mount 白名单映射到
@@ -1038,9 +1031,12 @@ export class Kernel {
       // manager 尚未 start，list() 为空——资产挂载必须等发现/激活完成后直接在 app 上
       // 补挂。fastify 允许 listen 前 register（插件在 listen 触发的 ready 时统一加载），
       // 因此此刻 register 合法且请求期即可用。app 为 undefined（stub server）时跳过。
+      // /admin 的静态直连（mount:'ui'）同在此刻注册（见下方 adminUiRoot 块）。
       // ------------------------------------------------------------------
       if (app !== undefined) {
         const assetDirs: ExtAssetDir[] = [];
+        /** mount:'ui' 内置扩展的 uiRoot（/admin 直连 SPA；首个命中者） */
+        let adminUiRoot: string | undefined;
         for (const summary of extManager.list()) {
           if (summary.manifest?.ui === undefined || summary.dir === undefined) continue;
           const uiRoot = join(summary.dir, 'ui');
@@ -1052,8 +1048,39 @@ export class Kernel {
             continue;
           }
           assetDirs.push({ extId: summary.id, uiRoot });
+          if (
+            adminUiRoot === undefined &&
+            summary.manifest.builtin === true &&
+            summary.manifest.mount === 'ui'
+          ) {
+            adminUiRoot = uiRoot;
+          }
         }
         if (assetDirs.length > 0) registerExtAssets(app, assetDirs);
+
+        // ---- /admin 直接服务管理台 SPA（取代旧 GET /admin 302 → /ext/{id}/ui/）----
+        // 与 /ext/{id}/ui/ 各自处于兄弟封装上下文：fastify 同实例只允许一份 reply 装饰，
+        // 根实例上的 registerExtAssets 全部 decorateReply:false；此处单独开一个插件
+        // 上下文让本实例 decorateReply:true（sendFile 装饰仅本上下文可见，互不冲突）。
+        // - GET /admin（无尾斜杠）→ reply.sendFile('index.html')：200 直出入口页，无重定向；
+        // - GET /admin/assets/**（及 ui/ 下其余资产）→ 由 prefix '/admin/' 通配直出；
+        // - SPA base 为 './' + HashRouter：无需服务端 rewrite/目录索引兜底。
+        // 无 ui-mount 扩展时不注册 → /admin 落 fastify notFound（404，语义与旧 404 一致）。
+        if (adminUiRoot !== undefined) {
+          const adminRoot = adminUiRoot;
+          void app.register(async (admin) => {
+            await admin.register(fastifyStatic, {
+              root: adminRoot,
+              prefix: '/admin/',
+              index: 'index.html',
+            });
+            admin.get(
+              '/admin',
+              { schema: { hide: true } },
+              async (_request, reply) => reply.sendFile('index.html'),
+            );
+          });
+        }
       }
 
       await cron.start();

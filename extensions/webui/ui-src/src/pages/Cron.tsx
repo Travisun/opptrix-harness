@@ -24,6 +24,7 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Pagination } from '@/components/pagination';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   Sheet,
@@ -82,6 +83,9 @@ const LLM_PROMPT_MAX_BYTES = 8 * 1024;
 
 /** 模型 Select 的「默认第一可用」哨兵值（radix Select 不允许空串 value） */
 const MODEL_DEFAULT = '__default__';
+
+/** 任务列表客户端分页：每页条数 */
+const JOB_PAGE_SIZE = 20;
 
 /** 任务类型 → Select 取值 */
 type JobKind = 'plain' | 'llm';
@@ -197,6 +201,8 @@ export default function CronPage(): React.ReactNode {
   const [historyLoading, setHistoryLoading] = useState(false);
   /** LLM 型任务的模型聚合视图（GET /api/v1/llm/models；失败静默 → 无可选模型） */
   const [modelOptions, setModelOptions] = useState<Array<{ model: string; provider: string }>>([]);
+  /** 客户端分页（一次性拉取后前端切片） */
+  const [page, setPage] = useState(1);
 
   const load = useCallback(async (): Promise<void> => {
     setRefreshing(true);
@@ -375,6 +381,14 @@ export default function CronPage(): React.ReactNode {
     return [...list].sort((a, b) => a.createdAt - b.createdAt);
   }, [jobs]);
 
+  // 客户端分页：page 越界（删除/刷新后变少）时收敛到有效页
+  const totalPages = Math.max(1, Math.ceil(sorted.length / JOB_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const paged = useMemo(
+    () => sorted.slice((safePage - 1) * JOB_PAGE_SIZE, safePage * JOB_PAGE_SIZE),
+    [sorted, safePage],
+  );
+
   return (
     <div className="flex flex-col gap-6">
       {/* 页头 */}
@@ -439,7 +453,7 @@ export default function CronPage(): React.ReactNode {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {sorted.map((job) => (
+                {paged.map((job) => (
                   <TableRow key={job.id}>
                     <TableCell className="max-w-[180px] truncate font-medium" title={job.name}>
                       {jobKindOf(job.payload) === 'llm' && (
@@ -507,7 +521,7 @@ export default function CronPage(): React.ReactNode {
 
           {/* 移动卡片列表（<md） */}
           <div className="flex flex-col gap-3 md:hidden">
-            {sorted.map((job) => (
+            {paged.map((job) => (
               <Card key={job.id} className="gap-3 py-4">
                 <CardContent className="flex flex-col gap-3 px-4">
                   <div className="flex items-start justify-between gap-3">
@@ -574,6 +588,9 @@ export default function CronPage(): React.ReactNode {
               </Card>
             ))}
           </div>
+
+          {/* 客户端分页（桌面表格与移动卡片共用同一分页状态） */}
+          <Pagination page={safePage} pageSize={JOB_PAGE_SIZE} total={sorted.length} onPageChange={setPage} />
         </>
       )}
 

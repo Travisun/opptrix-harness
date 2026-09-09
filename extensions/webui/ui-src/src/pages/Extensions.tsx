@@ -22,6 +22,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
+import { Pagination } from '@/components/pagination';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -542,88 +543,116 @@ export default function ExtensionsPage(): React.ReactNode {
   );
 }
 
-/** 路由表 Tab（<md 横向滚动；长路径 break-all 断行） */
+/** 路由表 Tab（<md 横向滚动；长路径 break-all 断行；客户端分页 20/页） */
+const TAB_PAGE_SIZE = 20;
+
 function RoutesTab({ routes, onRefresh }: { routes: ExtRouteTableEntry[] | null; onRefresh: () => void }): React.ReactNode {
+  const [page, setPage] = useState(1);
   if (routes === null) return <TabSkeleton onRefresh={onRefresh} />;
   if (routes.length === 0) {
     return <EmptyState icon={BlocksIcon} title="暂无注册路由" description="当前启用的扩展没有注册任何 HTTP 路由。" />;
   }
+  const totalPages = Math.max(1, Math.ceil(routes.length / TAB_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const paged = routes.slice((safePage - 1) * TAB_PAGE_SIZE, safePage * TAB_PAGE_SIZE);
   return (
-    <div className="overflow-x-auto rounded-lg border">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-24">方法</TableHead>
-            <TableHead>路径</TableHead>
-            <TableHead className="w-24">鉴权</TableHead>
-            <TableHead className="w-44">扩展</TableHead>
-            <TableHead className="w-28">超时</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {routes.map((r) => (
-            <TableRow key={`${r.extId}:${r.method}:${r.path}`}>
-              <TableCell>
-                <Badge variant={r.method === 'GET' ? 'secondary' : r.method === 'DELETE' ? 'destructive' : 'outline'} className="font-mono">
-                  {r.method}
-                </Badge>
-              </TableCell>
-              <TableCell className="min-w-[180px] break-all font-mono text-xs" title={r.path}>
-                {r.path}
-              </TableCell>
-              <TableCell>
-                <Badge variant={r.auth === 'public' ? 'outline' : r.auth === 'admin' ? 'warning' : 'secondary'}>{r.auth}</Badge>
-              </TableCell>
-              <TableCell className="break-all font-mono text-xs">{r.extId}</TableCell>
-              <TableCell className="text-muted-foreground tabular-nums text-xs">
-                {r.timeoutMs !== undefined ? `${r.timeoutMs} ms` : '默认'}
-              </TableCell>
+    <div className="overflow-hidden rounded-lg border">
+      <div className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-24">方法</TableHead>
+              <TableHead>路径</TableHead>
+              <TableHead className="w-24">鉴权</TableHead>
+              <TableHead className="w-44">扩展</TableHead>
+              <TableHead className="w-28">超时</TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {paged.map((r) => (
+              <TableRow key={`${r.extId}:${r.method}:${r.path}`}>
+                <TableCell>
+                  <Badge variant={r.method === 'GET' ? 'secondary' : r.method === 'DELETE' ? 'destructive' : 'outline'} className="font-mono">
+                    {r.method}
+                  </Badge>
+                </TableCell>
+                <TableCell className="min-w-[180px] break-all font-mono text-xs" title={r.path}>
+                  {r.path}
+                </TableCell>
+                <TableCell>
+                  <Badge variant={r.auth === 'public' ? 'outline' : r.auth === 'admin' ? 'warning' : 'secondary'}>{r.auth}</Badge>
+                </TableCell>
+                <TableCell className="break-all font-mono text-xs">{r.extId}</TableCell>
+                <TableCell className="text-muted-foreground tabular-nums text-xs">
+                  {r.timeoutMs !== undefined ? `${r.timeoutMs} ms` : '默认'}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      <Pagination
+        page={safePage}
+        pageSize={TAB_PAGE_SIZE}
+        total={routes.length}
+        onPageChange={setPage}
+        className="border-t"
+      />
     </div>
   );
 }
 
-/** 服务注册 Tab（长服务全名 break-all 断行） */
+/** 服务注册 Tab（长服务全名 break-all 断行；客户端分页 20/页） */
 function RegistryTab({ registry, onRefresh }: { registry: ServiceEntry[] | null; onRefresh: () => void }): React.ReactNode {
+  const [page, setPage] = useState(1);
   if (registry === null) return <TabSkeleton onRefresh={onRefresh} />;
   if (registry.length === 0) {
     return <EmptyState icon={BlocksIcon} title="暂无服务注册" description="当前启用的扩展没有通过 h.expose 暴露任何服务。" />;
   }
+  const totalPages = Math.max(1, Math.ceil(registry.length / TAB_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const paged = registry.slice((safePage - 1) * TAB_PAGE_SIZE, safePage * TAB_PAGE_SIZE);
   return (
-    <div className="overflow-x-auto rounded-lg border">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>服务全名</TableHead>
-            <TableHead>方法</TableHead>
-            <TableHead className="w-28">状态</TableHead>
-            <TableHead className="w-44">扩展</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {registry.map((s) => (
-            <TableRow key={s.service}>
-              <TableCell className="break-all font-mono text-xs">{s.service}</TableCell>
-              <TableCell>
-                <div className="flex flex-wrap gap-1">
-                  {s.methods.map((m) => (
-                    <Badge key={m} variant="outline" className="font-mono text-[11px]">
-                      {m}
-                    </Badge>
-                  ))}
-                </div>
-              </TableCell>
-              <TableCell>
-                <Badge variant={s.status === 'active' ? 'success' : 'warning'}>{s.status === 'active' ? '活跃' : '已挂起'}</Badge>
-              </TableCell>
-              <TableCell className="break-all font-mono text-xs">{s.extId}</TableCell>
+    <div className="overflow-hidden rounded-lg border">
+      <div className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>服务全名</TableHead>
+              <TableHead>方法</TableHead>
+              <TableHead className="w-28">状态</TableHead>
+              <TableHead className="w-44">扩展</TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {paged.map((s) => (
+              <TableRow key={s.service}>
+                <TableCell className="break-all font-mono text-xs">{s.service}</TableCell>
+                <TableCell>
+                  <div className="flex flex-wrap gap-1">
+                    {s.methods.map((m) => (
+                      <Badge key={m} variant="outline" className="font-mono text-[11px]">
+                        {m}
+                      </Badge>
+                    ))}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <Badge variant={s.status === 'active' ? 'success' : 'warning'}>{s.status === 'active' ? '活跃' : '已挂起'}</Badge>
+                </TableCell>
+                <TableCell className="break-all font-mono text-xs">{s.extId}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      <Pagination
+        page={safePage}
+        pageSize={TAB_PAGE_SIZE}
+        total={registry.length}
+        onPageChange={setPage}
+        className="border-t"
+      />
     </div>
   );
 }

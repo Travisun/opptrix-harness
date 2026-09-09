@@ -14,8 +14,10 @@
  * C. 真实 Kernel E2E（真实 createHttpServer + 真实 worker 线程 + 临时 dataDir）：
  *    builtin 自动启用（与 auth 同款）→ manifest/聚合端点 → /admin 与 UI 资产路由断言。
  *
- * ★ 内核接线状态（与上版一致，行为未回归）：
- *   1. mount:'ui' → /admin 接管：GET /admin → 302 → /ext/webui/ui/。
+ * ★ 内核接线状态：
+ *   1. mount:'ui' → /admin 直连：GET /admin → 200 直接服务 SPA index.html
+ *      （@fastify/static prefix '/admin' 于 extManager.start() 后补挂；不再 302），
+ *      /admin/assets/** 静态直出；/ext/webui/ui/** 兼容前缀照旧服务（老链接不断）。
  *   2. 扩展 UI 静态资产：registerExtAssets 延迟到 extManager.start() 之后在 app 上补挂，
  *      /ext/webui/ui/** 可静态服务。
  *   3. h.page/h.menu 贡献聚合：GET /api/v1/ui 含 webui 条目。
@@ -381,15 +383,27 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     expect(res.body).toContain('<div id="app">');
   });
 
-  it('17. GET /admin → 302 重定向到 /ext/webui/ui/（mount:"ui" 接管），跟随后 200 管理台', async () => {
+  it('17. GET /admin → 200 直接服务管理台 SPA（不再 302），/admin/assets/* 静态直出，兼容前缀 /ext/webui/ui/ 保留', async () => {
+    // mount:'ui' 接线：@fastify/static prefix '/admin' 于 manager.start() 后补挂，
+    // GET /admin 直接回 SPA index.html（200，地址栏不再出现 /ext/webui/ui/）：
     const res = await app.inject({ method: 'GET', url: '/admin' });
-    // AGENTS.md 内置扩展白名单 webui → /admin：内核已接线（请求期查 enabled + mount==='ui'），
-    // 命中即 302 到扩展静态资产前缀根（index.html 回退）：
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('/ext/webui/ui/');
-    const followed = await app.inject({ method: 'GET', url: '/ext/webui/ui/' });
-    expect(followed.statusCode).toBe(200);
-    expect(followed.body).toContain('<div id="app">');
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('text/html');
+    expect(res.body).toContain('<div id="app">');
+    // 非内核应急页、非重定向
+    expect(res.body).not.toContain('webui 扩展未启用');
+    expect(res.headers.location).toBeUndefined();
+
+    // /admin/assets/*：index.html 的 ./ 相对引用资产在 /admin 前缀下直接可达
+    for (const ref of referencedAssets(res.body)) {
+      const asset = await app.inject({ method: 'GET', url: `/admin/${ref.slice('./'.length)}` });
+      expect(asset.statusCode, `asset ${ref} should be servable under /admin`).toBe(200);
+    }
+
+    // 兼容面：旧 302 落点 /ext/webui/ui/ 前缀照旧静态服务（老链接不断）
+    const legacy = await app.inject({ method: 'GET', url: '/ext/webui/ui/' });
+    expect(legacy.statusCode).toBe(200);
+    expect(legacy.body).toContain('<div id="app">');
   });
 
   it('18. 核心内置扩展保护（HARNESS-1007 core-builtin）：webui disable/uninstall → 403，webui 保持 enabled', async () => {
@@ -676,5 +690,73 @@ describe('webui 主题 Token 扩展（ctl/shadow）与 Dashboard 品牌', () => 
     }
     expect(appShell).not.toContain('Opptrix Console');
     expect(login).not.toContain('Opptrix Console');
+  });
+});
+
+// ############################################################################
+// F. 全局表格分页组件 + 用户菜单增强
+// ############################################################################
+
+describe('webui 全局分页组件与用户菜单增强', () => {
+  /** UI_SRC 相对路径读源码 */
+  const readSrc = (...segs: string[]): string => readFileSync(path.join(UI_SRC, ...segs), 'utf8');
+
+  it('33. components/pagination.tsx 存在且契约完整：签名四参 + total=0 隐藏 + 上/下页按钮与页码/每页条数显示', () => {
+    const src = readSrc('components', 'pagination.tsx');
+    expect(src).toContain('export function Pagination');
+    for (const token of ['page:', 'pageSize:', 'total:', 'onPageChange:']) {
+      expect(src, `pagination prop missing: ${token}`).toContain(token);
+    }
+    // total=0（<=0）整条隐藏，由页面空态兜底
+    expect(src).toMatch(/total\s*<=\s*0/);
+    expect(src).toContain('return null');
+    // 上一页/下一页按钮 + 页码显示（x / y）+ 每页条数说明
+    expect(src).toContain('上一页');
+    expect(src).toContain('下一页');
+    expect(src).toContain('totalPages');
+    expect(src).toContain('每页');
+    expectNoConsole(src, 'pagination.tsx');
+  });
+
+  it('34. 分页接入四页面：Extensions / Cron / Notifications / Logs 均消费 Pagination 并客户端切片', () => {
+    const pages: Array<[string, string]> = [
+      ['Extensions.tsx', readSrc('pages', 'Extensions.tsx')],
+      ['Cron.tsx', readSrc('pages', 'Cron.tsx')],
+      ['Notifications.tsx', readSrc('pages', 'Notifications.tsx')],
+      ['Logs.tsx', readSrc('pages', 'Logs.tsx')],
+    ];
+    for (const [name, src] of pages) {
+      expect(src, `${name} imports Pagination`).toContain('@/components/pagination');
+      expect(src, `${name} renders <Pagination`).toContain('<Pagination');
+      expect(src, `${name} slices client-side`).toContain('.slice(');
+      expectNoConsole(src, name);
+    }
+    // 每页条数统一 20（客户端分页基数）
+    for (const name of ['Cron.tsx', 'Notifications.tsx', 'Logs.tsx']) {
+      expect(readSrc('pages', name), `${name} page size = 20`).toMatch(/_PAGE_SIZE = 20/);
+    }
+    // Extensions 两个表格 Tab（路由表 / 服务注册表）各自接入分页
+    const extensions = readSrc('pages', 'Extensions.tsx');
+    expect(extensions).toContain('TAB_PAGE_SIZE');
+    for (const tab of ['RoutesTab', 'RegistryTab']) {
+      const at = extensions.indexOf(`function ${tab}`);
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(extensions.slice(at), `${tab} consumes Pagination`).toContain('<Pagination');
+    }
+  });
+
+  it('35. 用户菜单增强：个人设置 / API Keys 菜单项 + 角色徽标（管理红/普通灰）+ 头像按钮 ring 突出', () => {
+    const topbar = readSrc('components', 'layout', 'Topbar.tsx');
+    // 菜单项与跳转目标（路由均存在于 router.tsx）
+    expect(topbar).toContain('个人设置');
+    expect(topbar).toContain("navigate('/settings')");
+    expect(topbar).toContain('API Keys');
+    expect(topbar).toContain("navigate('/api-keys')");
+    // 角色徽标：Badge 变体按角色二态（destructive 红 / secondary 灰）
+    expect(topbar).toContain('isPrivilegedRole');
+    expect(topbar).toContain("variant={isPrivilegedRole(session?.role) ? 'destructive' : 'secondary'}");
+    // 头像按钮 ring 突出（默认 ring-border、hover ring-primary、过渡）
+    expect(topbar).toContain('ring ring-border rounded-full transition hover:ring-primary');
+    expectNoConsole(topbar, 'Topbar.tsx');
   });
 });

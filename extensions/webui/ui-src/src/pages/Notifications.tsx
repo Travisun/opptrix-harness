@@ -22,6 +22,7 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Pagination } from '@/components/pagination';
 import {
   Select,
   SelectContent,
@@ -60,6 +61,9 @@ import RoutesSection from '@/pages/Notifications/RoutesSection';
 
 const LEVEL_OPTIONS = ['info', 'success', 'warning', 'error'] as const;
 
+/** 消息列表客户端分页：每页条数 */
+const MESSAGE_PAGE_SIZE = 20;
+
 export default function NotificationsPage(): React.ReactNode {
   const notifier = useNotifications();
   const [items, setItems] = useState<NotificationRecord[] | null>(null);
@@ -78,6 +82,8 @@ export default function NotificationsPage(): React.ReactNode {
   const [sendBody, setSendBody] = useState('');
   const [sendLevel, setSendLevel] = useState<string>('info');
   const [sending, setSending] = useState(false);
+  /** 客户端分页（一次性拉取后前端切片） */
+  const [page, setPage] = useState(1);
 
   const load = useCallback(async (): Promise<void> => {
     setRefreshing(true);
@@ -155,6 +161,12 @@ export default function NotificationsPage(): React.ReactNode {
   }, [sendTitle, sendBody, sendLevel, load, notifier]);
 
   const unreadCount = (items ?? []).filter((it) => it.readAt === null || it.readAt === undefined).length;
+
+  // 客户端分页：page 越界（刷新后变少）时收敛到有效页
+  const messageTotal = (items ?? []).length;
+  const messageTotalPages = Math.max(1, Math.ceil(messageTotal / MESSAGE_PAGE_SIZE));
+  const safePage = Math.min(page, messageTotalPages);
+  const pagedItems = (items ?? []).slice((safePage - 1) * MESSAGE_PAGE_SIZE, safePage * MESSAGE_PAGE_SIZE);
 
   return (
     <div className="flex flex-col gap-4">
@@ -246,10 +258,10 @@ export default function NotificationsPage(): React.ReactNode {
             </EmptyState>
           )}
 
-          {/* 通知列表 */}
+          {/* 通知列表（客户端分页切片） */}
           {!loading && error === null && (items ?? []).length > 0 && (
             <div className="flex flex-col gap-2">
-              {(items ?? []).map((item) => {
+              {pagedItems.map((item) => {
                 const unread = item.readAt === null || item.readAt === undefined;
                 const expanded = expandedId === item.id;
                 const dataText =
@@ -308,6 +320,16 @@ export default function NotificationsPage(): React.ReactNode {
                 );
               })}
             </div>
+          )}
+
+          {/* 客户端分页条（消息列表切片后展示） */}
+          {!loading && error === null && (
+            <Pagination
+              page={safePage}
+              pageSize={MESSAGE_PAGE_SIZE}
+              total={messageTotal}
+              onPageChange={setPage}
+            />
           )}
         </TabsContent>
 
