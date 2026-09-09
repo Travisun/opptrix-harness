@@ -1058,18 +1058,6 @@ export class Kernel {
         }
         if (assetDirs.length > 0) registerExtAssets(app, assetDirs);
 
-        // 浏览器在 /admin 下 ./assets/* 的相对路径会解析为根级 /assets/*——
-        // 此处补一条兜底路由指向 webui 的 ui/assets 目录（消除 404）
-        if (adminUiRoot !== undefined) {
-          const uiAssetsRoot = adminUiRoot;
-          void app.register(async (assetScope) => {
-            await assetScope.register(fastifyStatic, {
-              root: uiAssetsRoot,
-              prefix: '/assets/',
-              decorateReply: false,
-            });
-          });
-        }
 
         // ---- /admin 直接服务管理台 SPA（取代旧 GET /admin 302 → /ext/{id}/ui/）----
         // 与 /ext/{id}/ui/ 各自处于兄弟封装上下文：fastify 同实例只允许一份 reply 装饰，
