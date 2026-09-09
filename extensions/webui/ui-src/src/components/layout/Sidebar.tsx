@@ -103,8 +103,8 @@ export function Sidebar({ collapsed, onToggleCollapsed }: SidebarProps): React.R
         </div>
         {!collapsed && (
           <div className="min-w-0 leading-tight">
-            <p className="truncate text-sm font-semibold">Opptrix 控制台</p>
-            <p className="text-muted-foreground truncate text-[11px]">Harness OS 管理台</p>
+            <p className="truncate text-sm font-semibold">Opptrix Harness</p>
+            <p className="text-muted-foreground truncate text-[11px]">Dashboard（管理台）</p>
           </div>
         )}
       </div>

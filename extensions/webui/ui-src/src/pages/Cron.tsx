@@ -6,6 +6,7 @@ import {
   PlayIcon,
   PlusIcon,
   RefreshCwIcon,
+  SparklesIcon,
   TimerOffIcon,
   Trash2Icon,
 } from 'lucide-react';
@@ -23,6 +24,7 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   Sheet,
   SheetContent,
@@ -45,32 +47,99 @@ import { toast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { EmptyState, CodeBlock } from '@/pages/_shared';
-import type { CronJobRecord, CronRunEntry } from '@/pages/_shared';
+import type { CronJobRecord, CronRunEntry, LlmModelAggregate } from '@/pages/_shared';
 import { errText, formatDateTime, formatDuration, isValidTimezone, parseJsonInput } from '@/pages/_shared';
 
 /**
  * Cron — 定时任务管理。
  *
  * - GET    /api/v1/cron             任务列表（name/expr/tz/nextRun/lastRun/enabled）；
- * - POST   /api/v1/cron             新建（name/expr/tz 缺省 UTC/payload JSON 校验）；
+ * - POST   /api/v1/cron             新建（name/expr/tz 缺省 UTC/payload 按类型校验）；
  * - PATCH  /api/v1/cron/:id         编辑（name/expr/tz/payload）与启停（enabled）；
  * - DELETE /api/v1/cron/:id         删除（confirm）；
  * - POST   /api/v1/cron/:id/run     立即触发（202 → toast）；
  * - GET    /api/v1/cron/:id/history 执行历史（Sheet 表格）。
+ * - GET    /api/v1/llm/models       LLM 型任务的模型聚合视图（静默加载，失败仅无选项）。
+ *
+ * 任务类型（payload.kind）：
+ * - 普通任务（kind 缺省）：payload 自由 JSON，触发时仅广播事件；
+ * - LLM 提示词自动化（kind:'llm'）：prompt（≤8KB）+ 可选 model（缺省第一可用）
+ *   + 完成/失败发通知（默认开），触发时由 LLM 执行并投递结果通知。
  * nextRun === null → 「永不触发」警示徽标（表达式无效或已停用）。
  */
 
+/** LLM 提示词自动化的 payload 形状（与 api/cron.ts 校验、内核 llm-job 执行器一致） */
+interface LlmJobPayload {
+  kind: 'llm';
+  prompt: string;
+  model?: string;
+  notify?: boolean;
+  channelSlug?: string;
+}
+
+/** prompt 的 UTF-8 字节上限（8KB，与 REST 校验一致） */
+const LLM_PROMPT_MAX_BYTES = 8 * 1024;
+
+/** 模型 Select 的「默认第一可用」哨兵值（radix Select 不允许空串 value） */
+const MODEL_DEFAULT = '__default__';
+
+/** 任务类型 → Select 取值 */
+type JobKind = 'plain' | 'llm';
+
+/** prompt 的 UTF-8 字节数（计数用） */
+function promptBytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/** job payload → 任务类型（kind:'llm' 之外一律视为普通任务） */
+function jobKindOf(payload: unknown): JobKind {
+  return typeof payload === 'object' && payload !== null && !Array.isArray(payload) && (payload as Record<string, unknown>)['kind'] === 'llm'
+    ? 'llm'
+    : 'plain';
+}
+
 /** 新建/编辑共用的表单草稿 */
 interface JobDraft {
+  kind: JobKind;
   name: string;
   expr: string;
   tz: string;
+  /** 普通任务：payload JSON 文本 */
   payloadText: string;
+  /** LLM 型：提示词 */
+  prompt: string;
+  /** LLM 型：模型（'' = 默认第一可用） */
+  model: string;
+  /** LLM 型：完成/失败发通知（默认开） */
+  notify: boolean;
 }
 
-const EMPTY_DRAFT: JobDraft = { name: '', expr: '', tz: 'UTC', payloadText: '' };
+const EMPTY_DRAFT: JobDraft = {
+  kind: 'plain',
+  name: '',
+  expr: '',
+  tz: 'UTC',
+  payloadText: '',
+  prompt: '',
+  model: '',
+  notify: true,
+};
 
-/** 草稿 → 请求体（payload JSON 校验失败返回 null 并 toast） */
+/** LLM 型校验：prompt 非空且 ≤8KB（不通过时 toast 并返回 null） */
+function validatedPrompt(draft: JobDraft): string | null {
+  const prompt = draft.prompt.trim();
+  if (prompt === '') {
+    toast.error('请填写提示词', 'LLM 自动化任务需要一段要执行的提示词');
+    return null;
+  }
+  if (promptBytes(draft.prompt) > LLM_PROMPT_MAX_BYTES) {
+    toast.error('提示词过长', `UTF-8 编码需 ≤ ${LLM_PROMPT_MAX_BYTES} 字节（当前 ${promptBytes(draft.prompt)} 字节）`);
+    return null;
+  }
+  return draft.prompt;
+}
+
+/** 草稿 → 请求体（payload 按任务类型构造；校验失败返回 null 并 toast） */
 function draftToBody(draft: JobDraft): { name: string; expr: string; tz: string; payload?: unknown } | null {
   const name = draft.name.trim();
   const expr = draft.expr.trim();
@@ -86,6 +155,17 @@ function draftToBody(draft: JobDraft): { name: string; expr: string; tz: string;
   if (!isValidTimezone(tz)) {
     toast.error('时区不合法', `"${tz}" 不是可识别的 IANA 时区（例如 UTC、Asia/Shanghai）`);
     return null;
+  }
+  if (draft.kind === 'llm') {
+    const prompt = validatedPrompt(draft);
+    if (prompt === null) return null;
+    const payload: LlmJobPayload = {
+      kind: 'llm',
+      prompt,
+      ...(draft.model.trim() !== '' ? { model: draft.model.trim() } : {}),
+      ...(draft.notify ? {} : { notify: false }),
+    };
+    return { name, expr, tz, payload };
   }
   const parsed = parseJsonInput(draft.payloadText);
   if (!parsed.ok) {
@@ -115,6 +195,8 @@ export default function CronPage(): React.ReactNode {
   const [historyTarget, setHistoryTarget] = useState<CronJobRecord | null>(null);
   const [history, setHistory] = useState<CronRunEntry[] | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
+  /** LLM 型任务的模型聚合视图（GET /api/v1/llm/models；失败静默 → 无可选模型） */
+  const [modelOptions, setModelOptions] = useState<Array<{ model: string; provider: string }>>([]);
 
   const load = useCallback(async (): Promise<void> => {
     setRefreshing(true);
@@ -133,6 +215,27 @@ export default function CronPage(): React.ReactNode {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async (): Promise<void> => {
+      try {
+        const aggregates = await api.get<LlmModelAggregate[]>('/api/v1/llm/models', { silent: true });
+        if (cancelled || !Array.isArray(aggregates)) return;
+        const options = aggregates.flatMap((entry) =>
+          (Array.isArray(entry.models) ? entry.models : []).map((model) => ({ model, provider: entry.provider })),
+        );
+        // 同名模型多 provider 重复时按首次出现去重（gateway 路由取首个命中者）
+        const seen = new Set<string>();
+        setModelOptions(options.filter((option) => (seen.has(option.model) ? false : (seen.add(option.model), true))));
+      } catch {
+        if (!cancelled) setModelOptions([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   /** 行级动作：runNow / toggle(enabled) */
   const rowAction = useCallback(
@@ -182,8 +285,24 @@ export default function CronPage(): React.ReactNode {
   );
 
   const openEdit = useCallback((job: CronJobRecord): void => {
-    setEditTarget(job);
+    const kind = jobKindOf(job.payload);
+    if (kind === 'llm') {
+      const payload = job.payload as Partial<LlmJobPayload>;
+      setEditDraft({
+        ...EMPTY_DRAFT,
+        kind: 'llm',
+        name: job.name,
+        expr: job.expr,
+        tz: job.tz,
+        prompt: typeof payload.prompt === 'string' ? payload.prompt : '',
+        model: typeof payload.model === 'string' ? payload.model : '',
+        notify: payload.notify !== false,
+      });
+      return;
+    }
     setEditDraft({
+      ...EMPTY_DRAFT,
+      kind: 'plain',
       name: job.name,
       expr: job.expr,
       tz: job.tz,
@@ -197,17 +316,13 @@ export default function CronPage(): React.ReactNode {
       if (editTarget === null) return;
       const body = draftToBody(editDraft);
       if (body === null) return;
-      const payloadParsed = parseJsonInput(editDraft.payloadText);
-      if (!payloadParsed.ok) {
-        toast.error('payload 不是合法 JSON', payloadParsed.message);
-        return;
-      }
       setSubmitting(true);
       try {
-        // PATCH 只更新给出的字段：payload 文本留空 → 显式传 null 以清除负载
+        // PATCH 只更新给出的字段：普通任务 payload 文本留空 → 显式传 null 以清除负载；
+        // LLM 型任务的 payload 由 draftToBody 按形状构造后整体覆盖
         await api.patch<CronJobRecord>(`/api/v1/cron/${encodeURIComponent(editTarget.id)}`, {
           ...body,
-          payload: payloadParsed.value ?? null,
+          payload: body.payload ?? null,
         });
         toast.success('已保存', body.name);
         setEditTarget(null);
@@ -327,6 +442,12 @@ export default function CronPage(): React.ReactNode {
                 {sorted.map((job) => (
                   <TableRow key={job.id}>
                     <TableCell className="max-w-[180px] truncate font-medium" title={job.name}>
+                      {jobKindOf(job.payload) === 'llm' && (
+                        <Badge variant="secondary" className="mr-1.5 gap-1 px-1.5 font-normal text-[10px]">
+                          <SparklesIcon className="size-3" aria-hidden />
+                          LLM
+                        </Badge>
+                      )}
                       {job.name}
                       {job.extId !== null && (
                         <Badge variant="outline" className="ml-2 font-mono text-[10px]">
@@ -391,7 +512,15 @@ export default function CronPage(): React.ReactNode {
                 <CardContent className="flex flex-col gap-3 px-4">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <p className="truncate text-sm font-semibold">{job.name}</p>
+                      <p className="truncate text-sm font-semibold">
+                        {jobKindOf(job.payload) === 'llm' && (
+                          <Badge variant="secondary" className="mr-1.5 gap-1 px-1.5 align-[1px] font-normal text-[10px]">
+                            <SparklesIcon className="size-3" aria-hidden />
+                            LLM
+                          </Badge>
+                        )}
+                        {job.name}
+                      </p>
                       <p className="text-muted-foreground mt-0.5 font-mono text-xs">
                         {job.expr} · {job.tz}
                       </p>
@@ -456,7 +585,7 @@ export default function CronPage(): React.ReactNode {
             <DialogDescription>使用 5 字段 cron 表达式（或 @daily 等别名）定义触发计划。</DialogDescription>
           </DialogHeader>
           <form onSubmit={(e) => void handleCreate(e)} className="flex flex-col gap-4" noValidate>
-            <JobFormFields draft={draft} onDraftChange={setDraft} submitting={submitting} />
+            <JobFormFields draft={draft} onDraftChange={setDraft} submitting={submitting} modelOptions={modelOptions} />
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={submitting}>
                 取消
@@ -474,10 +603,14 @@ export default function CronPage(): React.ReactNode {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>编辑任务</DialogTitle>
-            <DialogDescription>修改后立即重排下次触发时间（payload 留空表示清除）。</DialogDescription>
+            <DialogDescription>
+              {editDraft.kind === 'llm'
+                ? '修改提示词、模型与通知选项后保存（触发计划照常重排）。'
+                : '修改后立即重排下次触发时间（payload 留空表示清除）。'}
+            </DialogDescription>
           </DialogHeader>
           <form onSubmit={(e) => void handleEdit(e)} className="flex flex-col gap-4" noValidate>
-            <JobFormFields draft={editDraft} onDraftChange={setEditDraft} submitting={submitting} />
+            <JobFormFields draft={editDraft} onDraftChange={setEditDraft} submitting={submitting} modelOptions={modelOptions} />
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditTarget(null)} disabled={submitting}>
                 取消
@@ -553,18 +686,38 @@ export default function CronPage(): React.ReactNode {
   );
 }
 
-/** 新建/编辑共用字段：name / expr / tz / payload(JSON) */
+/** 新建/编辑共用字段：任务类型 + name / expr / tz +（普通）payload JSON /（LLM）prompt·模型·通知 */
 function JobFormFields({
   draft,
   onDraftChange,
   submitting,
+  modelOptions,
 }: {
   draft: JobDraft;
   onDraftChange: (next: JobDraft) => void;
   submitting: boolean;
+  modelOptions: Array<{ model: string; provider: string }>;
 }): React.ReactNode {
+  const bytes = promptBytes(draft.prompt);
+  const overLimit = bytes > LLM_PROMPT_MAX_BYTES;
   return (
     <>
+      <div className="flex flex-col gap-2">
+        <Label htmlFor="cron-kind">任务类型</Label>
+        <Select
+          value={draft.kind}
+          onValueChange={(value) => onDraftChange({ ...draft, kind: value === 'llm' ? 'llm' : 'plain' })}
+          disabled={submitting}
+        >
+          <SelectTrigger id="cron-kind" className="w-full" aria-label="任务类型">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="plain">普通任务 — 触发时广播事件</SelectItem>
+            <SelectItem value="llm">LLM 提示词自动化 — 触发时由 LLM 执行</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="flex flex-col gap-2">
           <Label htmlFor="cron-name">任务名称</Label>
@@ -602,17 +755,78 @@ function JobFormFields({
           className="font-mono"
         />
       </div>
-      <div className="flex flex-col gap-2">
-        <Label htmlFor="cron-payload">payload（可选，JSON）</Label>
-        <Textarea
-          id="cron-payload"
-          value={draft.payloadText}
-          onChange={(e) => onDraftChange({ ...draft, payloadText: e.target.value })}
-          placeholder='{"key": "value"}'
-          disabled={submitting}
-          className="min-h-20 font-mono text-xs"
-        />
-      </div>
+      {draft.kind === 'llm' ? (
+        <>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="cron-llm-prompt">提示词</Label>
+            <Textarea
+              id="cron-llm-prompt"
+              value={draft.prompt}
+              onChange={(e) => onDraftChange({ ...draft, prompt: e.target.value })}
+              placeholder="每次触发时交给 LLM 执行的提示词，例如「总结昨日告警并给出处理建议」"
+              disabled={submitting}
+              aria-invalid={overLimit}
+              className={cn('min-h-24', overLimit && 'border-destructive focus-visible:border-destructive')}
+            />
+            <p className={cn('text-muted-foreground text-xs tabular-nums', overLimit && 'text-destructive')}>
+              {bytes} / {LLM_PROMPT_MAX_BYTES} 字节
+            </p>
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="cron-llm-model">模型（缺省 = 第一可用）</Label>
+            <Select
+              value={draft.model === '' ? MODEL_DEFAULT : draft.model}
+              onValueChange={(value) => onDraftChange({ ...draft, model: value === MODEL_DEFAULT ? '' : value })}
+              disabled={submitting}
+            >
+              <SelectTrigger id="cron-llm-model" className="w-full" aria-label="模型">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={MODEL_DEFAULT}>默认（第一可用供应商的缺省模型）</SelectItem>
+                {modelOptions.map((option) => (
+                  <SelectItem key={option.model} value={option.model}>
+                    {option.model}
+                    {option.provider !== '' && (
+                      <span className="text-muted-foreground ml-1.5 text-xs">（{option.provider}）</span>
+                    )}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-muted-foreground text-xs">
+              {modelOptions.length === 0
+                ? '暂无已配置的模型——将回退到第一可用供应商（可先在「设置 → LLM」添加）。'
+                : '指定模型不可用时自动回退第一可用供应商的缺省模型。'}
+            </p>
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg border p-3">
+            <div className="flex flex-col gap-0.5">
+              <Label htmlFor="cron-llm-notify">完成/失败发通知</Label>
+              <p className="text-muted-foreground text-xs">执行结束后投递结果摘要（失败以 error 级别提醒）。</p>
+            </div>
+            <Switch
+              id="cron-llm-notify"
+              checked={draft.notify}
+              onCheckedChange={(checked) => onDraftChange({ ...draft, notify: checked })}
+              disabled={submitting}
+              aria-label="完成/失败发通知"
+            />
+          </div>
+        </>
+      ) : (
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="cron-payload">payload（可选，JSON）</Label>
+          <Textarea
+            id="cron-payload"
+            value={draft.payloadText}
+            onChange={(e) => onDraftChange({ ...draft, payloadText: e.target.value })}
+            placeholder='{"key": "value"}'
+            disabled={submitting}
+            className="min-h-20 font-mono text-xs"
+          />
+        </div>
+      )}
     </>
   );
 }

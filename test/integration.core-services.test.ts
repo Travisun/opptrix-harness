@@ -102,7 +102,8 @@ describe('核心服务总装配 E2E', () => {
     expect(drivers.statusCode).toBe(200);
     expect(drivers.json()).toEqual({
       notification: ['console', 'email', 'inbox', 'webhook'],
-      chat: ['email', 'webhook'],
+      // webhook/email 纯出站桥 + 平台连接器 ×5（chat-platforms：出站驱动 + 入站回调）
+      chat: ['dingtalk', 'email', 'feishu', 'slack', 'telegram', 'webhook', 'wecom'],
     });
   });
 

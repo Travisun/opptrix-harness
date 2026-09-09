@@ -15,6 +15,9 @@
  *   deps.checker 校验；通过后 role 非 'root'|'admin' → 403 HARNESS-1007；
  * - 入参全部 zod 校验；body 非法 JSON（解析失败）与 zod 校验失败统一
  *   400 HARNESS-1009 VALIDATION_FAILED（detail = issues）；
+ * - payload 校验为放宽 discriminated：`payload.kind === 'llm'` 走 LLM 提示词自动化
+ *   结构校验（prompt 必填 ≤8KB、model/notify/channelSlug 可选）；其余形状
+ *   （含 kind 缺省的 v1 普通任务=仅事件广播）维持自由 JSON 现状；
  * - 存储与调度委托 deps.scheduler（内核 CronScheduler 门面），执行历史经
  *   deps.history（通常为 store.history 绑定）透传。
  */
@@ -22,6 +25,7 @@ import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from
 import { z } from 'zod';
 
 import { extractToken } from '../kernel/auth/authProxy.js';
+import { LLM_JOB_PROMPT_MAX_BYTES } from '../kernel/cron/llm-job.js';
 import type { CronJobRecord, CronRunEntry } from '../kernel/cron/store.js';
 import { err, HarnessError } from '../kernel/errors/index.js';
 
@@ -98,6 +102,46 @@ export interface CronRoutesDeps {
 /** overlap / misfire 的合法取值（与 CronScheduler 的策略枚举对齐） */
 const overlapSchema = z.enum(['skip', 'queue']);
 const misfireSchema = z.enum(['skip', 'runOnce']);
+
+/**
+ * payload.kind === 'llm'（LLM 提示词自动化）的结构约束：
+ * prompt 必填（非空、UTF-8 ≤8KB，上限常量 LLM_JOB_PROMPT_MAX_BYTES 定义见内核
+ * cron/llm-job.ts）；model / notify / channelSlug 可选。
+ * 执行语义见 src/kernel/cron/llm-job.ts（channelSlug 为 v1 预留字段，随 payload 原样落库）。
+ */
+const llmJobPayloadSchema = z.object({
+  kind: z.literal('llm'),
+  prompt: z
+    .string()
+    .min(1, 'payload.prompt is required for kind:"llm" (LLM prompt automation) jobs')
+    .refine((value) => Buffer.byteLength(value, 'utf8') <= LLM_JOB_PROMPT_MAX_BYTES, {
+      error: `payload.prompt exceeds ${LLM_JOB_PROMPT_MAX_BYTES} bytes (8KB UTF-8)`,
+    }),
+  model: z.string().min(1).max(256).optional(),
+  notify: z.boolean().optional(),
+  channelSlug: z.string().min(1).max(128).optional(),
+});
+
+/** payload 是否为 LLM 提示词自动化形状（对象且 kind === 'llm'；数组/标量一律视为普通负载） */
+function isLlmJobPayload(payload: unknown): payload is Record<string, unknown> {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    !Array.isArray(payload) &&
+    (payload as Record<string, unknown>)['kind'] === 'llm'
+  );
+}
+
+/**
+ * payload 的放宽 discriminated 校验：
+ * - 缺省 / null / 非对象 / kind !== 'llm' → 返回 null（v1 普通任务维持自由 JSON 现状）；
+ * - kind === 'llm' → 必须满足 llmJobPayloadSchema，失败返回 zod 错误（调用方转 400）。
+ */
+function validateJobPayload(payload: unknown): z.ZodError | null {
+  if (!isLlmJobPayload(payload)) return null;
+  const parsed = llmJobPayloadSchema.safeParse(payload);
+  return parsed.success ? null : parsed.error;
+}
 
 /** POST /api/v1/cron 请求体 */
 const createBodySchema = z.object({
@@ -197,6 +241,10 @@ export function registerCronRoutes(app: FastifyInstance, deps: CronRoutesDeps): 
         throw err('VALIDATION_FAILED', { detail: parsed.error.issues });
       }
       const body = parsed.data;
+      const payloadError = validateJobPayload(body.payload);
+      if (payloadError !== null) {
+        throw err('VALIDATION_FAILED', { detail: payloadError.issues });
+      }
       const record = await deps.scheduler.schedule({
         name: body.name,
         expr: body.expr,
@@ -231,6 +279,13 @@ export function registerCronRoutes(app: FastifyInstance, deps: CronRoutesDeps): 
       const parsed = patchBodySchema.safeParse(request.body);
       if (!parsed.success) {
         throw err('VALIDATION_FAILED', { detail: parsed.error.issues });
+      }
+      // payload 键给出时才做 llm 结构校验（缺省 = 不修改负载，维持现状）
+      if (parsed.data.payload !== undefined) {
+        const payloadError = validateJobPayload(parsed.data.payload);
+        if (payloadError !== null) {
+          throw err('VALIDATION_FAILED', { detail: payloadError.issues });
+        }
       }
       const record = await deps.scheduler.update(id, parsed.data);
       if (record === null) throw jobNotFound(id);

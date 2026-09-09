@@ -13,7 +13,19 @@ export {
   type NotificationSendInput,
   type NotificationChannel,
   type ChannelDeliveryResult,
+  type NotificationDeliveryEntry,
 } from './manager.js';
+export {
+  withDeliveryRetry,
+  resolveChannelRetry,
+  normalizeRetryOverride,
+  defaultSleep,
+  NOTIFICATION_RETRY_DEFAULTS,
+  FALLBACK_DELIVERY_RETRY,
+  type DeliveryRetryConfig,
+  type SleepFn,
+  type WithDeliveryRetryOptions,
+} from './retry.js';
 export { inboxDriver } from './drivers/inbox.js';
 export { createWebhookDriver, type WebhookDriverDeps } from './drivers/webhook.js';
 export { createConsoleDriver } from './drivers/console.js';

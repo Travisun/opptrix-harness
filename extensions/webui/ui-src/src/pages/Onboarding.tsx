@@ -362,7 +362,7 @@ export default function OnboardingPage(): ReactNode {
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    document.title = 'Opptrix Console — 初始化向导';
+    document.title = 'Dashboard — 初始化向导';
   }, []);
 
   /** 第 0 步探测：needsOnboarding=false → 「系统已初始化」+ 去登录 */
@@ -493,7 +493,7 @@ export default function OnboardingPage(): ReactNode {
           <CardContent className="flex flex-col items-center gap-3 py-10 text-center">
             <CheckCircle2Icon className="text-emerald-600 dark:text-emerald-400 size-10" aria-hidden />
             <p className="text-base font-medium">初始化完成</p>
-            <p className="text-muted-foreground text-sm">两步验证已绑定，即将进入控制台…</p>
+            <p className="text-muted-foreground text-sm">两步验证已绑定，即将进入 Dashboard…</p>
             <Loader2Icon className="text-muted-foreground size-4 animate-spin" aria-hidden />
           </CardContent>
         </Card>
@@ -574,7 +574,7 @@ export default function OnboardingPage(): ReactNode {
                 onChange={(e) => setPassword(e.target.value)}
                 disabled={submitting}
               />
-              <p className="text-muted-foreground text-xs">密码至少 8 位，用于登录控制台</p>
+              <p className="text-muted-foreground text-xs">密码至少 8 位，用于登录 Dashboard</p>
             </div>
 
             <Button type="submit" className="w-full" disabled={submitting}>

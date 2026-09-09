@@ -21,6 +21,12 @@
  * 入站 webhook（公开免鉴权，令牌即凭据）：
  * - POST   /hooks/chat/:token                    body {text, sender?} → 202；
  *                                                无效 token → 404 HARNESS-3004（不回显令牌）
+ * - POST   /hooks/connector/:platform/:token     平台连接器统一入站回调（deps.connectors 提供
+ *                                                createPlatformConnectors() 时启用）：
+ *                                                verifyInbound → parseInbound → sendMessage
+ *                                                → 202；无效 token / 校验失败 → 401（不回显令牌）；
+ *                                                未内置平台 → 404；feishu url_verification
+ *                                                challenge 直回（见 docs/chat-platforms.mdx）
  *
  * 约定：
  * - 鉴权：token 经 extractToken（Authorization: Bearer 优先，其次 ?token=）交
@@ -34,6 +40,8 @@ import { z } from 'zod';
 import { extractToken } from '../kernel/auth/authProxy.js';
 import { err, HarnessError } from '../kernel/errors/index.js';
 import type { ChatService } from '../kernel/chat/index.js';
+import type { PlatformConnector } from '../kernel/chat/connectors/index.js';
+import { parseFeishuChallenge, platformTargetFromMeta } from '../kernel/chat/connectors/index.js';
 
 // ---------------------------------------------------------------------------
 // 依赖契约
@@ -57,6 +65,14 @@ export interface ChatRoutesDeps {
   }) => Promise<ChatRouteIdentity>;
   /** 聊天领域服务（频道/成员/消息全部委托于此） */
   service: ChatService;
+  /**
+   * 平台连接器注册中心（可选；缺省时 /hooks/connector/* 一律 404）。
+   * 由内核装配层注入 createPlatformConnectors() 产物（get 按平台名取连接器：
+   * 入站回调解析 + 出站平台 API 投递，见 src/kernel/chat/connectors/）。
+   */
+  connectors?: {
+    get(platform: string): PlatformConnector | undefined;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +219,61 @@ export function registerChatRoutes(app: FastifyInstance, deps: ChatRoutesDeps): 
         content: { type: 'text', text: parsed.data.text },
       });
       // 202 = 已受理（异步语义）；被 hook 拦截同样视为已受理，仅回执 blocked 标记
+      reply.code(202);
+      return result.blocked
+        ? { accepted: true, blocked: true, reason: result.reason }
+        : { accepted: true, blocked: false, messageId: result.message.id };
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 平台连接器统一入站回调（公开免鉴权；令牌即凭据；deps.connectors 提供时启用）
+  // -------------------------------------------------------------------------
+
+  app.post(
+    '/hooks/connector/:platform/:token',
+    { ...routeOptions, errorHandler: mapBodyParseError },
+    async (request, reply) => {
+      const { platform, token } = request.params as { platform: string; token: string };
+      const connector = deps.connectors?.get(platform);
+      if (connector === undefined) {
+        throw notFound(`chat connector platform "${platform}" is not supported`, { platform });
+      }
+      const channel = await deps.service.getChannelByToken(token);
+      if (channel === null) {
+        // 不回显令牌（密钥不入日志/响应）
+        throw err('UNAUTHORIZED', { message: 'chat connector callback rejected (invalid token)' });
+      }
+      // 飞书 url_verification 握手：challenge 直回（在 parseInbound 之前处理）
+      if (connector.platform === 'feishu') {
+        const challenge = parseFeishuChallenge(request.body);
+        if (challenge !== null) return { challenge };
+      }
+      // 入站校验（如 Telegram secret_token 头；期望值随该频道 meta.bridges 的平台 target 配置）
+      if (connector.verifyInbound !== undefined) {
+        const verified = await connector.verifyInbound(
+          { headers: request.headers, body: request.body },
+          platformTargetFromMeta(channel.meta, connector.platform),
+        );
+        if (!verified) {
+          throw err('UNAUTHORIZED', {
+            message: `chat connector inbound verification failed (platform "${connector.platform}")`,
+            detail: { platform: connector.platform },
+          });
+        }
+      }
+      const parsed = connector.parseInbound({ headers: request.headers, body: request.body });
+      if (parsed === null || parsed.text.trim() === '') {
+        // 非消息载荷（心跳/已跳过事件等）：受理但不入库，避免平台侧重试风暴
+        reply.code(202);
+        return { accepted: true, ignored: true };
+      }
+      const result = await deps.service.sendMessage({
+        channelId: channel.id,
+        senderType: 'webhook',
+        senderId: parsed.senderName ?? connector.platform,
+        content: { type: 'text', text: parsed.text.slice(0, 20_000) },
+      });
       reply.code(202);
       return result.blocked
         ? { accepted: true, blocked: true, reason: result.reason }

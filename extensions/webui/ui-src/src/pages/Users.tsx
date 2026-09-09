@@ -281,7 +281,7 @@ export default function UsersPage(): React.ReactNode {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>新建用户</DialogTitle>
-            <DialogDescription>创建可登录控制台的账号（密码至少 8 个字符）。</DialogDescription>
+            <DialogDescription>创建可登录 Dashboard 的账号（密码至少 8 个字符）。</DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-4">
             <div className="flex flex-col gap-2">

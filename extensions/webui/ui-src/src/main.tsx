@@ -9,7 +9,7 @@ import { AppRoutes } from '@/router';
 import './styles.css';
 
 /**
- * main — 控制台入口。
+ * main — Dashboard（管理台）入口。
  *
  * Provider 层级：Theme（模式/预设/圆角/密度/自定义覆盖 → CSS 变量）
  *   → Toast（轻量全局提示，api.ts 错误经模块级 toast() 上报）

@@ -257,7 +257,7 @@ export default function UpdatePage(): React.ReactNode {
           </DialogHeader>
           <p className="text-destructive bg-destructive/5 flex items-start gap-2 rounded-md border border-dashed p-3 text-xs leading-relaxed">
             <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-            升级完成后服务将自动重启，期间管理台与 API 会短暂不可用；请确认当前没有正在执行的关键任务。
+            升级完成后服务将自动重启，期间 Dashboard（管理台）与 API 会短暂不可用；请确认当前没有正在执行的关键任务。
           </p>
           <DialogFooter>
             <Button variant="outline" onClick={() => setApplyOpen(false)} disabled={applying}>

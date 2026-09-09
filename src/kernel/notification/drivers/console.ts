@@ -3,6 +3,9 @@
  *
  * 把通知标题/级别经 kernel logger（pino，info 级）输出，用于本地开发与
  * 无外发渠道场景下的可观测性。日志只含 id/级别/标题等非敏感字段。
+ *
+ * 失败重试：投递与其他驱动同样纳入 NotificationManager 的统一重试封装
+ *（retry.ts withDeliveryRetry）；logger.info 几乎不会失败，缺省口径为不重试。
  */
 import type { NotificationDriver } from '../../channels/index.js';
 import type { Logger } from 'pino';

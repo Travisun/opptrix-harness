@@ -6,13 +6,18 @@
  * - secret 明文共享密钥，或 secretRef（kernel secrets 引用，明文永不入配置）——
  *   两者都给时 target.secret 优先；都未给则发不带签名头的 POST；
  *   secretRef 有值但未注入 resolveSecret 时抛 DELIVERY_FAILED（给出两种修复方式）；
- * - timeoutMs / retries 透传给 channels 包 signedPost（缺省 10s / 3 次重试）。
+ * - timeoutMs 单次尝试超时（毫秒），透传 signedPost（缺省 10s）；
+ * - retries 表达「首次失败后的重试次数」语义（缺省 3 次 500ms/1s/2s），由
+ *   NotificationManager 的统一重试封装（retry.ts withDeliveryRetry，指数退避）编排；
+ *   本驱动每次 deliver 恰好发起一次 HTTP 请求（signedPost retries 固定 0），
+ *   直接调用驱动（不经 manager）时 target.retries 不生效。
  *
  * 投递：请求体为 NotificationPayload 原样 JSON；secret 存在时由 signedPost 附加
  * x-harness-timestamp / x-harness-signature（hex(hmac_sha256(secret, ts + '.' + rawBody))）。
  *
- * 失败语义：target 非法 → VALIDATION_FAILED；secretRef 解析/POST 任一环节失败 →
- * DELIVERY_FAILED。失败由 NotificationManager 隔离计数，不会中断其他渠道。
+ * 失败语义：target 非法 → VALIDATION_FAILED（manager 不重试）；secretRef 解析/POST
+ * 任一环节失败 → DELIVERY_FAILED（manager 按统一口径指数退避重试）。失败由
+ * NotificationManager 隔离计数，不会中断其他渠道。
  */
 import type { NotificationDriver } from '../../channels/index.js';
 import { signedPost } from '../../channels/index.js';
@@ -39,7 +44,7 @@ const webhookTargetSchema = z.object({
   secretRef: z.string().min(1).optional(),
   /** 单次尝试超时（毫秒），透传 signedPost */
   timeoutMs: z.number().int().positive().optional(),
-  /** 失败重试次数（不含首次），透传 signedPost；测试可置 0 加速失败路径 */
+  /** 重试次数（不含首次）：由 NotificationManager 统一编排；测试可置 0 加速失败路径 */
   retries: z.number().int().min(0).max(10).optional(),
 });
 
@@ -100,7 +105,10 @@ export function createWebhookDriver(deps: WebhookDriverDeps = {}): NotificationD
         body: payload,
         secret,
         timeoutMs: targetValue.timeoutMs,
-        retries: targetValue.retries,
+        // 单次尝试：重试统一由 NotificationManager 的 withDeliveryRetry 编排
+        //（口径不变：缺省 3 次重试、退避 500ms/1s/2s；target.retries 仍按次数生效），
+        // 避免驱动内重试与 manager 层重试叠乘
+        retries: 0,
       });
     },
   } satisfies NotificationDriver;

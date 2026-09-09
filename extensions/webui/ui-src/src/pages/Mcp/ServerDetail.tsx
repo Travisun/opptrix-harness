@@ -225,7 +225,7 @@ export function ServerDetail({
               {viewResource.mimeType !== undefined && <MetaRow label="MIME">{viewResource.mimeType}</MetaRow>}
               {viewResource.description !== undefined && <MetaRow label="描述">{viewResource.description}</MetaRow>}
               <p className="text-muted-foreground text-xs leading-relaxed">
-                resources.read 不在当前管理台 REST 面的 9 个端点内，故仅展示目录元数据。
+                resources.read 不在当前 Dashboard REST 面的 9 个端点内，故仅展示目录元数据。
               </p>
             </div>
           )}

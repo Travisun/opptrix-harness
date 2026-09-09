@@ -8,7 +8,7 @@ import { cn } from '@/lib/utils';
  *
  * - `toast.success/info/error(...)` 全局函数：非组件环境（如 lib/api.ts）可直接调用；
  * - `<ToastProvider>`：挂载视口，订阅事件总线渲染队列（最多同屏 5 条，自动过期）。
- * 刻意不引 sonner/radix-toast：本控制台只需要右下角堆叠的轻提示。
+ * 刻意不引 sonner/radix-toast：本管理台只需要右下角堆叠的轻提示。
  */
 
 export type ToastVariant = 'info' | 'success' | 'error';

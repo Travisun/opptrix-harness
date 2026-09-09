@@ -55,10 +55,10 @@ export default function LoginPage(): React.ReactNode {
   const totpInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    document.title = 'Opptrix Console — 登录';
+    document.title = 'Dashboard — 登录';
   }, []);
 
-  // 已登录直接进控制台（hash 路由下的 /login 自愈）
+  // 已登录直接进 Dashboard（hash 路由下的 /login 自愈）
   if (getToken() !== '') {
     return <Navigate to="/" replace />;
   }
@@ -219,7 +219,7 @@ export default function LoginPage(): React.ReactNode {
 
   // ---- 第一步：用户名 + 密码 ----
   return (
-    <LoginLayout subtitle="Harness OS 管理台">
+    <LoginLayout subtitle="Dashboard（管理台）">
       <Card>
         <CardHeader>
           <CardTitle>登录</CardTitle>
@@ -287,7 +287,7 @@ function LoginLayout({
           <div className="bg-primary text-primary-foreground flex size-11 items-center justify-center rounded-lg shadow-sm">
             <BoxesIcon className="size-6" aria-hidden />
           </div>
-          <p className="text-lg font-semibold tracking-tight">Opptrix 控制台</p>
+          <p className="text-lg font-semibold tracking-tight">Opptrix Harness</p>
           <p className="text-muted-foreground text-sm">{subtitle}</p>
         </div>
         {children}

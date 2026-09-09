@@ -4,6 +4,7 @@ import {
   CircleArrowUpIcon,
   DatabaseIcon,
   KeyRoundIcon,
+  MinusIcon,
   MonitorIcon,
   MoonIcon,
   PencilIcon,
@@ -49,9 +50,15 @@ import { api, type SystemInfo } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import {
   ACCENT_PRESETS,
+  CTL_ADJ_MAX,
+  CTL_ADJ_MIN,
+  CTL_ADJ_STEP,
+  ctlVarValues,
   RADIUS_STEPS,
   useTheme,
+  type ControlScale,
   type Density,
+  type ShadowLevel,
   type ThemeMode,
 } from '@/lib/theme';
 import {
@@ -72,6 +79,8 @@ import { EmptyState } from '@/pages/_shared';
  *
  * - 「外观」：主题定制器（useTheme 全能力产品化）——模式三态卡（浅色/深色/跟随系统）、
  *   强调色预设色板圆点（7 组，选中高亮）、圆角五档分段控件、密度切换（舒适/紧凑）、
+ *   控件尺寸（紧凑/默认/宽敞三档 + py/px ±1px 微调，实时预览按钮/输入框）、
+ *   面板阴影（无/柔和/适中/明显四档 + 实时预览卡）、
  *   自定义 --* 变量覆盖编辑器（增删改实时生效）；「恢复默认」需确认（resetToDefaults
  *   + 兜底清理 localStorage ui.tokens/ui.mode）。全部即时生效、无需保存，
  *   持久化由 ThemeProvider（localStorage ui.*）负责。
@@ -100,6 +109,21 @@ const DENSITY_OPTIONS: Array<{ value: Density; label: string }> = [
   { value: 'compact', label: '紧凑' },
 ];
 
+/** 控件尺寸三档（基数见 theme.CONTROL_SCALES：紧凑 32px / 默认 36px / 宽敞 40px） */
+const CONTROL_SCALE_OPTIONS: Array<{ value: ControlScale; label: string }> = [
+  { value: 'compact', label: '紧凑' },
+  { value: 'default', label: '默认' },
+  { value: 'roomy', label: '宽敞' },
+];
+
+/** 面板阴影四档（映射 --ui-shadow-card/pop，见 theme.SHADOW_PRESETS） */
+const SHADOW_OPTIONS: Array<{ value: ShadowLevel; label: string; hint: string }> = [
+  { value: 'none', label: '无', hint: '纯平面' },
+  { value: 'subtle', label: '柔和', hint: '默认' },
+  { value: 'medium', label: '适中', hint: '层级感' },
+  { value: 'strong', label: '明显', hint: '强浮起' },
+];
+
 /** 自定义覆盖编辑器的行状态（id 供 React key / 行定位） */
 interface TokenRow {
   id: number;
@@ -108,6 +132,49 @@ interface TokenRow {
 }
 
 let tokenRowSeq = 0;
+
+/** py/px ±1px 微调行（−/+ 步进，范围 [CTL_ADJ_MIN, CTL_ADJ_MAX]，显示实际生效值） */
+function NudgeRow({
+  label,
+  value,
+  effective,
+  onAdjust,
+}: {
+  label: string;
+  value: number;
+  effective: string;
+  onAdjust: (delta: number) => void;
+}): React.ReactNode {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-muted-foreground w-24 shrink-0 text-xs">{label}</span>
+      <Button
+        variant="outline"
+        size="icon-sm"
+        aria-label={`减少${label}`}
+        disabled={value <= CTL_ADJ_MIN}
+        onClick={() => onAdjust(-CTL_ADJ_STEP)}
+      >
+        <MinusIcon aria-hidden />
+      </Button>
+      <span className="w-10 text-center font-mono text-xs tabular-nums">
+        {value > 0 ? `+${value}` : String(value)}
+      </span>
+      <Button
+        variant="outline"
+        size="icon-sm"
+        aria-label={`增加${label}`}
+        disabled={value >= CTL_ADJ_MAX}
+        onClick={() => onAdjust(CTL_ADJ_STEP)}
+      >
+        <PlusIcon aria-hidden />
+      </Button>
+      <span className="text-muted-foreground text-xs">
+        实际生效 <span className="font-mono tabular-nums">{effective}</span>
+      </span>
+    </div>
+  );
+}
 
 function AppearanceTab(): React.ReactNode {
   const theme = useTheme();
@@ -119,6 +186,13 @@ function AppearanceTab(): React.ReactNode {
     })),
   );
   const [resetOpen, setResetOpen] = useState(false);
+
+  // 控件尺寸实际生效值（档位基数 + 密度联动 + ±px 微调合成，与 ThemeProvider 同一函数）
+  const effectiveCtl = ctlVarValues(
+    { scale: theme.controlScale, pyAdj: theme.ctlAdjust.py, pxAdj: theme.ctlAdjust.px },
+    theme.density,
+  );
+  const currentShadowLabel = SHADOW_OPTIONS.find((o) => o.value === theme.shadow)?.label ?? '';
 
   /** 提交单行到主题：合法变量名 + 非空值 → 覆盖；否则删除该覆盖（即时生效） */
   const commit = (name: string, value: string): void => {
@@ -164,7 +238,7 @@ function AppearanceTab(): React.ReactNode {
     }
     setRows([]);
     setResetOpen(false);
-    toast.success('已恢复默认外观', '模式 / 强调色 / 圆角 / 密度 / 自定义覆盖全部重置。');
+    toast.success('已恢复默认外观', '模式 / 强调色 / 圆角 / 密度 / 控件尺寸 / 面板阴影 / 自定义覆盖全部重置。');
   };
 
   return (
@@ -291,6 +365,108 @@ function AppearanceTab(): React.ReactNode {
         </div>
       </section>
 
+      {/* 控件尺寸 */}
+      <section className="flex flex-col gap-3">
+        <div>
+          <h3 className="text-sm font-medium">控件尺寸</h3>
+          <p className="text-muted-foreground text-xs">
+            按钮 / 输入框 / 表格等控件的 padding 与高度令牌（--ui-ctl-*），随密度档联动微调。
+          </p>
+        </div>
+        <div className="border-input inline-flex w-fit gap-1 rounded-lg border p-1">
+          {CONTROL_SCALE_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              aria-pressed={theme.controlScale === opt.value}
+              onClick={() => theme.setControlScale(opt.value)}
+              className={cn(
+                'rounded-md px-4 py-1.5 text-xs transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                theme.controlScale === opt.value
+                  ? 'bg-primary text-primary-foreground shadow-xs'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-col gap-2">
+          <NudgeRow
+            label="纵向 padding"
+            value={theme.ctlAdjust.py}
+            effective={effectiveCtl['--ui-ctl-py']}
+            onAdjust={(delta) => theme.setCtlAdjust({ py: theme.ctlAdjust.py + delta })}
+          />
+          <NudgeRow
+            label="横向 padding"
+            value={theme.ctlAdjust.px}
+            effective={effectiveCtl['--ui-ctl-px']}
+            onAdjust={(delta) => theme.setCtlAdjust({ px: theme.ctlAdjust.px + delta })}
+          />
+        </div>
+        {/* 实时预览：真实组件消费同一组令牌，随档位/微调即时变化 */}
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed p-3">
+          <span className="text-muted-foreground text-xs">预览（高度 {effectiveCtl['--ui-ctl-h']}）：</span>
+          <Button size="sm">主按钮</Button>
+          <Button variant="outline" size="sm">
+            次按钮
+          </Button>
+          <Input placeholder="输入框" aria-label="控件尺寸预览输入框" className="w-40" />
+        </div>
+      </section>
+
+      {/* 面板阴影 */}
+      <section className="flex flex-col gap-3">
+        <div>
+          <h3 className="text-sm font-medium">面板阴影</h3>
+          <p className="text-muted-foreground text-xs">
+            卡片 / 面板（--ui-shadow-card）与浮层 Dialog / Sheet / 下拉（--ui-shadow-pop 等）的阴影档位。
+          </p>
+        </div>
+        <div className="border-input inline-flex w-fit gap-1 rounded-lg border p-1">
+          {SHADOW_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              aria-pressed={theme.shadow === opt.value}
+              onClick={() => theme.setShadow(opt.value)}
+              className={cn(
+                'rounded-md px-4 py-1.5 text-xs transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                theme.shadow === opt.value
+                  ? 'bg-primary text-primary-foreground shadow-xs'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        {/* 实时预览：面板卡 + 浮层卡直接消费 --ui-shadow-* 变量 */}
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="bg-background flex items-center justify-center rounded-lg border border-dashed p-5">
+            <div
+              className="bg-card text-card-foreground flex flex-col gap-1 rounded-lg border p-4"
+              style={{ boxShadow: 'var(--ui-shadow-card)' }}
+            >
+              <p className="text-sm font-medium">卡片 / 面板</p>
+              <p className="text-muted-foreground text-xs">
+                --ui-shadow-card · 当前「{currentShadowLabel}」档
+              </p>
+            </div>
+          </div>
+          <div className="bg-background flex items-center justify-center rounded-lg border border-dashed p-5">
+            <div
+              className="bg-popover text-popover-foreground rounded-lg border px-4 py-3"
+              style={{ boxShadow: 'var(--ui-shadow-pop)' }}
+            >
+              <p className="text-sm font-medium">浮层 Dialog / Sheet</p>
+              <p className="text-muted-foreground text-xs">--ui-shadow-pop</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* 自定义覆盖 */}
       <section className="flex flex-col gap-3">
         <div className="flex flex-wrap items-end justify-between gap-2">
@@ -353,7 +529,7 @@ function AppearanceTab(): React.ReactNode {
         <div>
           <h3 className="text-sm font-medium">恢复默认</h3>
           <p className="text-muted-foreground text-xs">
-            清除模式 / 强调色 / 圆角 / 密度 / 自定义覆盖的全部本地偏好（localStorage ui.*）。
+            清除模式 / 强调色 / 圆角 / 密度 / 控件尺寸 / 面板阴影 / 自定义覆盖的全部本地偏好（localStorage ui.*）。
           </p>
         </div>
         <Button variant="destructive" size="sm" className="w-fit" onClick={() => setResetOpen(true)}>

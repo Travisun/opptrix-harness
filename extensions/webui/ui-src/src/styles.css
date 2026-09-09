@@ -55,6 +55,32 @@
   --density-px: 0.75rem;
   --density-line-height: 1.5rem;
   --density-gap: 0.5rem;
+
+  /*
+   * 控件内边距/高度令牌（default 档 = 现版像素；compact/roomy 档、密度联动与
+   * ±px 微调由 ThemeProvider 以 style.setProperty 覆盖，calc 派生随基数缩放）。
+   * 组件侧消费（缺省档逐像素对齐 vendored 版）：
+   * - Button default: h-(--ui-ctl-h)/px-(--ui-ctl-px)/py-(--ui-ctl-py) = 36/16/8px（原 h-9/px-4/py-2）
+   * - Input: h-(--ui-ctl-h)/px-(-4px→12px)/py-(-4px→4px)（原 h-9/px-3/py-1）
+   * - SelectTrigger: px-(-4px→12px)/py-(--ui-ctl-py)=8px、h: 36/32px（原 px-3/py-2/h-9|8）
+   * - Textarea: px-(-4px→12px)/py-(--ui-ctl-py)=8px（原 px-3/py-2）
+   * - Table: 表头 h-(-4px→40px)/px-(-8px→8px)、单元格 px-(-8px→8px)/py-(--ui-ctl-py)=8px（原 h-10/px-2/p-2）
+   */
+  --ui-ctl-py: 0.5rem; /* 8px */
+  --ui-ctl-px: 1rem; /* 16px */
+  --ui-ctl-h: 2.25rem; /* 36px */
+
+  /*
+   * 面板阴影令牌（subtle 档 = 现版像素；none/medium/strong 档由 ThemeProvider 覆盖）。
+   * card=卡片/面板；pop=模态浮层（Dialog/Sheet/子菜单）；menu=菜单类浮层（Dropdown/Select
+   * 内容，与模态层级区分）；ctl=控件微阴影（Button/Input/Textarea/SelectTrigger）——
+   * menu/ctl 为保持现版像素一致的派生伴生变量（同一档位四者联动，可被 ui.tokens 单独覆盖）。
+   * 缺省值 = Tailwind shadow-sm / shadow-lg / shadow-md / shadow-xs。
+   */
+  --ui-shadow-card: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  --ui-shadow-pop: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  --ui-shadow-menu: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --ui-shadow-ctl: 0 1px 2px 0 rgb(0 0 0 / 0.05);
 }
 
 .dark {

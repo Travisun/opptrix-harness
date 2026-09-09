@@ -37,6 +37,8 @@ import { registerExtAssets } from '../src/kernel/extensions/assets.js';
 import { validateManifest, validatePermissions } from '../src/kernel/extensions/manifest.js';
 import { CONTAINER_KEYS, Kernel } from '../src/kernel/Kernel.js';
 import { loadConfig } from '../src/kernel/config/index.js';
+// Skills 编辑体验包：frontmatter 识别纯函数（零依赖，供仓库根 vitest 直接导入）
+import { parseSkillFile, slugifyId } from '../extensions/webui/ui-src/src/pages/Skills/frontmatter.js';
 
 // ---------------------------------------------------------------------------
 // 公共路径
@@ -61,7 +63,7 @@ describe('webui manifest 与扩展入口', () => {
     expect(manifest.api).toBe(1);
     expect(manifest.version).toBe('1.0.0');
     expect(manifest.main).toBe('index.js');
-    expect(manifest.displayName).toBe('Web Console');
+    expect(manifest.displayName).toBe('Dashboard'); // ★ Dashboard 品牌包：Web Console → Dashboard（id 保持 'webui' 稳定标识不变，见 extensions/webui/index.js 头注释）
     expect(manifest.builtin).toBe(true);
     expect(manifest.mount).toBe('ui');
     expect(manifest.permissions).toEqual(['http', 'ui', 'storage']);
@@ -416,5 +418,263 @@ describe('webui 真实内核 E2E（builtin 自动启用 + /admin 与 UI 资产�
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toContain('text/html');
     expect(res.body).toContain('webui 扩展未启用');
+  });
+});
+
+// ############################################################################
+// D. Skills 创建/编辑体验增强（md-editor + frontmatter 识别纯函数）
+// ############################################################################
+
+/** Skills 页面包源码目录 */
+const SKILLS_DIR = path.join(UI_SRC, 'pages', 'Skills');
+
+/** 源码 console.* 禁用断言（新增文件统一收口） */
+function expectNoConsole(src: string, file: string): void {
+  expect(src, `${file} uses console.*`).not.toMatch(/\bconsole\.(log|error|warn|info|debug)/);
+}
+
+describe('webui Skills 编辑体验（md-editor + frontmatter 识别）', () => {
+  it('20. md-editor 存在且为 CodeMirror 6 封装：value/onChange/height 契约 + 主题亮暗跟随', () => {
+    const src = readFileSync(path.join(SKILLS_DIR, 'md-editor.tsx'), 'utf8');
+    expect(src).toContain('@uiw/react-codemirror');
+    expect(src).toContain('@codemirror/lang-markdown');
+    expect(src).toContain('useTheme'); // 亮暗跟随 ThemeProvider（system 模式跟随系统）
+    for (const prop of ['value', 'onChange', 'height']) {
+      expect(src).toContain(prop);
+    }
+    expect(src).toContain('EditorView.lineWrapping'); // 软换行
+    expectNoConsole(src, 'md-editor.tsx');
+  });
+
+  it('21. 创建/编辑弹窗与页面接线：frontmatter 导入 + id slug 联动 + DELETE+POST 保存序列 + 依赖登记', () => {
+    // 创建弹窗：md-editor + 粘贴 SKILL.md 识别 + slug 联动 + 字节上限
+    const create = readFileSync(path.join(SKILLS_DIR, 'CreateSkillDialog.tsx'), 'utf8');
+    expect(create).toContain('MdEditor');
+    expect(create).toContain('parseSkillFile');
+    expect(create).toContain('slugifyId');
+    expect(create).toContain('BODY_LIMIT_BYTES');
+    expectNoConsole(create, 'CreateSkillDialog.tsx');
+
+    // 编辑弹窗：md-editor + 保存 = DELETE + POST（REST 无 PUT）
+    const edit = readFileSync(path.join(SKILLS_DIR, 'EditSkillDialog.tsx'), 'utf8');
+    expect(edit).toContain('MdEditor');
+    expect(edit).toContain('api.delete(');
+    expect(edit).toContain("api.post('/api/v1/skills'");
+    expect(edit).toContain('encodeURIComponent');
+    expectNoConsole(edit, 'EditSkillDialog.tsx');
+
+    // 页面接线：EditSkillDialog 挂载 + 编辑入口仅数据卷来源
+    const page = readFileSync(path.join(UI_SRC, 'pages', 'Skills.tsx'), 'utf8');
+    expect(page).toContain('EditSkillDialog');
+    expect(page).toContain("source === 'data'");
+    expectNoConsole(page, 'Skills.tsx');
+
+    // ui-src package.json 登记 CodeMirror 依赖（Package-First）
+    const pkg = JSON.parse(readFileSync(path.join(UI_SRC_DIR, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>;
+    };
+    expect(pkg.dependencies?.['@uiw/react-codemirror']).toBeDefined();
+    expect(pkg.dependencies?.['@codemirror/lang-markdown']).toBeDefined();
+  });
+
+  it('22. frontmatter 识别：完整 SKILL.md（块序列 tags）→ 字段拆解 + 正文分离', () => {
+    const raw = [
+      '---',
+      'name: weekly-report',
+      'description: 导出周报',
+      'version: 1.0.0',
+      'author: team-platform',
+      'tags:',
+      '  - docs',
+      '  - report',
+      'enabled: true',
+      '---',
+      '',
+      '# 周报',
+      '',
+      '正文内容',
+    ].join('\n');
+    const parsed = parseSkillFile(raw);
+    expect(parsed.hasFrontmatter).toBe(true);
+    expect(parsed.fields.name).toBe('weekly-report');
+    expect(parsed.fields.description).toBe('导出周报');
+    expect(parsed.fields.version).toBe('1.0.0');
+    expect(parsed.fields.author).toBe('team-platform');
+    expect(parsed.fields.tags).toEqual(['docs', 'report']);
+    expect(parsed.fields.enabled).toBe(true);
+    expect(parsed.unknownKeys).toEqual([]);
+    expect(parsed.body).toBe('# 周报\n\n正文内容');
+  });
+
+  it('23. frontmatter 识别：行内数组 tags / 引号值剥离 / enabled:false / 未知键收集', () => {
+    const raw = ['---', "name: 'code-review'", 'description: "代码评审技能"', 'tags: [docs, review]', 'enabled: false', 'license: MIT', '---', '正文'].join('\n');
+    const parsed = parseSkillFile(raw);
+    expect(parsed.hasFrontmatter).toBe(true);
+    expect(parsed.fields.name).toBe('code-review');
+    expect(parsed.fields.description).toBe('代码评审技能');
+    expect(parsed.fields.tags).toEqual(['docs', 'review']);
+    expect(parsed.fields.enabled).toBe(false);
+    expect(parsed.unknownKeys).toEqual(['license']);
+    expect(parsed.body).toBe('正文');
+  });
+
+  it('24. frontmatter 识别：无文件头纯 Markdown → 整体作为正文（hasFrontmatter=false）', () => {
+    const raw = '# 纯 Markdown\n\n没有 frontmatter。';
+    const parsed = parseSkillFile(raw);
+    expect(parsed.hasFrontmatter).toBe(false);
+    expect(parsed.fields).toEqual({ tags: [] });
+    expect(parsed.unknownKeys).toEqual([]);
+    expect(parsed.body).toBe(raw);
+  });
+
+  it('25. frontmatter 识别：--- 未闭合 → 不误判为文件头，整体回落正文', () => {
+    const raw = '---\nname: broken\n正文没有闭合分隔符';
+    const parsed = parseSkillFile(raw);
+    expect(parsed.hasFrontmatter).toBe(false);
+    expect(parsed.body).toBe(raw);
+  });
+
+  it('26. frontmatter 识别：CRLF 行尾与 BOM 前缀兼容', () => {
+    const parsed = parseSkillFile('\uFEFF---\r\nname: crlf-skill\r\ndescription: 换行兼容\r\n---\r\n\r\n正文\r\n');
+    expect(parsed.hasFrontmatter).toBe(true);
+    expect(parsed.fields.name).toBe('crlf-skill');
+    expect(parsed.fields.description).toBe('换行兼容');
+    expect(parsed.body).toBe('正文');
+  });
+
+  it('27. slugifyId：名称 → 合法 id（小写/连字符压缩/变音剥离/截断 64/中文回落空串）', () => {
+    expect(slugifyId('Weekly Report!')).toBe('weekly-report');
+    expect(slugifyId('  Code   Review  ')).toBe('code-review');
+    expect(slugifyId('--Already--id--')).toBe('already-id');
+    expect(slugifyId('Ábc Éfg')).toBe('abc-efg'); // 变音符号剥离
+    expect(slugifyId('a'.repeat(100))).toBe('a'.repeat(64)); // 截断 64 位
+    expect(slugifyId('周报导出')).toBe(''); // 中文无法转写 → 空串，留待手填
+  });
+});
+
+// ############################################################################
+// E. 主题 Token 扩展（控件内边距 + 面板阴影）与 Dashboard 品牌更名
+//    （--ui-ctl-* / --ui-shadow-* 缺省档 = 现版像素；逐组件对照见各断言注释）
+// ############################################################################
+
+describe('webui 主题 Token 扩展（ctl/shadow）与 Dashboard 品牌', () => {
+  it('28. styles.css 派生变量组：--ui-ctl-* 三值缺省 = 现版像素（8/16/36px）；--ui-shadow-* 四值缺省 = subtle 档（= Tailwind sm/lg/md/xs）', () => {
+    const css = readFileSync(path.join(UI_SRC, 'styles.css'), 'utf8');
+    const rootStart = css.indexOf(':root {');
+    const darkStart = css.indexOf('.dark {');
+    expect(rootStart).toBeGreaterThanOrEqual(0);
+    expect(darkStart).toBeGreaterThan(rootStart);
+    const rootBlock = css.slice(rootStart, darkStart);
+    // 控件内边距/高度缺省档：py 8px（原 py-2）/ px 16px（原 px-4）/ h 36px（原 h-9）
+    expect(rootBlock).toContain('--ui-ctl-py: 0.5rem;');
+    expect(rootBlock).toContain('--ui-ctl-px: 1rem;');
+    expect(rootBlock).toContain('--ui-ctl-h: 2.25rem;');
+    // 面板阴影缺省档（subtle）：card=shadow-sm / pop=shadow-lg / menu=shadow-md / ctl=shadow-xs
+    expect(rootBlock).toContain('--ui-shadow-card: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);');
+    expect(rootBlock).toContain('--ui-shadow-pop: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);');
+    expect(rootBlock).toContain('--ui-shadow-menu: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);');
+    expect(rootBlock).toContain('--ui-shadow-ctl: 0 1px 2px 0 rgb(0 0 0 / 0.05);');
+  });
+
+  it('29. 组件消费变量：button/input/textarea/select 走 --ui-ctl-*，card/dialog/sheet/dropdown 走 --ui-shadow-*，calc 派生常数 = 原档位差', () => {
+    const read = (p: string): string => readFileSync(path.join(UI_SRC, 'components', 'ui', p), 'utf8');
+    // button：default 档直接消费三变量；阴影走 ctl 档（原 shadow-xs）
+    const button = read('button.tsx');
+    expect(button).toContain('h-(--ui-ctl-h)'); // = 36px（原 h-9）
+    expect(button).toContain('px-(--ui-ctl-px)'); // = 16px（原 px-4）
+    expect(button).toContain('py-(--ui-ctl-py)'); // = 8px（原 py-2）
+    expect(button).toContain('shadow-[var(--ui-shadow-ctl)]');
+    expect(button).toContain('size-(--ui-ctl-h)'); // icon 档 = 36px（原 size-9）
+    expect(button).not.toMatch(/'[^']*shadow-xs/); // className 串内写死的阴影已全部替换
+    // input：px/py 以 -4px 派生（16-4=12px=原 px-3、8-4=4px=原 py-1），高度走变量
+    const input = read('input.tsx');
+    expect(input).toContain('h-(--ui-ctl-h)');
+    expect(input).toContain('px-[calc(var(--ui-ctl-px)-4px)]');
+    expect(input).toContain('py-[calc(var(--ui-ctl-py)-4px)]');
+    expect(input).toContain('shadow-[var(--ui-shadow-ctl)]');
+    // textarea：py 直接消费变量（= 原 py-2）
+    const textarea = read('textarea.tsx');
+    expect(textarea).toContain('py-(--ui-ctl-py)');
+    expect(textarea).toContain('px-[calc(var(--ui-ctl-px)-4px)]');
+    // card / dialog / sheet：面板与模态浮层阴影变量
+    expect(read('card.tsx')).toContain('shadow-[var(--ui-shadow-card)]'); // 原 shadow-sm
+    expect(read('dialog.tsx')).toContain('shadow-[var(--ui-shadow-pop)]'); // 原 shadow-lg
+    expect(read('sheet.tsx')).toContain('shadow-[var(--ui-shadow-pop)]'); // 原 shadow-lg
+    // dropdown / select：菜单层阴影变量（原 shadow-md，与模态层级区分）
+    expect(read('dropdown-menu.tsx')).toContain('shadow-[var(--ui-shadow-menu)]');
+    expect(read('select.tsx')).toContain('shadow-[var(--ui-shadow-menu)]');
+    // select trigger：尺寸走 ctl 变量（原 px-3/py-2/h-9|8）
+    expect(read('select.tsx')).toContain('px-[calc(var(--ui-ctl-px)-4px)]');
+    expect(read('select.tsx')).toContain('data-[size=default]:h-(--ui-ctl-h)');
+    // table：表头 h +4px 派生（= 原 h-10）、px -8px 派生（= 原 px-2）、单元格 py 直接消费
+    const table = read('table.tsx');
+    expect(table).toContain('h-[calc(var(--ui-ctl-h)+4px)]');
+    expect(table).toContain('px-[calc(var(--ui-ctl-px)-8px)]');
+    expect(table).toContain('py-(--ui-ctl-py)');
+  });
+
+  it('30. theme.tsx：controlScale 三档/shadow 四档映射完整；持久化键 ui.ctl / ui.shadow；resetToDefaults 一并复位', () => {
+    const theme = readFileSync(path.join(UI_SRC, 'lib', 'theme.tsx'), 'utf8');
+    // 控件三档基数（default 档 = 现版 36/16/8）
+    expect(theme).toContain('compact: { py: 6, px: 12, h: 32 }');
+    expect(theme).toContain('default: { py: 8, px: 16, h: 36 }');
+    expect(theme).toContain('roomy: { py: 10, px: 20, h: 40 }');
+    // 阴影四档
+    for (const level of ['none', 'subtle', 'medium', 'strong']) {
+      expect(theme).toContain(`${level}: {`);
+    }
+    // 持久化键（与 Settings 定制器共用）
+    expect(theme).toContain("'ui.ctl'");
+    expect(theme).toContain("'ui.shadow'");
+    // 复位：resetToDefaults 清除两组新键并回退缺省档
+    expect(theme).toContain('removeStored(CTL_KEY)');
+    expect(theme).toContain('removeStored(SHADOW_KEY)');
+    expect(theme).toContain("DEFAULT_CONTROL_SCALE: ControlScale = 'default'");
+    expect(theme).toContain("DEFAULT_SHADOW: ShadowLevel = 'subtle'");
+  });
+
+  it('31. Settings 外观定制器：控件尺寸（三档分段 + py/px ±1px 微调 + 实时预览）与面板阴影（四档 + 预览卡）两组接线', () => {
+    const settings = readFileSync(path.join(UI_SRC, 'pages', 'Settings.tsx'), 'utf8');
+    expect(settings).toContain('控件尺寸');
+    expect(settings).toContain('面板阴影');
+    expect(settings).toContain('setControlScale');
+    expect(settings).toContain('setCtlAdjust');
+    expect(settings).toContain('setShadow');
+    // 微调范围常量被消费（±px 边界裁剪）
+    expect(settings).toContain('CTL_ADJ_MIN');
+    expect(settings).toContain('CTL_ADJ_MAX');
+    // 预览卡直接消费阴影变量（实时生效）
+    expect(settings).toContain('var(--ui-shadow-card)');
+    expect(settings).toContain('var(--ui-shadow-pop)');
+  });
+
+  it('32. Dashboard 品牌更名：manifest displayName 变更而 id 稳定；index.html 标题 / 侧栏 / 移动抽屉 / 登录页 / document.title 同步，旧品牌串清零', () => {
+    const manifest = validateManifest(manifestRaw);
+    expect(manifest.id).toBe('webui'); // 稳定标识：挂载/数据关联依赖，不改（决策见 extensions/webui/index.js 头注释）
+    expect(manifest.displayName).toBe('Dashboard');
+    // ui-src index.html 标题
+    expect(readFileSync(path.join(UI_SRC_DIR, 'index.html'), 'utf8')).toContain(
+      '<title>Dashboard · Opptrix Harness</title>',
+    );
+    // 侧栏 / 移动端抽屉品牌区：主标 Opptrix Harness + 副标 Dashboard（管理台）
+    const sidebar = readFileSync(path.join(UI_SRC, 'components', 'layout', 'Sidebar.tsx'), 'utf8');
+    expect(sidebar).toContain('Opptrix Harness');
+    expect(sidebar).toContain('Dashboard（管理台）');
+    const topbar = readFileSync(path.join(UI_SRC, 'components', 'layout', 'Topbar.tsx'), 'utf8');
+    expect(topbar).toContain('Opptrix Harness');
+    // 登录页标题与 document.title 同步
+    const login = readFileSync(path.join(UI_SRC, 'pages', 'Login.tsx'), 'utf8');
+    expect(login).toContain('Opptrix Harness');
+    expect(login).toContain('Dashboard — 登录');
+    // 壳层 document.title 品牌化（Dashboard — 页面名 / Dashboard · Opptrix Harness）
+    const appShell = readFileSync(path.join(UI_SRC, 'components', 'layout', 'AppShell.tsx'), 'utf8');
+    expect(appShell).toContain('Dashboard — ');
+    // 旧品牌串「Opptrix Console」在源码内清零（术语统一为 Dashboard）
+    for (const f of ['main.tsx', 'router.tsx']) {
+      const src = readFileSync(path.join(UI_SRC, f), 'utf8');
+      expect(src).not.toContain('Opptrix Console');
+    }
+    expect(appShell).not.toContain('Opptrix Console');
+    expect(login).not.toContain('Opptrix Console');
   });
 });

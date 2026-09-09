@@ -1,4 +1,4 @@
-/**
+          /**
  * Kernel — 内核生命周期编排（服务提供者两阶段引导）。
  *
  * 职责：
@@ -57,6 +57,7 @@ import { ExtensionServiceRegistry } from './extensions/registry.js';
 import { createKernelHandlers, type AuthProviderRegistration, type KernelBridgeHandlers } from './extensions/kernel-handlers.js';
 import { UiRegistry } from './extensions/ui-registry.js';
 import { registerExtensionRoutes, type ExtensionsApiDeps } from '../api/extensions.js';
+import { installExtensionZip } from './extensions/installer.js';
 import { registerExtAssets, type ExtAssetDir } from './extensions/assets.js';
 import { HOST_METHODS } from '../extension-host/protocol.js';
 import { createWorkerFactory } from '../extension-host/worker-factory.js';
@@ -73,6 +74,9 @@ import {
   type UpdateHistoryEntry,
   type UpdaterNotifier,
 } from './update/index.js';
+
+/** 仓库内置扩展目录（受信第一方；与数据卷用户扩展目录隔离） */
+const REPO_EXTENSIONS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'extensions');
 
 /** 内核生命周期状态机：created → registering → booting → ready → stopping → stopped */
 export type KernelState = 'created' | 'registering' | 'booting' | 'ready' | 'stopping' | 'stopped';
@@ -815,6 +819,17 @@ export class Kernel {
             checker: authChecker,
             manager: extManager as unknown as ExtensionsApiDeps['manager'],
             registry: extSvcRegistry,
+            // 本地扩展包安装（zip → 数据卷 extensions 目录，受信内置目录不受影响）
+            install: {
+              installZip: (cfg, zipPath, opts) => installExtensionZip(cfg, zipPath, opts),
+              dataDir: this.config.dataDir,
+              extensionsRepoDir: REPO_EXTENSIONS_DIR,
+              onInstalled: (id) => {
+                void extManager.rescan().catch((e) => {
+                  this.logger.error({ err: e, id }, '[kernel] rescan after extension install failed');
+                });
+              },
+            },
           });
 
           // GET /api/v1/ui — UI 贡献目录（认证任意角色；管理台/宿主前端消费）

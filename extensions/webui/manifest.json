@@ -3,7 +3,7 @@
   "api": 1,
   "version": "1.0.0",
   "main": "index.js",
-  "displayName": "Web Console",
+  "displayName": "Dashboard",
   "permissions": ["http", "ui", "storage"],
   "builtin": true,
   "mount": "ui",

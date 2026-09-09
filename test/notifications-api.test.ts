@@ -6,7 +6,9 @@
  * （unread/level/limit + 缺省 limit=50）、limit 非法 400、read 命中与
  * markRead false → 404 HARNESS-3004、read-all 计数、send 两态（deps.send
  * 注入 → 201 + 规范化入参；缺省 → 501 HARNESS-9004）、send body 校验 400、
- * GET routes 透传、PUT routes 校验失败 400、drivers 清单。
+ * GET routes 透传、PUT routes 校验失败 400、drivers 清单；
+ * 渠道配置 GET/PUT /channels（admin 门禁、settings 桩持久化往返、缺省合并、
+ * zod 校验与未知密钥键剥离、未接线 501）、send 对象形渠道归一化。
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
@@ -14,6 +16,9 @@ import pino from 'pino';
 
 import {
   registerNotificationRoutes,
+  NOTIFY_EMAIL_CHANNEL_KEY,
+  NOTIFY_WEBHOOK_CHANNEL_KEY,
+  type NotificationChannelsConfig,
   type NotificationRoutesDeps,
   type NotificationSendInput,
 } from '../src/api/notifications.js';
@@ -38,6 +43,16 @@ const PUT_ROUTES_BODY = [
   { match: {}, channels: [{ driver: 'webhook', target: 'https://hooks.example.com/x' }] },
 ];
 
+/** PUT /channels 合法 body（渠道凭据与目标；密码只给 secrets 引用名） */
+const PUT_CHANNELS_BODY = {
+  webhook: { url: 'https://hooks.example.com/opptrix', secret: 'shh' },
+  email: {
+    smtp: { host: 'smtp.example.com', port: 465, secure: true, user: 'ops', passSecretRef: 'smtp.pass' },
+    from: 'opptrix@example.com',
+    to: 'oncall@example.com',
+  },
+};
+
 const ALL_ROUTES = [
   { method: 'GET', url: '/api/v1/notifications' },
   { method: 'GET', url: '/api/v1/notifications/routes' },
@@ -46,6 +61,8 @@ const ALL_ROUTES = [
   { method: 'POST', url: '/api/v1/notifications/read-all' },
   { method: 'POST', url: '/api/v1/notifications/send', body: { title: 'hello' } },
   { method: 'PUT', url: '/api/v1/notifications/routes', body: PUT_ROUTES_BODY },
+  { method: 'GET', url: '/api/v1/notifications/channels' },
+  { method: 'PUT', url: '/api/v1/notifications/channels', body: PUT_CHANNELS_BODY },
 ] as const;
 
 const WRITE_ROUTES = ALL_ROUTES.slice(3);
@@ -105,13 +122,32 @@ interface BuildCtx {
   store: StoreStub;
   setRoutesInputs: unknown[];
   sendInputs: NotificationSendInput[];
+  /** settings 桩（notify.channels.* 持久化落点） */
+  settings: SettingsStub;
+  /** PUT /channels 透传给 deps.setChannels 的归一化值 */
+  setChannelsInputs: NotificationChannelsConfig[];
 }
 
-/** 组装被测服务器：stub checker + stub store + 可断言的 routes/send 透传层 */
-function buildServer(opts: { withSend?: boolean } = {}): BuildCtx {
+/** settings 桩（与 SettingsService 的 get/set 契约一致的最小内存实现） */
+class SettingsStub {
+  readonly map = new Map<string, unknown>();
+
+  async get<T>(key: string, fallback?: T): Promise<T | undefined> {
+    return this.map.has(key) ? (this.map.get(key) as T) : fallback;
+  }
+
+  async set(key: string, value: unknown): Promise<void> {
+    this.map.set(key, value);
+  }
+}
+
+/** 组装被测服务器：stub checker + stub store + 可断言的 routes/channels/send 透传层 */
+function buildServer(opts: { withSend?: boolean; withChannels?: boolean } = {}): BuildCtx {
   const store = new StoreStub();
+  const settings = new SettingsStub();
   const setRoutesInputs: unknown[] = [];
   const sendInputs: NotificationSendInput[] = [];
+  const setChannelsInputs: NotificationChannelsConfig[] = [];
   const sendSpy = vi.fn(async (input: NotificationSendInput) => ({ id: 'ntf-new', ...input }));
   const config = loadConfig({ NODE_ENV: 'test', HARNESS_LOG_LEVEL: 'error', HARNESS_DATA_DIR: './data' });
   const { app } = createHttpServer({
@@ -133,12 +169,25 @@ function buildServer(opts: { withSend?: boolean } = {}): BuildCtx {
           setRoutesInputs.push(rules);
         },
         drivers: () => ({ notification: ['ui', 'email'], chat: ['slack'] }),
+        ...(opts.withChannels === false
+          ? {}
+          : {
+              getChannels: async () => ({
+                webhook: (await settings.get(NOTIFY_WEBHOOK_CHANNEL_KEY)) ?? null,
+                email: (await settings.get(NOTIFY_EMAIL_CHANNEL_KEY)) ?? null,
+              }),
+              setChannels: async (next: NotificationChannelsConfig) => {
+                setChannelsInputs.push(next);
+                await settings.set(NOTIFY_WEBHOOK_CHANNEL_KEY, next.webhook);
+                await settings.set(NOTIFY_EMAIL_CHANNEL_KEY, next.email);
+              },
+            }),
         ...(opts.withSend === false ? {} : { send: async (input) => { sendInputs.push(input); return sendSpy(input); } }),
       };
       registerNotificationRoutes(a, deps);
     },
   });
-  return { app, store, setRoutesInputs, sendInputs };
+  return { app, store, setRoutesInputs, sendInputs, settings, setChannelsInputs };
 }
 
 // ---------------------------------------------------------------------------
@@ -368,5 +417,227 @@ describe('notifications api — 路由规则与驱动清单', () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/notifications/drivers', headers: AUTH_ADMIN });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ notification: ['ui', 'email'], chat: ['slack'] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 渠道凭据与目标（GET/PUT /api/v1/notifications/channels；settings 桩持久化）
+// ---------------------------------------------------------------------------
+
+describe('notifications api — GET/PUT /api/v1/notifications/channels（渠道配置）', () => {
+  it('GET 未配置（settings 空）→ 合并缺省的完整形状（webhook/email 全字段，端口 587）', async () => {
+    const { app } = buildServer();
+    const res = await app.inject({ method: 'GET', url: '/api/v1/notifications/channels', headers: AUTH_ADMIN });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      webhook: { url: '', secret: '' },
+      email: {
+        smtp: { host: '', port: 587, secure: false, user: '', passSecretRef: '' },
+        from: '',
+        to: '',
+      },
+    });
+  });
+
+  it('PUT 合法 body → {ok:true}，settings 两键持久化；GET 回读一致（持久化往返）', async () => {
+    const { app, settings, setChannelsInputs } = buildServer();
+    const put = await app.inject({
+      method: 'PUT',
+      url: '/api/v1/notifications/channels',
+      headers: AUTH_ADMIN,
+      payload: PUT_CHANNELS_BODY,
+    });
+    expect(put.statusCode).toBe(200);
+    expect(put.json()).toEqual({ ok: true });
+    // setChannels 收到归一化形状，settings 两键各落一份
+    expect(setChannelsInputs).toHaveLength(1);
+    expect(settings.map.get(NOTIFY_WEBHOOK_CHANNEL_KEY)).toEqual(PUT_CHANNELS_BODY.webhook);
+    expect(settings.map.get(NOTIFY_EMAIL_CHANNEL_KEY)).toEqual(PUT_CHANNELS_BODY.email);
+
+    // GET 回读 = 保存值（passSecretRef 只回引用名，无任何明文密码字段）
+    const get = await app.inject({ method: 'GET', url: '/api/v1/notifications/channels', headers: AUTH_ADMIN });
+    expect(get.statusCode).toBe(200);
+    expect(get.json()).toEqual(PUT_CHANNELS_BODY);
+    expect(get.json().email.smtp.passSecretRef).toBe('smtp.pass');
+    expect(get.json().email.smtp).not.toHaveProperty('pass');
+    expect(get.json().email.smtp).not.toHaveProperty('password');
+  });
+
+  it('PUT 部分 body（只给 webhook）→ email 落缺省形状；GET 合并返回', async () => {
+    const { app, settings } = buildServer();
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/api/v1/notifications/channels',
+      headers: AUTH_ADMIN,
+      payload: { webhook: { url: 'https://hooks.example.com/x' } },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(settings.map.get(NOTIFY_WEBHOOK_CHANNEL_KEY)).toEqual({ url: 'https://hooks.example.com/x', secret: '' });
+    expect(settings.map.get(NOTIFY_EMAIL_CHANNEL_KEY)).toEqual({
+      smtp: { host: '', port: 587, secure: false, user: '', passSecretRef: '' },
+      from: '',
+      to: '',
+    });
+  });
+
+  it('PUT 非法（url 非法 / port 越界 / secure 非布尔 / 非对象 body）→ 400 且不落 setChannels/settings', async () => {
+    for (const [label, body] of [
+      ['url 非法', { webhook: { url: 'not-a-url' } }],
+      ['port 越界', { email: { smtp: { host: 'h', port: 70000 } } }],
+      ['port 非数字', { email: { smtp: { host: 'h', port: 'smtp' } } }],
+      ['secure 非布尔', { email: { smtp: { host: 'h', secure: 'yes' } } }],
+      ['顶层数组', [1, 2]],
+    ] as const) {
+      const { app, setChannelsInputs, settings } = buildServer();
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/api/v1/notifications/channels',
+        headers: AUTH_ADMIN,
+        payload: body as unknown as Record<string, unknown>,
+      });
+      expect(res.statusCode, `${label} 应为 400`).toBe(400);
+      expect(res.json().code).toBe('HARNESS-1009');
+      expect(setChannelsInputs, label).toEqual([]);
+      expect(settings.map.size, label).toBe(0);
+    }
+  });
+
+  it('PUT 未知键剥离：smtp 里的 pass/password 明文不入 settings（白名单字段）', async () => {
+    const { app, settings, setChannelsInputs } = buildServer();
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/api/v1/notifications/channels',
+      headers: AUTH_ADMIN,
+      payload: {
+        webhook: { url: 'https://hooks.example.com/x', secret: 's', apiKey: 'nope' },
+        email: {
+          smtp: { host: 'smtp.example.com', pass: 'plaintext', password: 'plaintext2', passSecretRef: 'smtp.pass' },
+          from: 'a@b.c',
+          to: 'd@e.f',
+          cc: 'sneak@x.y',
+        },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(settings.map.get(NOTIFY_WEBHOOK_CHANNEL_KEY)).toEqual({ url: 'https://hooks.example.com/x', secret: 's' });
+    expect(settings.map.get(NOTIFY_EMAIL_CHANNEL_KEY)).toEqual({
+      smtp: { host: 'smtp.example.com', port: 587, secure: false, user: '', passSecretRef: 'smtp.pass' },
+      from: 'a@b.c',
+      to: 'd@e.f',
+    });
+    const serialized = JSON.stringify([...settings.map.values()]);
+    expect(serialized).not.toContain('plaintext');
+    expect(setChannelsInputs[0]).toBeDefined();
+  });
+
+  it('GET/PUT 门禁：无 token → 401；normal 角色读与写 → 403（渠道配置含凭据，读也要求 admin）', async () => {
+    const { app } = buildServer();
+    const getNoToken = await app.inject({ method: 'GET', url: '/api/v1/notifications/channels' });
+    expect(getNoToken.statusCode).toBe(401);
+    const getNormal = await app.inject({ method: 'GET', url: '/api/v1/notifications/channels', headers: AUTH_NORMAL });
+    expect(getNormal.statusCode).toBe(403);
+    expect(getNormal.json().code).toBe('HARNESS-1007');
+    const putNormal = await app.inject({
+      method: 'PUT',
+      url: '/api/v1/notifications/channels',
+      headers: AUTH_NORMAL,
+      payload: PUT_CHANNELS_BODY,
+    });
+    expect(putNormal.statusCode).toBe(403);
+    // root 放行
+    const getRoot = await app.inject({ method: 'GET', url: '/api/v1/notifications/channels', headers: AUTH_ROOT });
+    expect(getRoot.statusCode).toBe(200);
+  });
+
+  it('未接线（getChannels/setChannels 缺省）→ 501 HARNESS-9004', async () => {
+    const { app } = buildServer({ withChannels: false });
+    const get = await app.inject({ method: 'GET', url: '/api/v1/notifications/channels', headers: AUTH_ADMIN });
+    expect(get.statusCode).toBe(501);
+    expect(get.json().code).toBe('HARNESS-9004');
+    const put = await app.inject({
+      method: 'PUT',
+      url: '/api/v1/notifications/channels',
+      headers: AUTH_ADMIN,
+      payload: PUT_CHANNELS_BODY,
+    });
+    expect(put.statusCode).toBe(501);
+    expect(put.json().code).toBe('HARNESS-9004');
+  });
+
+  it('GET 形状容错：settings 存脏数据（非对象/数组）→ 按未配置合并缺省，不抛', async () => {
+    const { app, settings } = buildServer();
+    settings.map.set(NOTIFY_WEBHOOK_CHANNEL_KEY, ['garbage']);
+    settings.map.set(NOTIFY_EMAIL_CHANNEL_KEY, 'garbage');
+    const res = await app.inject({ method: 'GET', url: '/api/v1/notifications/channels', headers: AUTH_ADMIN });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      webhook: { url: '', secret: '' },
+      email: {
+        smtp: { host: '', port: 587, secure: false, user: '', passSecretRef: '' },
+        from: '',
+        to: '',
+      },
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /send 的对象形渠道（渠道配置 UI「测试发送」：target 携带当前表单值）
+// ---------------------------------------------------------------------------
+
+describe('notifications api — POST /send 对象形渠道归一化', () => {
+  it('对象形 channels → 201，deps.send 收到 channels 驱动名 + 同下标 channelTargets', async () => {
+    const { app, sendInputs } = buildServer();
+    const target = { url: 'https://hooks.example.com/x', secret: 'shh' };
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/notifications/send',
+      headers: AUTH_ADMIN,
+      payload: { title: '渠道测试', level: 'info', channels: [{ driver: 'webhook', target }] },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(sendInputs).toEqual([
+      { title: '渠道测试', body: '', level: 'info', data: null, channels: ['webhook'], channelTargets: [target] },
+    ]);
+  });
+
+  it('混合形（字符串 + 对象）按同下标对齐；纯字符串形不带 channelTargets（既有形状不变）', async () => {
+    const { app, sendInputs } = buildServer();
+    const target = { smtp: { host: 'smtp.example.com' }, from: 'a@b.c', to: 'd@e.f' };
+    await app.inject({
+      method: 'POST',
+      url: '/api/v1/notifications/send',
+      headers: AUTH_ADMIN,
+      payload: { title: '混合', channels: ['ui', { driver: 'email', target }] },
+    });
+    expect(sendInputs[0]).toEqual({
+      title: '混合',
+      body: '',
+      level: 'info',
+      data: null,
+      channels: ['ui', 'email'],
+      channelTargets: [undefined, target],
+    });
+
+    await app.inject({
+      method: 'POST',
+      url: '/api/v1/notifications/send',
+      headers: AUTH_ADMIN,
+      payload: { title: '纯字符串', channels: ['ui'] },
+    });
+    expect(sendInputs[1]).toEqual({ title: '纯字符串', body: '', level: 'info', data: null, channels: ['ui'] });
+  });
+
+  it('对象形渠道缺 driver → 400 HARNESS-1009 且不调 deps.send', async () => {
+    const { app, sendInputs } = buildServer();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/notifications/send',
+      headers: AUTH_ADMIN,
+      payload: { title: 'bad', channels: [{ target: {} }] },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe('HARNESS-1009');
+    expect(sendInputs).toEqual([]);
   });
 });

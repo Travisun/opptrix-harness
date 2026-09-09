@@ -3,7 +3,14 @@
 /**
  * webui — Opptrix Harness OS 内置管理台扩展（builtin:true, mount:'ui'）。
  *
- * 职责：Vue3 SPA 管理台（源码见 ui-src/，构建产物见 ui/）。
+ * 职责：React SPA 管理台（源码见 ui-src/，构建产物见 ui/）。
+ *
+ * ★ 品牌更名决策（Dashboard 包）：displayName 由 "Web Console" 改为 "Dashboard"，
+ *   但 **id 保持 'webui' 不变**——id 是稳定标识：静态资产挂载路径 /ext/webui/ui/**、
+ *   /admin 重定向、GET /api/v1/extensions/webui 等数据关联、内核 DB 里的扩展登记行
+ *   全部以 id 为键；改名等于换了扩展，会破坏既有挂载与数据关联（builtin 白名单
+ *   AGENTS.md 亦按 'webui' 记账）。manifest.json 是纯 JSON 无法写注释，决策记录于此。
+ *   manifest.ui.menu/pages 的 'Console' 标签同属挂载契约面（webui.test 断言），保持不变。
  *
  * 声明面（两条等价通道并存，见 types/harness.d.ts PageDefinition 注释「二选一即可」）：
  * - manifest.json `ui.pages` / `ui.menu`：内核静态资产挂载的数据源——Kernel 装配期

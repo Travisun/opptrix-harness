@@ -9,12 +9,15 @@ import { NotificationsProvider } from '@/features/notifications/NotificationsPro
 import { findNavItem } from '@/lib/nav';
 
 /**
- * AppShell — 控制台壳层（已认证区域的布局骨架）。
+ * AppShell — Dashboard 壳层（已认证区域的布局骨架）。
  *
  * 桌面（≥lg）三栏：左侧固定侧栏（可折叠为图标栏，折叠态持久化）｜中间主内容｜
  * 右侧聊天面板（默认隐藏，顶栏聊天按钮开关，宽 ~380px）。
  * 移动（<lg）：侧栏 → 汉堡 + Sheet 抽屉；聊天面板 → 右侧全屏 Sheet；
  * 顶栏含汉堡 / 页面标题 / 主题切换 / 聊天开关（未读徽标）/ 用户菜单。
+ *
+ * 品牌：管理台更名 Dashboard（index.html <title> 同步）；扩展 id 仍为 'webui'
+ * （稳定标识，挂载/数据关联依赖它，不改）。
  */
 export function AppShell(): React.ReactNode {
   const location = useLocation();
@@ -24,7 +27,7 @@ export function AppShell(): React.ReactNode {
   // 页面标题随路由（hash 路由下 location.pathname 即路由路径）
   useEffect(() => {
     const item = findNavItem(location.pathname);
-    document.title = item !== undefined ? `Opptrix Console — ${item.title}` : 'Opptrix Console';
+    document.title = item !== undefined ? `Dashboard — ${item.title}` : 'Dashboard · Opptrix Harness';
   }, [location.pathname]);
 
   const toggleCollapsed = (): void => {

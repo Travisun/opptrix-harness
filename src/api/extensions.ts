@@ -12,6 +12,9 @@
  *       detail 带 permissions 与 confirmHint）后，确认信任方携带 confirmTrust=true 重试授信
  * - POST /api/v1/extensions/:id/uninstall（?purge=1 连持久化数据一并清除）→ { ok: true }
  * - GET  /api/v1/extensions/:id       单个扩展详情（在 manager.list() 中查找；无 → 404 HARNESS-3004）
+ * - POST /api/v1/extensions/install   安装扩展 zip 包（multipart field 'file' ≤32MB，?overwrite=1 覆盖）
+ *                                     → 201 { id, manifest 摘要, enabled:false }；
+ *                                     仅当 deps.install 接线时注册（见文件尾追加段）
  *
  * 约定：
  * - 鉴权：token 经 extractToken（Authorization: Bearer 优先，其次 ?token=）交
@@ -21,11 +24,22 @@
  * - 写操作挂路由级 errorHandler：HarnessError 按自身状态码下发（即使宿主未装
  *   全局 HarnessError 处理器也保持透传语义），其余异常交回全局兜底。
  */
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+import multipart from '@fastify/multipart';
 import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import { extractToken } from '../kernel/auth/authProxy.js';
 import { err, HarnessError } from '../kernel/errors/index.js';
+import type {
+  ExtInstallConfig,
+  ExtInstallOptions,
+  ExtInstallResult,
+} from '../kernel/extensions/installer.js';
 
 // ---------------------------------------------------------------------------
 // 依赖契约
@@ -73,6 +87,14 @@ export interface ExtensionsApiDeps {
   registry: {
     list(): unknown[];
   };
+  /**
+   * 本地扩展包安装依赖（可选；未提供时**不注册** POST /api/v1/extensions/install，
+   * 对既有行为零影响）。集成接线（Kernel）：installZip=installExtensionZip（原始形态）、
+   * dataDir=数据卷根（安装落点 <dataDir>/extensions/<id>，与 repoRoot/extensions 不同路径）、
+   * extensionsRepoDir=repoRoot/extensions（受信目录保护判定输入）、
+   * onInstalled=id => manager.rescan()（安装后免重启发现）。
+   */
+  install?: ExtensionsInstallDeps;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,4 +263,179 @@ export function registerExtensionRoutes(app: FastifyInstance, deps: ExtensionsAp
     if (found === undefined) throw extensionNotFound(id);
     return found;
   });
+
+  // -----------------------------------------------------------------------
+  // 追加段：POST /api/v1/extensions/install — 本地扩展包安装（deps.install 接线时才注册）
+  // -----------------------------------------------------------------------
+  const installDeps = deps.install;
+  if (installDeps !== undefined) {
+    const maxZipBytes = installDeps.maxZipBytes ?? MAX_EXTENSION_ZIP_BYTES;
+    // 兄弟封装上下文手法（同 core-services 对 files/plugins 路由的接线）：@fastify/multipart
+    // 为 fp 包装、无封装边界——同一 fastify 上下文二次注册会撞装饰器（FST_ERR_DEC_ALREADY_PRESENT），
+    // 子上下文又会克隆父上下文已注册的 content-type parser（先注册的一侧污染后注册的一侧）。
+    // 故把 multipart 与安装路由一起挂进本模块自建的**子上下文**：multipart 装饰器只在该
+    // 子上下文可见，路由照常全局暴露，与 files / plugins 的 multipart 互不可见、互不冲突。
+    void app.register((installCtx) => {
+      void installCtx.register(multipart);
+      installCtx.post('/api/v1/extensions/install', writeOptions, async (request, reply) => {
+        await requireAdmin(request);
+        const query = (request.query ?? {}) as Record<string, unknown>;
+        const parsedQuery = installQuerySchema.safeParse(query);
+        if (!parsedQuery.success) {
+          throw err('VALIDATION_FAILED', {
+            message: 'query.overwrite only accepts "1" or "true"',
+            detail: parsedQuery.error.issues,
+          });
+        }
+
+        let part: InstallFilePart | undefined;
+        try {
+          part = await request.file({
+            throwFileSizeLimit: false,
+            limits: { fileSize: maxZipBytes + 1, files: 1, fields: 8, parts: 16 },
+          });
+        } catch (e) {
+          throw mapZipMultipartError(e);
+        }
+        if (part === undefined) {
+          throw err('BAD_REQUEST', { message: 'multipart body with a "file" field (extension zip) is required' });
+        }
+        if (!part.filename.toLowerCase().endsWith('.zip')) {
+          throw err('VALIDATION_FAILED', {
+            message: 'extension package must be a .zip file (field "file")',
+            detail: { filename: part.filename },
+          });
+        }
+
+        const data = await consumeZipPart(part, maxZipBytes);
+        // 落临时文件后交内核安装器（installer 以路径为入参），finally 清理
+        const stagingDir = await mkdtemp(path.join(tmpdir(), 'opptrix-ext-upload-'));
+        const zipPath = path.join(stagingDir, `ext-${randomUUID()}.zip`);
+        try {
+          await writeFile(zipPath, data);
+          const result = await installDeps.installZip(
+            {
+              dataDir: installDeps.dataDir,
+              extensionsRepoDir: installDeps.extensionsRepoDir,
+              onInstalled: installDeps.onInstalled,
+            },
+            zipPath,
+            { overwrite: parsedQuery.data.overwrite !== undefined },
+          );
+          reply.code(201);
+          const body: ExtensionInstallResponse = {
+            ok: true,
+            id: result.id,
+            dir: result.dir,
+            manifest: {
+              id: result.id,
+              version: result.version,
+              api: result.api,
+              ...(result.displayName !== undefined ? { displayName: result.displayName } : {}),
+              permissions: result.permissions,
+            },
+            // 安装即落位、不自动启用：新扩展 enabled=false，启用走既有信任确认流
+            enabled: false,
+            overwrite: parsedQuery.data.overwrite !== undefined,
+          };
+          return body;
+        } finally {
+          await rm(stagingDir, { recursive: true, force: true });
+        }
+      });
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 追加段：本地扩展包安装（POST /api/v1/extensions/install）
+// ---------------------------------------------------------------------------
+
+/** 扩展 zip 上传大小上限（32MB；与 UI 客户端预检 MAX_EXTENSION_ZIP_BYTES 同值） */
+export const MAX_EXTENSION_ZIP_BYTES = 32 * 1024 * 1024;
+
+/** POST /api/v1/extensions/install 查询参数（?overwrite=1|true 覆盖安装） */
+const installQuerySchema = z.object({
+  overwrite: z.enum(['1', 'true']).optional(),
+});
+
+/** request.file() 的返回类型（@fastify/multipart 对 FastifyRequest 的增强） */
+type InstallFilePart = NonNullable<Awaited<ReturnType<FastifyRequest['file']>>>;
+
+/** deps.install 的形状（内核 installExtensionZip + 接线参数；见 ExtensionsApiDeps.install 注释） */
+export interface ExtensionsInstallDeps {
+  /** 内核安装器（原始形态 installExtensionZip(cfg, zipPath, opts)；REST 层绑定 cfg 后调用） */
+  installZip: (
+    cfg: ExtInstallConfig,
+    zipPath: string,
+    opts?: ExtInstallOptions,
+  ) => Promise<ExtInstallResult>;
+  /** 数据根目录（安装落点 <dataDir>/extensions/<id>；与受信仓库目录不同路径） */
+  dataDir: string;
+  /** 受信第一方扩展目录（repoRoot/extensions；installer 受信目录保护判定输入） */
+  extensionsRepoDir?: string;
+  /** 安装成功回调（集成方接 manager.rescan() 免重启发现；失败路径不触发） */
+  onInstalled?: (id: string) => void | Promise<void>;
+  /** 上传大小上限（字节）；缺省 32MB */
+  maxZipBytes?: number;
+}
+
+/** POST /api/v1/extensions/install 的 201 响应（manifest 摘要供 UI 二次确认 Dialog 展示） */
+export interface ExtensionInstallResponse {
+  ok: true;
+  id: string;
+  /** 安装落位目录（<dataDir>/extensions/<id>） */
+  dir: string;
+  manifest: {
+    id: string;
+    version: string;
+    /** 扩展 API 版本（manifest.api） */
+    api: number;
+    displayName?: string;
+    permissions: string[];
+  };
+  /** 恒为 false：安装即落位、不自动启用，启用走既有信任确认流 */
+  enabled: false;
+  overwrite: boolean;
+}
+
+/** 逐块消费上传流并计量：累计超过 maxBytes 即销毁流并抛 PAYLOAD_TOO_LARGE（413） */
+async function consumeZipPart(part: InstallFilePart, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of part.file) {
+    const buf = chunk as Buffer;
+    size += buf.byteLength;
+    if (size > maxBytes) {
+      part.file.destroy();
+      throw err('PAYLOAD_TOO_LARGE', {
+        message: `uploaded extension zip exceeds the ${maxBytes} byte limit`,
+        detail: { limit: maxBytes },
+      });
+    }
+    chunks.push(buf);
+  }
+  // busboy 在 fileSize 上限处截断（fileSize 设为 maxBytes+1 兜底），双保险复核
+  if ((part.file as { truncated?: boolean }).truncated === true || size > maxBytes) {
+    throw err('PAYLOAD_TOO_LARGE', {
+      message: `uploaded extension zip exceeds the ${maxBytes} byte limit`,
+      detail: { limit: maxBytes },
+    });
+  }
+  return Buffer.concat(chunks);
+}
+
+/** multipart 解析类异常 → 400 BAD_REQUEST（其余原样上抛交全局兜底） */
+function mapZipMultipartError(e: unknown): Error {
+  if (e instanceof HarnessError) return e;
+  const code = (e as { code?: string }).code;
+  if (typeof code === 'string' && code.startsWith('FST_')) {
+    return err('BAD_REQUEST', {
+      message: 'request must be multipart/form-data with a single "file" field containing an extension zip',
+      detail: [{ code, message: e instanceof Error ? e.message : String(e) }],
+      cause: e,
+    });
+  }
+  if (e instanceof Error) return e;
+  return new Error(String(e));
 }

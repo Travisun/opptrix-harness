@@ -22,7 +22,7 @@ import UpdatePage from '@/pages/Update';
 import UsersPage from '@/pages/Users';
 
 /**
- * router — 控制台路由表（HashRouter）。
+ * router — Dashboard 路由表（HashRouter）。
  *
  * hash 模式是硬约束：内核静态挂载无目录索引（index:false）也无 rewrite 能力，
  * history 深链刷新会 404。
@@ -35,7 +35,7 @@ import UsersPage from '@/pages/Users';
  * 启动探测（OnboardingGate）：挂载后（已登录除外）调 GET /api/v1/auth/onboarding/status，
  * needsOnboarding=true 且本地无 token → 全部路由强制重定向 /onboarding（首次初始化向导），
  * 向导完成后经 OnboardingFinishContext 解除强制，进入仪表盘。探测期间渲染品牌闪屏，
- * 探测失败按「无需引导」处理（保持既有行为，不因探测故障锁死控制台）。
+ * 探测失败按「无需引导」处理（保持既有行为，不因探测故障锁死 Dashboard）。
  */
 
 /** 已认证守卫：无 token 一律去登录页（api.ts 的 401 处理与之呼应） */
@@ -78,7 +78,7 @@ function OnboardingGate({ children }: { children: ReactNode }): ReactNode {
         if (alive) setNeedsOnboarding(s.needsOnboarding === true);
       })
       .catch(() => {
-        if (alive) setNeedsOnboarding(false); // 探测失败不锁死控制台
+        if (alive) setNeedsOnboarding(false); // 探测失败不锁死 Dashboard
       })
       .finally(() => {
         if (alive) setPhase('ready');

@@ -13,7 +13,8 @@
  *
  * 装配图（谁依赖谁）：
  * - registry（ChannelRegistry 单例）← 通知驱动 ×4（inbox/webhook/console/email）
- *   + 聊天桥 ×2（webhook/email）；secrets.get 作为统一密钥解析源
+ *   + 聊天桥 ×2（webhook/email）+ 平台连接器 ×5（telegram/slack/feishu/dingtalk/wecom，
+ *   兼出站驱动与 /hooks/connector/* 入站回调）；secrets.get 作为统一密钥解析源
  * - NotificationManager ← store(db) / registry / hooks / publish(sseHub) / logger / secrets
  * - ChatService ← store(db) / hooks / publish(sseHub) / emit(eventBus) / logger /
  *   bridgeDispatch → ChatBridgeDispatcher ← registry / meta.bridges / deliveries 落库
@@ -50,8 +51,10 @@ import type { ExtensionManager } from '../extensions/manager.js';
 import type { AuthIdentity, AuthVerifyInput } from '../auth/types.js';
 import { ChannelRegistry, type ChannelLevel } from '../channels/index.js';
 import { type ChannelBridgeConfig, createEmailBridge, createWebhookBridge, ChatBridgeDispatcher } from '../chat/bridges.js';
+import { createPlatformConnectors } from '../chat/connectors/index.js';
 import { ChatService } from '../chat/service.js';
 import { ChatStore } from '../chat/store.js';
+import { createLlmJobRunner } from '../cron/llm-job.js';
 import type { HarnessConfig } from '../config/index.js';
 import { CONTAINER_KEYS, type Kernel } from '../Kernel.js';
 import { FACADE_CONTAINER_KEYS } from '../Facades.js';
@@ -59,6 +62,7 @@ import { err } from '../errors/index.js';
 import { FileService, createLocalDriver } from '../files/index.js';
 import type { EventBus } from '../events/bus.js';
 import type { HookManager } from '../hooks/manager.js';
+import { EVENT_NS } from '../hooks/points.js';
 import { LlmGateway } from '../llm/gateway.js';
 import type { LlmChatInput, LlmProviderConfig, LlmStreamEvent } from '../llm/types.js';
 import { createMcpBridge, McpConfigStore, McpRegistry, MCP_CLIENT_PERMISSION } from '../mcp/index.js';
@@ -177,6 +181,14 @@ export function createCoreServices(kernel: Kernel): CoreServices {
   const resolveBridgeSecret = async (ref: string): Promise<string | undefined> => (await secrets.get(ref)) ?? undefined;
   registry.registerChatBridgeDriver(createWebhookBridge({ resolveSecret: resolveBridgeSecret }));
   registry.registerChatBridgeDriver(createEmailBridge({ resolveSecret: resolveBridgeSecret }));
+  // 平台连接器（telegram / slack / feishu / dingtalk / wecom）：主流 IM 接入框架——
+  // 入站统一回调 /hooks/connector/:platform/:token + 出站平台 API 投递（与上面
+  // webhook/email 纯出站桥并存）。出站投递目标 target 形状见各驱动 zod
+  // （文档站 docs/chat-platforms.mdx 平台矩阵）；iMessage 无运行时驱动（文档「探索结论」）。
+  const platformConnectors = createPlatformConnectors();
+  for (const driver of platformConnectors.bridgeDrivers()) {
+    registry.registerChatBridgeDriver(driver);
+  }
   kernel.container.instance(CONTAINER_KEYS.channels, registry);
 
   // -------------------------------------------------------------------------
@@ -193,6 +205,24 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     // 默认渠道路由规则（settings 'notify.routes'，与 REST routes API 同一落点）：
     // send 未显式传入 channels 时按 level 匹配追加投递计划
     getRoutes: () => settings.get(NOTIFY_ROUTES_KEY, [] as unknown),
+    // 投递重试覆盖（settings 'notify.retry'，缺省走驱动缺省表）
+    getRetry: () => settings.get('notify.retry', null as unknown),
+    // 投递记录落库（deliveries 表，migration 014）：kind='notification'
+    recordDelivery: (entry) => {
+      void db(DELIVERIES_TABLE)
+        .insert({
+          kind: 'notification',
+          target: String(entry.target),
+          channel: entry.channel,
+          ok: entry.ok ? 1 : 0,
+          duration_ms: entry.durationMs ?? null,
+          error: entry.error ?? null,
+          created_at: Date.now(),
+        })
+        .catch((e: unknown) => {
+          logger.error({ err: e }, '[core-services] notification delivery record insert failed');
+        });
+    },
   });
   kernel.container.instance(CONTAINER_KEYS.notify, notifyManager);
 
@@ -328,6 +358,70 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     const inner = (await gateway.chat({ ...input, stream: true })) as AsyncGenerator<LlmStreamEvent>;
     yield* inner;
   }
+
+  // -------------------------------------------------------------------------
+  // cron × llm — LLM 提示词定时任务（payload.kind==='llm'）派发。
+  // 内核 #onCronFire 触发管线广播 `kernel.cron.fired`（EventBus 顺序 await 监听器、
+  // 单点异常隔离），本监听对 llm 负载执行提示词并投递结果通知（runNow / 定时触发
+  // 均在事件投递内同步完成，运行历史落库晚于本执行）。kind 缺省的任务维持现状
+  // （v1 普通任务=仅事件广播），扩展任务照旧由扩展子系统按名派发。执行语义与
+  // 模型回退（指定模型失败 → 第一可用 provider 缺省模型重试一次）见 cron/llm-job.ts。
+  // -------------------------------------------------------------------------
+  const llmJobRunner = createLlmJobRunner({
+    gateway,
+    getProviders: async () => {
+      const providers = (await settings.get(LLM_PROVIDERS_KEY, [] as LlmProviderConfig[])) as LlmProviderConfig[];
+      return providers.map((provider) => ({
+        name: provider.name,
+        models: Array.isArray(provider.models) ? provider.models : [],
+      }));
+    },
+    notify: notifyManager,
+    logger,
+  });
+
+  /** cron 负载是否为 LLM 提示词自动化形状（对象且 kind === 'llm'） */
+  const isLlmJobPayload = (payload: unknown): payload is Record<string, unknown> =>
+    typeof payload === 'object' &&
+    payload !== null &&
+    !Array.isArray(payload) &&
+    (payload as Record<string, unknown>)['kind'] === 'llm';
+
+  eventBus.on(`${EVENT_NS.kernel}.cron.fired`, async (raw) => {
+    const fired = (raw ?? {}) as { jobId?: unknown; name?: unknown; payload?: unknown };
+    if (typeof fired.name !== 'string' || fired.name === '' || !isLlmJobPayload(fired.payload)) return;
+    const jobPayload = fired.payload;
+    try {
+      const result = await llmJobRunner.run(
+        {
+          prompt: typeof jobPayload['prompt'] === 'string' ? jobPayload['prompt'] : '',
+          ...(typeof jobPayload['model'] === 'string' && jobPayload['model'] !== ''
+            ? { model: jobPayload['model'] }
+            : {}),
+          ...(typeof jobPayload['notify'] === 'boolean' ? { notify: jobPayload['notify'] } : {}),
+        },
+        { jobName: fired.name },
+      );
+      logger.info(
+        { jobId: fired.jobId, jobName: fired.name, ok: result.ok },
+        'core-services: llm prompt cron job finished',
+      );
+    } catch (cause) {
+      // 兜底（runner.run 约定不抛）：意外异常 → error 通知，绝不外溢到事件总线之外
+      logger.error({ err: cause, jobId: fired.jobId, jobName: fired.name }, 'core-services: llm prompt cron job crashed');
+      if (jobPayload['notify'] !== false) {
+        try {
+          await notifyManager.send({
+            title: `自动化「${fired.name}」完成`,
+            body: `执行失败：${cause instanceof Error ? cause.message : String(cause)}`,
+            level: 'error',
+          });
+        } catch (notifyErr) {
+          logger.warn({ err: notifyErr, jobId: fired.jobId }, 'core-services: llm job crash notification failed');
+        }
+      }
+    }
+  });
 
   // -------------------------------------------------------------------------
   // skills — 技能注册表（builtin=repoRoot/skills + data=<dataDir>/skills；均可选，
@@ -589,6 +683,11 @@ export function createCoreServices(kernel: Kernel): CoreServices {
           notification: registry.listNotificationDrivers(),
           chat: registry.listChatBridgeDrivers(),
         }),
+        getChannels: async () => ({
+          webhook: await settings.get('notify.channels.webhook', {} as unknown),
+          email: await settings.get('notify.channels.email', {} as unknown),
+        }),
+        setChannels: (next) => settings.set('notify.channels.webhook', next),
         send: (input) =>
           notifyManager.send({
             title: input.title,
@@ -596,11 +695,14 @@ export function createCoreServices(kernel: Kernel): CoreServices {
             // REST 层 level 为 open string，通知中心内部 zod 复核（非法值 → 400 VALIDATION_FAILED）
             level: input.level as ChannelLevel,
             data: input.data,
-            // REST 契约只传驱动名；target 形状由各驱动自行校验（inbox 等无目标驱动天然兼容）
-            channels: input.channels.map((driver) => ({ driver, target: {} })),
+            // REST 契约：字符串形只传驱动名；对象形（渠道配置 UI 测试发送）随行 target
+            channels: input.channels.map((driver, i) => ({
+              driver,
+              target: input.channelTargets?.[i] ?? {},
+            })),
           }),
       });
-      registerChatRoutes(app, { checker, service: chatService });
+      registerChatRoutes(app, { checker, service: chatService, connectors: platformConnectors });
       registerTaskRoutes(app, { checker, manager: taskManager });
       // LLM 网关 REST（/api/v1/llm/*）：providers 管理的持久化即 settings 读写；
       // secrets 注入使 PUT 支持 apiKey 明文 → 自动转存（键 'llm.<name>'）

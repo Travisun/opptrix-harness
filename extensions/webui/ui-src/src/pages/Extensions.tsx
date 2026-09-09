@@ -1,13 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BlocksIcon,
+  PackagePlusIcon,
   PackageXIcon,
-  PuzzleIcon,
   RefreshCwIcon,
-  RotateCwIcon,
   SearchIcon,
   ShieldCheckIcon,
   TriangleAlertIcon,
+  UploadCloudIcon,
 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
@@ -36,9 +36,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { toast } from '@/components/ui/toast';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { ExtensionCard } from '@/pages/Extensions/ExtensionCard';
+import { InstallConfirmDialog } from '@/pages/Extensions/InstallConfirmDialog';
+import { MAX_EXTENSION_ZIP_BYTES, isDuplicateInstallError } from '@/pages/Extensions/shared';
+import type { ExtensionInstallResponse } from '@/pages/Extensions/shared';
 import {
   EmptyState,
-  CodeBlock,
+  formatBytes,
 } from '@/pages/_shared';
 import type {
   ExtRouteTableEntry,
@@ -51,7 +55,13 @@ import { errText, isApiError } from '@/pages/_shared';
 /**
  * Extensions — 扩展管理。
  *
- * - GET    /api/v1/extensions                扩展卡片列表（启停 Switch / host / 信任 / lastError 折叠）；
+ * - GET    /api/v1/extensions                扩展卡片列表（分类 Tabs：全部 / 内置扩展 /
+ *                                            本地扩展；启停 Switch / host / 信任 / lastError 折叠；
+ *                                            <md 单列卡片流、元数据换行断行，≥md 双列）；
+ * - POST   /api/v1/extensions/install        安装扩展包（工具条按钮 / 页面级拖拽 .zip ≤32MB
+ *                                            客户端预检）→ 二次确认 Dialog（manifest 摘要 + 信任提示）
+ *                                            → 确认后自动 rescan + 刷新；新扩展 enabled=false，
+ *                                            启用走既有信任确认流；
  * - POST   /api/v1/extensions/:id/enable     启用（403 HARNESS-3012 → 信任确认 Dialog，确认后带
  *                                            {confirmTrust:true} 重试授信）；
  * - POST   /api/v1/extensions/:id/disable    停用；
@@ -92,6 +102,18 @@ export default function ExtensionsPage(): React.ReactNode {
   /** 卸载确认 Dialog 目标 */
   const [uninstallTarget, setUninstallTarget] = useState<ExtSummary | null>(null);
   const [purge, setPurge] = useState(false);
+
+  // ---- 扩展包安装（工具条按钮 / 页面级拖拽 → POST install → 二次确认 → rescan） ----
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  /** 拖拽悬停高亮 */
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
+  /** POST install 忙态 */
+  const [installing, setInstalling] = useState(false);
+  /** 二次确认 Dialog 的数据源（安装返回的 manifest 摘要） */
+  const [installResult, setInstallResult] = useState<ExtensionInstallResponse | null>(null);
+  /** 确认后 rescan + 刷新忙态 */
+  const [confirming, setConfirming] = useState(false);
 
   const load = useCallback(async (): Promise<void> => {
     setError(null);
@@ -201,20 +223,148 @@ export default function ExtensionsPage(): React.ReactNode {
     if (ok) await load();
   }, [trustTarget, runAction, load]);
 
+  // ---------------------------------------------------------------- 安装扩展包
+
+  /** 上传并安装 zip（≤32MB 客户端预检；成功 → 打开二次确认 Dialog） */
+  const installZip = useCallback(async (file: File): Promise<void> => {
+    setInstalling(true);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await api.post<ExtensionInstallResponse>('/api/v1/extensions/install', form, { silent: true });
+      setInstallResult(res);
+    } catch (e) {
+      if (isDuplicateInstallError(e)) {
+        // 内核 400 'extension id already installed, use overwrite' 的引导文案
+        toast.error('安装失败', '该扩展 id 已安装，可开启覆盖重装');
+      } else {
+        toast.error('安装失败', errText(e));
+      }
+    } finally {
+      setInstalling(false);
+    }
+  }, []);
+
+  /** 选/拖到的 zip 预检：.zip 扩展名 + 32MB 上限（与内核一致） */
+  const acceptFile = useCallback(
+    (candidate: File | undefined): void => {
+      if (candidate === undefined) return;
+      if (!candidate.name.toLowerCase().endsWith('.zip')) {
+        toast.error('无法安装', '仅支持 .zip 扩展包（包内需含 manifest.json）');
+        return;
+      }
+      if (candidate.size > MAX_EXTENSION_ZIP_BYTES) {
+        toast.error('无法安装', `超过 32MB 上限（当前 ${formatBytes(candidate.size)}，内核将拒绝 413）`);
+        return;
+      }
+      void installZip(candidate);
+    },
+    [installZip],
+  );
+
+  /** 二次确认：自动 rescan → 刷新列表（新扩展 enabled=false，启用走既有信任确认流） */
+  const confirmInstall = useCallback(async (): Promise<void> => {
+    if (installResult === null) return;
+    setConfirming(true);
+    try {
+      await api.post('/api/v1/extensions/rescan');
+      await load();
+      toast.success('已扫描并刷新列表', `「${installResult.manifest.displayName ?? installResult.id}」默认停用，启用时需信任确认`);
+      setInstallResult(null);
+    } catch (e) {
+      toast.error('扫描失败', errText(e));
+    } finally {
+      setConfirming(false);
+    }
+  }, [installResult, load]);
+
+  /** 页面级拖拽（depth 计数避免子元素 dragleave 闪烁） */
+  const onDragEnter = useCallback((e: React.DragEvent<HTMLDivElement>): void => {
+    e.preventDefault();
+    dragDepth.current += 1;
+    setDragging(true);
+  }, []);
+  const onDragOver = useCallback((e: React.DragEvent<HTMLDivElement>): void => {
+    e.preventDefault();
+    setDragging(true);
+  }, []);
+  const onDragLeave = useCallback((e: React.DragEvent<HTMLDivElement>): void => {
+    e.preventDefault();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragging(false);
+  }, []);
+  const onDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>): void => {
+      e.preventDefault();
+      dragDepth.current = 0;
+      setDragging(false);
+      acceptFile(e.dataTransfer.files?.[0]);
+    },
+    [acceptFile],
+  );
+
+  // ---------------------------------------------------------------- 列表与分类
+
   const sorted = useMemo(() => {
     const list = extensions ?? [];
     return [...list].sort((a, b) => (a.host === b.host ? a.id.localeCompare(b.id) : a.host === 'builtin' ? -1 : 1));
   }, [extensions]);
+  const builtinExts = useMemo(() => sorted.filter((ext) => ext.host === 'builtin'), [sorted]);
+  const communityExts = useMemo(() => sorted.filter((ext) => ext.host === 'community'), [sorted]);
+
+  const renderCardGrid = (items: ExtSummary[]): React.ReactNode =>
+    items.length === 0 ? (
+      <EmptyState
+        icon={PackageXIcon}
+        title="该分类暂无扩展"
+        description="内置扩展随镜像交付；本地扩展经「安装扩展包」上传 zip 或放入数据卷扩展目录后重扫发现。"
+      />
+    ) : (
+      /* <md 单列卡片流；≥md 保持双列网格 */
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        {items.map((ext) => (
+          <ExtensionCard
+            key={ext.id}
+            ext={ext}
+            busyAction={busy[ext.id]}
+            onToggle={(enabled) => void handleToggle(ext, enabled)}
+            onReload={() => void runAction(ext, 'reload').then((ok) => ok && void load())}
+            onUninstall={() => setUninstallTarget(ext)}
+          />
+        ))}
+      </div>
+    );
 
   return (
-    <div className="flex flex-col gap-6">
+    <div
+      className="flex flex-col gap-6"
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      {/* 拖拽悬停高亮层（pointer-events-none：drop 事件仍落在页面根节点） */}
+      {dragging && (
+        <div className="bg-background/80 pointer-events-none fixed inset-0 z-50 flex items-center justify-center p-6">
+          <div className="flex w-full max-w-md flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-primary bg-background/95 p-10 text-center">
+            <UploadCloudIcon className="text-primary size-8" aria-hidden />
+            <p className="text-sm font-medium">松开以安装扩展包</p>
+            <p className="text-muted-foreground text-xs">.zip ≤ 32MB，包内需含 manifest.json</p>
+          </div>
+        </div>
+      )}
+
       {/* 页头 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
           <h2 className="text-lg font-semibold tracking-tight">系统扩展</h2>
           <p className="text-muted-foreground text-sm">系统扩展的启停、重载、卸载与贡献点查看。</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" onClick={() => fileInputRef.current?.click()} disabled={installing}>
+            <PackagePlusIcon className={cn(installing && 'animate-pulse')} aria-hidden />
+            {installing ? '安装中…' : '安装扩展包'}
+          </Button>
           <Button variant="outline" size="sm" onClick={() => void handleRescan()} disabled={rescanning}>
             <SearchIcon className={cn(rescanning && 'animate-pulse')} aria-hidden />
             {rescanning ? '扫描中…' : '重新扫描'}
@@ -225,6 +375,19 @@ export default function ExtensionsPage(): React.ReactNode {
           </Button>
         </div>
       </div>
+
+      {/* 隐藏的 zip 选择器（工具条「安装扩展包」按钮触发） */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".zip"
+        className="hidden"
+        disabled={installing}
+        onChange={(e) => {
+          acceptFile(e.target.files?.[0]);
+          e.target.value = ''; // 允许重复选择同一文件
+        }}
+      />
 
       {/* 加载骨架 */}
       {loading && (
@@ -250,8 +413,12 @@ export default function ExtensionsPage(): React.ReactNode {
         <EmptyState
           icon={PackageXIcon}
           title="暂无扩展"
-          description="扩展目录（HARNESS_EXTENSIONS_DIR）下还没有已注册的扩展，点击「重新扫描」尝试发现。"
+          description="扩展目录（HARNESS_EXTENSIONS_DIR）下还没有已注册的扩展，点击「重新扫描」尝试发现，或用「安装扩展包」上传 zip。"
         >
+          <Button size="sm" variant="outline" onClick={() => fileInputRef.current?.click()}>
+            <PackagePlusIcon aria-hidden />
+            安装扩展包
+          </Button>
           <Button size="sm" variant="outline" onClick={() => void handleRescan()}>
             <SearchIcon aria-hidden />
             重新扫描
@@ -259,20 +426,18 @@ export default function ExtensionsPage(): React.ReactNode {
         </EmptyState>
       )}
 
-      {/* 扩展卡片列表（天然响应式：<md 单列，≥md 双列） */}
+      {/* 扩展卡片列表 — 分类 Tabs（全部 / 内置扩展 / 本地扩展；TabsList 窄屏可换行） */}
       {!loading && error === null && sorted.length > 0 && (
-        <div className="grid gap-3 md:grid-cols-2">
-          {sorted.map((ext) => (
-            <ExtensionCard
-              key={ext.id}
-              ext={ext}
-              busyAction={busy[ext.id]}
-              onToggle={(enabled) => void handleToggle(ext, enabled)}
-              onReload={() => void runAction(ext, 'reload').then((ok) => ok && void load())}
-              onUninstall={() => setUninstallTarget(ext)}
-            />
-          ))}
-        </div>
+        <Tabs defaultValue="all" className="gap-3">
+          <TabsList className="h-auto flex-wrap justify-start">
+            <TabsTrigger value="all">全部（{sorted.length}）</TabsTrigger>
+            <TabsTrigger value="builtin">内置扩展（{builtinExts.length}）</TabsTrigger>
+            <TabsTrigger value="community">本地扩展（{communityExts.length}）</TabsTrigger>
+          </TabsList>
+          <TabsContent value="all">{renderCardGrid(sorted)}</TabsContent>
+          <TabsContent value="builtin">{renderCardGrid(builtinExts)}</TabsContent>
+          <TabsContent value="community">{renderCardGrid(communityExts)}</TabsContent>
+        </Tabs>
       )}
 
       {/* 贡献点 Tabs */}
@@ -296,6 +461,16 @@ export default function ExtensionsPage(): React.ReactNode {
         </Tabs>
       )}
 
+      {/* 安装二次确认 Dialog（manifest 摘要 + 信任提示 → 确认后 rescan + 刷新） */}
+      <InstallConfirmDialog
+        result={installResult}
+        confirming={confirming}
+        onOpenChange={(open) => {
+          if (!open) setInstallResult(null);
+        }}
+        onConfirm={() => void confirmInstall()}
+      />
+
       {/* 信任确认 Dialog */}
       <Dialog open={trustTarget !== null} onOpenChange={(open) => !open && setTrustTarget(null)}>
         <DialogContent>
@@ -305,7 +480,7 @@ export default function ExtensionsPage(): React.ReactNode {
               信任此扩展并启用？
             </DialogTitle>
             <DialogDescription>
-              「{trustTarget?.ext.manifest?.displayName ?? trustTarget?.ext.id}」来自不受信目录（社区池），首次启用需要人工授信。
+              「{trustTarget?.ext.manifest?.displayName ?? trustTarget?.ext.id}」来自不受信目录（本地扩展池），首次启用需要人工授信。
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3 text-sm">
@@ -367,115 +542,7 @@ export default function ExtensionsPage(): React.ReactNode {
   );
 }
 
-/** 单个扩展卡片 */
-function ExtensionCard({
-  ext,
-  busyAction,
-  onToggle,
-  onReload,
-  onUninstall,
-}: {
-  ext: ExtSummary;
-  busyAction: ExtAction | undefined;
-  onToggle: (enabled: boolean) => void;
-  onReload: () => void;
-  onUninstall: () => void;
-}): React.ReactNode {
-  const [showError, setShowError] = useState(false);
-  const name = ext.manifest?.displayName ?? ext.id;
-  const isBuiltin = ext.host === 'builtin';
-
-  return (
-    <Card className="gap-3 py-4">
-      <CardContent className="flex flex-col gap-3 px-4">
-        {/* 标题行：名称 + host/信任徽标 + 启停 Switch */}
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 flex-col gap-1.5">
-            <div className="flex flex-wrap items-center gap-2">
-              <PuzzleIcon className="text-muted-foreground size-4 shrink-0" aria-hidden />
-              <span className="truncate text-sm font-semibold" title={name}>
-                {name}
-              </span>
-              <Badge variant="outline" className="font-mono text-[11px]">
-                v{ext.version || '?'}
-              </Badge>
-              <Badge variant={isBuiltin ? 'success' : 'secondary'}>{isBuiltin ? '内置' : '社区'}</Badge>
-              {/* 信任徽标：内置池目录受信；社区池需首次启用时人工授信（trusted_at 由内核落库，清单接口未回显） */}
-              <Badge variant={isBuiltin ? 'outline' : 'warning'} className="gap-1">
-                <ShieldCheckIcon className="size-3" aria-hidden />
-                {isBuiltin ? '受信' : '待授信'}
-              </Badge>
-            </div>
-            <p className="text-muted-foreground truncate font-mono text-xs" title={ext.id}>
-              {ext.id}
-              {ext.dir !== undefined && ` · ${ext.dir}`}
-            </p>
-          </div>
-          <Switch
-            checked={ext.enabled}
-            disabled={busyAction !== undefined}
-            onCheckedChange={onToggle}
-            aria-label={ext.enabled ? `停用 ${name}` : `启用 ${name}`}
-          />
-        </div>
-
-        {/* 贡献点计数 */}
-        {ext.contributions !== undefined && (
-          <div className="flex flex-wrap gap-1.5">
-            <Badge variant="secondary">路由 {ext.contributions.routes}</Badge>
-            <Badge variant="secondary">定时 {ext.contributions.crons}</Badge>
-            <Badge variant="secondary">事件 {ext.contributions.events}</Badge>
-            <Badge variant="secondary">钩子 {ext.contributions.hooks}</Badge>
-            <Badge variant="secondary">服务 {ext.contributions.services}</Badge>
-          </div>
-        )}
-
-        {/* lastError 折叠 */}
-        {ext.lastError !== null && ext.lastError !== '' && (
-          <div className="flex flex-col gap-1.5">
-            <button
-              type="button"
-              onClick={() => setShowError((prev) => !prev)}
-              className="text-destructive flex items-center gap-1.5 text-left text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <TriangleAlertIcon className="size-3.5 shrink-0" aria-hidden />
-              最近一次错误
-              <span className="text-muted-foreground underline">{showError ? '收起' : '展开'}</span>
-            </button>
-            {showError && <CodeBlock text={ext.lastError} />}
-          </div>
-        )}
-
-        {/* 操作行 */}
-        <div className="flex flex-wrap items-center gap-2 border-t pt-3">
-          <Button variant="outline" size="sm" onClick={onReload} disabled={busyAction !== undefined}>
-            <RotateCwIcon className={cn(busyAction === 'reload' && 'animate-spin')} aria-hidden />
-            {busyAction === 'reload' ? '重载中…' : '重载'}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-            onClick={onUninstall}
-            disabled={busyAction !== undefined}
-          >
-            <PackageXIcon aria-hidden />
-            {busyAction === 'uninstall' ? '卸载中…' : '卸载'}
-          </Button>
-          {busyAction === 'enable' && <span className="text-muted-foreground text-xs">启用中…</span>}
-          {busyAction === 'disable' && <span className="text-muted-foreground text-xs">停用中…</span>}
-          {ext.crashCount > 0 && (
-            <Badge variant="warning" className="ml-auto">
-              近期崩溃 {ext.crashCount}
-            </Badge>
-          )}
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-/** 路由表 Tab（<md 横向滚动） */
+/** 路由表 Tab（<md 横向滚动；长路径 break-all 断行） */
 function RoutesTab({ routes, onRefresh }: { routes: ExtRouteTableEntry[] | null; onRefresh: () => void }): React.ReactNode {
   if (routes === null) return <TabSkeleton onRefresh={onRefresh} />;
   if (routes.length === 0) {
@@ -501,13 +568,13 @@ function RoutesTab({ routes, onRefresh }: { routes: ExtRouteTableEntry[] | null;
                   {r.method}
                 </Badge>
               </TableCell>
-              <TableCell className="max-w-[280px] truncate font-mono text-xs" title={r.path}>
+              <TableCell className="min-w-[180px] break-all font-mono text-xs" title={r.path}>
                 {r.path}
               </TableCell>
               <TableCell>
                 <Badge variant={r.auth === 'public' ? 'outline' : r.auth === 'admin' ? 'warning' : 'secondary'}>{r.auth}</Badge>
               </TableCell>
-              <TableCell className="font-mono text-xs">{r.extId}</TableCell>
+              <TableCell className="break-all font-mono text-xs">{r.extId}</TableCell>
               <TableCell className="text-muted-foreground tabular-nums text-xs">
                 {r.timeoutMs !== undefined ? `${r.timeoutMs} ms` : '默认'}
               </TableCell>
@@ -519,7 +586,7 @@ function RoutesTab({ routes, onRefresh }: { routes: ExtRouteTableEntry[] | null;
   );
 }
 
-/** 服务注册 Tab */
+/** 服务注册 Tab（长服务全名 break-all 断行） */
 function RegistryTab({ registry, onRefresh }: { registry: ServiceEntry[] | null; onRefresh: () => void }): React.ReactNode {
   if (registry === null) return <TabSkeleton onRefresh={onRefresh} />;
   if (registry.length === 0) {
@@ -539,7 +606,7 @@ function RegistryTab({ registry, onRefresh }: { registry: ServiceEntry[] | null;
         <TableBody>
           {registry.map((s) => (
             <TableRow key={s.service}>
-              <TableCell className="font-mono text-xs">{s.service}</TableCell>
+              <TableCell className="break-all font-mono text-xs">{s.service}</TableCell>
               <TableCell>
                 <div className="flex flex-wrap gap-1">
                   {s.methods.map((m) => (
@@ -552,7 +619,7 @@ function RegistryTab({ registry, onRefresh }: { registry: ServiceEntry[] | null;
               <TableCell>
                 <Badge variant={s.status === 'active' ? 'success' : 'warning'}>{s.status === 'active' ? '活跃' : '已挂起'}</Badge>
               </TableCell>
-              <TableCell className="font-mono text-xs">{s.extId}</TableCell>
+              <TableCell className="break-all font-mono text-xs">{s.extId}</TableCell>
             </TableRow>
           ))}
         </TableBody>
@@ -572,7 +639,7 @@ function UiTab({ entries, onRefresh }: { entries: UiSnapshotEntry[] | null; onRe
       {entries.map((e) => (
         <Card key={e.extId} className="gap-3 py-4">
           <CardContent className="flex flex-col gap-2.5 px-4">
-            <p className="font-mono text-xs font-semibold">{e.extId}</p>
+            <p className="break-all font-mono text-xs font-semibold">{e.extId}</p>
             {e.menu !== undefined && (
               <p className="text-muted-foreground text-xs">
                 菜单：<span className="text-foreground font-medium">{e.menu.label}</span>
@@ -582,7 +649,7 @@ function UiTab({ entries, onRefresh }: { entries: UiSnapshotEntry[] | null; onRe
               <div className="flex flex-col gap-1">
                 <span className="text-muted-foreground text-xs">页面</span>
                 {e.pages.map((p) => (
-                  <p key={p.path} className="truncate text-xs" title={`${p.path} → ${p.entry}`}>
+                  <p key={p.path} className="break-all text-xs" title={`${p.path} → ${p.entry}`}>
                     <span className="font-medium">{p.title}</span>
                     <span className="text-muted-foreground font-mono"> · {p.path}</span>
                   </p>

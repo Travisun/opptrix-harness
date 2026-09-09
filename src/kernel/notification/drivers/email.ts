@@ -8,6 +8,10 @@
  * - from 发件人；to 单地址或多收件人数组（sendMail 时 join(',')）
  * - subjectPrefix 可选主题前缀
  *
+ * 失败重试：sendMail 失败由 NotificationManager 的统一重试封装（retry.ts
+ * withDeliveryRetry，指数退避）编排——email 缺省重试 2 次（退避 2s/4s），可经
+ * settings 键 'notify.retry' 整体覆盖；本驱动每次 deliver 恰好一次 sendMail 尝试。
+ *
  * 失败语义：target 非法 → VALIDATION_FAILED；解析密码/sendMail 任一环节失败 →
  * DELIVERY_FAILED（携带原始错误为 cause）。detail 只含 host/to 等非敏感字段。
  */

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   PackageOpenIcon,
+  PencilIcon,
   PlusIcon,
   RefreshCwIcon,
   SearchIcon,
@@ -18,6 +19,7 @@ import { cn } from '@/lib/utils';
 import { EmptyState, errText, isApiError, isAdminRole, useMe } from '@/pages/_shared';
 import { CreateSkillDialog } from '@/pages/Skills/CreateSkillDialog';
 import { DeleteSkillDialog } from '@/pages/Skills/DeleteSkillDialog';
+import { EditSkillDialog } from '@/pages/Skills/EditSkillDialog';
 import { SkillCard } from '@/pages/Skills/SkillCard';
 import { SkillDetailSheet } from '@/pages/Skills/SkillDetailSheet';
 import {
@@ -35,6 +37,8 @@ import {
  * - GET  /api/v1/skills/:id    详情（含正文 body；点卡片经 Sheet 惰性拉取）；
  * - POST /api/v1/skills        新建技能（admin/root；「新建技能」弹窗，写数据卷后
  *                              内核自动 refresh → 成功后重载列表）；
+ * - GET+DELETE+POST            编辑技能（admin/root；仅数据卷来源——卡片「编辑」
+ *                              入口 + 弹窗按表单重建；builtin/extension 来源隐藏）；
  * - DELETE /api/v1/skills/:id  删除技能（admin/root；仅数据卷来源，卡片行操作 +
  *                              confirm 弹窗；builtin/extension 来源隐藏删除）；
  * - POST /api/v1/skills/refresh 重扫技能库（admin/root；403 → 隐藏按钮并提示）。
@@ -66,6 +70,8 @@ export default function SkillsPage(): React.ReactNode {
   const [createOpen, setCreateOpen] = useState(false);
   /** 删除确认弹窗目标（null = 关闭；仅数据卷来源可删） */
   const [deleteTarget, setDeleteTarget] = useState<SkillEntryView | null>(null);
+  /** 编辑弹窗目标（null = 关闭；仅数据卷来源可编辑，builtin/extension 隐藏入口） */
+  const [editTarget, setEditTarget] = useState<SkillEntryView | null>(null);
 
   /** 角色：refresh/新建/删除要求 admin/root（与内核 requireAdmin 对齐） */
   const { me, loading: meLoading } = useMe();
@@ -283,17 +289,30 @@ export default function SkillsPage(): React.ReactNode {
         </EmptyState>
       )}
 
-      {/* 技能卡片网格 */}
+      {/* 技能卡片网格（数据卷来源 + admin 追加悬浮「编辑」入口，与行内「删除」一致化） */}
       {!loading && error === null && filtered.length > 0 && (
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {filtered.map((skill) => (
-            <SkillCard
-              key={skill.id}
-              skill={skill}
-              onOpen={() => setDetailTarget(skill)}
-              // 行操作「删除」：仅数据卷来源 + admin（builtin 只读、extension 驻留内存，均不可删）
-              onDelete={canManage && skill.source === 'data' ? () => setDeleteTarget(skill) : undefined}
-            />
+            <div key={skill.id} className="relative">
+              <SkillCard
+                skill={skill}
+                onOpen={() => setDetailTarget(skill)}
+                // 行操作「删除」：仅数据卷来源 + admin（builtin 只读、extension 驻留内存，均不可删）
+                onDelete={canManage && skill.source === 'data' ? () => setDeleteTarget(skill) : undefined}
+              />
+              {canManage && skill.source === 'data' && (
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={`编辑技能 ${skill.name}`}
+                  title="编辑该技能（数据卷目录）"
+                  className="text-muted-foreground hover:text-foreground absolute right-4 bottom-3"
+                  onClick={() => setEditTarget(skill)}
+                >
+                  <PencilIcon aria-hidden />
+                </Button>
+              )}
+            </div>
           ))}
         </div>
       )}
@@ -306,6 +325,9 @@ export default function SkillsPage(): React.ReactNode {
 
       {/* 删除确认（admin；仅数据卷来源；DELETE 成功后内核已 refresh → 重载列表） */}
       <DeleteSkillDialog target={deleteTarget} onClose={() => setDeleteTarget(null)} onDeleted={() => void load()} />
+
+      {/* 编辑（admin；仅数据卷来源；保存 = DELETE+POST，内核均已 refresh → 重载列表） */}
+      <EditSkillDialog target={editTarget} onClose={() => setEditTarget(null)} onSaved={() => void load()} />
     </div>
   );
 }

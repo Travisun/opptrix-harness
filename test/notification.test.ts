@@ -6,6 +6,11 @@
  *   data/channels JSON 往返与损坏容错。
  * - manager：入库 + SSE publish 断言（created/delivered 两事件）、未知驱动跳过、
  *   单渠道失败不抛、hook beforeSend 改写、投递计划落库脱敏。
+ * - retry/manager 重试编排：withDeliveryRetry 指数退避纯函数、notify.retry 覆盖、
+ *   每驱动缺省口径（email 2 次 2s/4s、webhook 3 次 500ms/1s/2s）、target.retries
+ *   逐目标覆盖、不可重试错误短路、读取失败回落默认。
+ * - manager 投递记录：recordDelivery 每渠道回调（kind='notification'、target 脱敏、
+ *   ok/durationMs/error），回调抛错不外溢。
  * - webhook：真实 signedPost 打本地 http 服务器（成功/签名验签/secretRef 解析/
  *   非 2xx 抛 DELIVERY_FAILED/target 校验）。
  * - console：logger.info 输出断言。
@@ -28,7 +33,14 @@ import {
   NotificationStore,
   createConsoleDriver,
   createWebhookDriver,
+  defaultSleep,
   inboxDriver,
+  FALLBACK_DELIVERY_RETRY,
+  NOTIFICATION_RETRY_DEFAULTS,
+  normalizeRetryOverride,
+  resolveChannelRetry,
+  withDeliveryRetry,
+  type NotificationDeliveryEntry,
   type NotificationManagerDeps,
   type NotificationRecord,
 } from '../src/kernel/notification/index.js';
@@ -606,5 +618,332 @@ describe('console 驱动', () => {
     expect(fields.level).toBe('warn');
     expect(String(message)).toContain('控制台通知');
     expect(String(message)).toContain('warn');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 统一投递重试（retry.ts 纯函数）与 manager 重试编排 / 投递记录落库
+// ---------------------------------------------------------------------------
+
+/** 记录退避序列的 sleep 替身（免真实等待，直接断言指数退避口径） */
+function makeSleep(): { sleep: (ms: number) => Promise<void>; delays: number[] } {
+  const delays: number[] = [];
+  return {
+    delays,
+    sleep: async (ms: number) => {
+      delays.push(ms);
+    },
+  };
+}
+
+describe('withDeliveryRetry（统一指数退避重试）', () => {
+  it('首次成功：fn 恰好调用 1 次，无退避等待，原值透传', async () => {
+    const { sleep, delays } = makeSleep();
+    const fn = vi.fn(async () => 'ok');
+    await expect(withDeliveryRetry(fn, { retries: 3, baseMs: 500, sleep })).resolves.toBe('ok');
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(delays).toEqual([]);
+  });
+
+  it('失败后成功：按指数退避（base, base*2）重试并返回原值', async () => {
+    const { sleep, delays } = makeSleep();
+    let n = 0;
+    const fn = vi.fn(async () => {
+      n += 1;
+      if (n < 3) throw new Error(`fail-${n}`);
+      return 'done';
+    });
+    await expect(withDeliveryRetry(fn, { retries: 3, baseMs: 500, sleep })).resolves.toBe('done');
+    expect(fn).toHaveBeenCalledTimes(3);
+    expect(delays).toEqual([500, 1000]);
+  });
+
+  it('重试耗尽：共 retries+1 次尝试（email 口径退避 2s/4s），抛最后一次原始错误', async () => {
+    const { sleep, delays } = makeSleep();
+    const fn = vi.fn(async () => {
+      throw new Error('permanent');
+    });
+    await expect(withDeliveryRetry(fn, { retries: 2, baseMs: 2000, sleep })).rejects.toThrow('permanent');
+    expect(fn).toHaveBeenCalledTimes(3);
+    expect(delays).toEqual([2000, 4000]);
+  });
+
+  it('retries:0：单次尝试、零等待（负数/非整数口径被钳制为不重试）', async () => {
+    const { sleep, delays } = makeSleep();
+    const fn = vi.fn(async () => {
+      throw new Error('boom');
+    });
+    await expect(withDeliveryRetry(fn, { retries: 0, baseMs: 500, sleep })).rejects.toThrow('boom');
+    await expect(withDeliveryRetry(fn, { retries: -3, baseMs: 500, sleep })).rejects.toThrow('boom');
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([]);
+  });
+
+  it('retryOn 判定不可重试（如 VALIDATION_FAILED）→ 立即抛出不重试', async () => {
+    const { sleep, delays } = makeSleep();
+    const fn = vi.fn(async () => {
+      throw err('VALIDATION_FAILED', { message: 'bad target' });
+    });
+    await expect(
+      withDeliveryRetry(fn, {
+        retries: 5,
+        baseMs: 10,
+        sleep,
+        retryOn: (e) => !(e instanceof HarnessError) || e.retryable,
+      }),
+    ).rejects.toMatchObject({ code: 'HARNESS-1009' });
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(delays).toEqual([]);
+  });
+
+  it('口径解析：每驱动缺省表（email 2 次 2s / webhook 3 次 500ms）+ target.retries + notify.retry 覆盖优先', () => {
+    expect(NOTIFICATION_RETRY_DEFAULTS['email']).toEqual({ retries: 2, baseMs: 2000 });
+    expect(NOTIFICATION_RETRY_DEFAULTS['webhook']).toEqual({ retries: 3, baseMs: 500 });
+    expect(resolveChannelRetry('email', {}, null)).toEqual({ retries: 2, baseMs: 2000 });
+    expect(resolveChannelRetry('webhook', {}, null)).toEqual({ retries: 3, baseMs: 500 });
+    expect(resolveChannelRetry('nope', {}, null)).toEqual(FALLBACK_DELIVERY_RETRY);
+    // webhook 逐目标覆盖（历史契约：target.retries；0 合法）
+    expect(resolveChannelRetry('webhook', { url: 'https://x', retries: 0 }, null)).toEqual({ retries: 0, baseMs: 500 });
+    expect(resolveChannelRetry('webhook', { retries: 99 }, null)).toEqual({ retries: 10, baseMs: 500 });
+    expect(resolveChannelRetry('webhook', { retries: 1.5 }, null)).toEqual({ retries: 3, baseMs: 500 });
+    // settings notify.retry 覆盖优先于逐目标与缺省表
+    expect(resolveChannelRetry('email', {}, { retries: 1, baseMs: 250 })).toEqual({ retries: 1, baseMs: 250 });
+    expect(resolveChannelRetry('webhook', { retries: 0 }, { retries: 1, baseMs: 250 })).toEqual({
+      retries: 1,
+      baseMs: 250,
+    });
+    // 归一化：缺失/形状非法 → null（用默认）
+    expect(normalizeRetryOverride({ retries: 2, baseMs: 100 })).toEqual({ retries: 2, baseMs: 100 });
+    expect(normalizeRetryOverride(undefined)).toBeNull();
+    expect(normalizeRetryOverride(null)).toBeNull();
+    expect(normalizeRetryOverride({ retries: -1, baseMs: 100 })).toBeNull();
+    expect(normalizeRetryOverride({ retries: 11, baseMs: 100 })).toBeNull();
+    expect(normalizeRetryOverride({ retries: 2 })).toBeNull();
+    expect(normalizeRetryOverride('fast')).toBeNull();
+  });
+});
+
+describe('NotificationManager — 投递记录落库（recordDelivery → deliveries 表）', () => {
+  it('成功渠道：每渠道回调一次 {kind:"notification", channel, target 脱敏摘要, ok:true, durationMs}', async () => {
+    const deliver = vi.fn(async () => {});
+    const recordDelivery = vi.fn();
+    const { manager, registry } = makeManager({ recordDelivery });
+    registry.registerNotificationDriver({ name: 'stub', deliver });
+
+    const rec = await manager.send({
+      title: '落库成功',
+      channels: [{ driver: 'stub', target: { url: 'https://example.test/hook', secret: 's3cret' } }],
+    });
+
+    expect(recordDelivery).toHaveBeenCalledTimes(1);
+    const entry = recordDelivery.mock.calls[0]?.[0] as NotificationDeliveryEntry;
+    expect(entry.kind).toBe('notification');
+    expect(entry.channel).toBe('stub');
+    expect(entry.ok).toBe(true);
+    expect(typeof entry.durationMs).toBe('number');
+    expect(entry.error).toBeUndefined();
+    // target 脱敏摘要：secret → ***，非敏感字段原样
+    expect(JSON.parse(entry.target)).toEqual({ url: 'https://example.test/hook', secret: '***' });
+    expect(rec.id).toBeTruthy();
+  });
+
+  it('失败与未知驱动：ok:false + error；多渠道按计划序逐一记录，成功渠道不受影响', async () => {
+    const bad = vi.fn(async () => {
+      throw err('DELIVERY_FAILED', { message: 'smtp down' });
+    });
+    const good = vi.fn(async () => {});
+    const recordDelivery = vi.fn();
+    const { manager, registry } = makeManager({ recordDelivery });
+    registry.registerNotificationDriver({ name: 'bad', deliver: bad });
+    registry.registerNotificationDriver({ name: 'good', deliver: good });
+
+    const rec = await manager.send({
+      title: '落库失败',
+      channels: [
+        { driver: 'bad', target: { host: 'smtp.example.com' } },
+        { driver: 'nope', target: {} }, // 未注册
+        { driver: 'good', target: {} },
+      ],
+    });
+
+    expect(recordDelivery).toHaveBeenCalledTimes(3);
+    const entries = recordDelivery.mock.calls.map((c) => c[0] as NotificationDeliveryEntry);
+    expect(entries[0]).toMatchObject({ kind: 'notification', channel: 'bad', ok: false, error: 'smtp down' });
+    expect(JSON.parse(entries[0]?.target ?? '{}')).toEqual({ host: 'smtp.example.com' });
+    expect(entries[1]).toMatchObject({ kind: 'notification', channel: 'nope', ok: false, durationMs: 0 });
+    expect(entries[1]?.error).toContain('not found');
+    expect(entries[2]).toMatchObject({ kind: 'notification', channel: 'good', ok: true });
+    expect(rec.id).toBeTruthy();
+    // delivered SSE 仍发布（结果数组序一致）
+    expect(recordDelivery).toHaveBeenCalled();
+  });
+
+  it('recordDelivery 回调同步抛错：仅 warn 不外溢，send 正常返回', async () => {
+    const deliver = vi.fn(async () => {});
+    const warnSpy = vi.fn();
+    const recordDelivery = vi.fn(() => {
+      throw new Error('db write failed');
+    });
+    const { manager, registry, publish } = makeManager({
+      recordDelivery,
+      logger: { warn: warnSpy, error: vi.fn() } as never,
+    });
+    registry.registerNotificationDriver({ name: 'stub', deliver });
+
+    const rec = await manager.send({ title: '回调抛错', channels: [{ driver: 'stub', target: {} }] });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(recordDelivery).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledTimes(2); // created + delivered 照常
+    expect(rec.id).toBeTruthy();
+  });
+
+  it('未注入 recordDelivery：投递照常（向后兼容）', async () => {
+    const deliver = vi.fn(async () => {});
+    const { manager, registry, publish } = makeManager();
+    registry.registerNotificationDriver({ name: 'stub', deliver });
+
+    const rec = await manager.send({ title: '无落库依赖', channels: [{ driver: 'stub', target: {} }] });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(rec.id).toBeTruthy();
+  });
+});
+
+describe('NotificationManager — 统一重试编排（notify.retry 覆盖 / 每驱动缺省）', () => {
+  it('notify.retry 覆盖：getRetry 返回 {retries:2, baseMs:5} → 失败渠道尝试 3 次、退避 [5,10]', async () => {
+    const deliver = vi.fn(async () => {
+      throw err('DELIVERY_FAILED', { message: 'down' });
+    });
+    const { sleep, delays } = makeSleep();
+    const { manager, registry, publish } = makeManager({
+      getRetry: async () => ({ retries: 2, baseMs: 5 }),
+      sleep,
+    });
+    registry.registerNotificationDriver({ name: 'stub', deliver });
+
+    const rec = await manager.send({ title: '重试覆盖', channels: [{ driver: 'stub', target: {} }] });
+
+    expect(deliver).toHaveBeenCalledTimes(3);
+    expect(delays).toEqual([5, 10]);
+    expect(publish).toHaveBeenCalledWith('notifications', 'notification.delivered', {
+      id: rec.id,
+      results: [{ driver: 'stub', ok: false, durationMs: expect.any(Number), error: 'down' }],
+    });
+  });
+
+  it('缺省口径按驱动名：email 驱动失败 → 重试 2 次、退避 [2000,4000]（sleep 注入免真实等待）', async () => {
+    const deliver = vi.fn(async () => {
+      throw err('DELIVERY_FAILED', { message: 'smtp 5.4.1' });
+    });
+    const { sleep, delays } = makeSleep();
+    const { manager, registry } = makeManager({ sleep });
+    registry.registerNotificationDriver({ name: 'email', deliver });
+
+    await manager.send({
+      title: 'email 缺省重试',
+      channels: [{ driver: 'email', target: { smtp: { host: 'smtp.example.com' }, from: 'a@b.c', to: 'd@e.f' } }],
+    });
+
+    expect(deliver).toHaveBeenCalledTimes(3);
+    expect(delays).toEqual([2000, 4000]);
+  });
+
+  it('webhook target.retries 逐目标生效（manager 统一编排，base 500 历史口径）', async () => {
+    const deliver = vi.fn(async () => {
+      throw err('DELIVERY_FAILED', { message: 'http 500' });
+    });
+    const { sleep, delays } = makeSleep();
+    const { manager, registry } = makeManager({ sleep });
+    registry.registerNotificationDriver({ name: 'webhook', deliver });
+
+    await manager.send({
+      title: '目标级重试',
+      channels: [{ driver: 'webhook', target: { url: 'https://example.test/hook', retries: 1 } }],
+    });
+
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([500]);
+  });
+
+  it('VALIDATION_FAILED（retryable=false）不重试：即使 notify.retry 配置了重试', async () => {
+    const deliver = vi.fn(async () => {
+      throw err('VALIDATION_FAILED', { message: 'bad target' });
+    });
+    const { sleep, delays } = makeSleep();
+    const { manager, registry } = makeManager({
+      getRetry: async () => ({ retries: 3, baseMs: 1 }),
+      sleep,
+    });
+    registry.registerNotificationDriver({ name: 'stub', deliver });
+
+    await manager.send({ title: '配置错误不重试', channels: [{ driver: 'stub', target: {} }] });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(delays).toEqual([]);
+  });
+
+  it('getRetry 读取失败/形状非法 → 回落每驱动缺省口径（warn，不阻断投递）', async () => {
+    const deliver = vi.fn(async () => {
+      throw err('DELIVERY_FAILED', { message: 'down' });
+    });
+    const warnSpy = vi.fn();
+    const errorSpy = vi.fn();
+    const { sleep, delays } = makeSleep();
+    const boom = makeManager({
+      getRetry: async () => {
+        throw new Error('settings unavailable');
+      },
+      sleep,
+      logger: { warn: warnSpy, error: errorSpy } as never,
+    });
+    boom.registry.registerNotificationDriver({ name: 'email', deliver });
+    await boom.manager.send({ title: '读取失败回落', channels: [{ driver: 'email', target: {} }] });
+    expect(deliver).toHaveBeenCalledTimes(3); // email 缺省口径 2 次重试
+    expect(delays).toEqual([2000, 4000]);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    const invalid = makeManager({
+      getRetry: async () => ({ retries: 'fast' }),
+      sleep,
+      logger: { warn: warnSpy, error: errorSpy } as never,
+    });
+    invalid.registry.registerNotificationDriver({ name: 'email', deliver });
+    await invalid.manager.send({ title: '形状非法回落', channels: [{ driver: 'email', target: {} }] });
+    expect(deliver).toHaveBeenCalledTimes(6);
+    expect(delays).toEqual([2000, 4000, 2000, 4000]);
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    // 投递失败不上抛：send 正常返回（record 已入库，由断言外 store 可查）
+  });
+});
+
+describe('withDeliveryRetry / 投递流水 — 边界补齐', () => {
+  it('defaultSleep：setTimeout 实现可等待完成', async () => {
+    const start = Date.now();
+    await defaultSleep(5);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(3);
+  });
+
+  it('target 含循环引用：store 桩放行后，投递流水摘要兜底为 [unserializable target]', async () => {
+    const deliver = vi.fn(async () => {});
+    const recordDelivery = vi.fn();
+    const { manager, registry } = makeManager({
+      recordDelivery,
+      // 绕过真实 store 的 channels 序列化（循环引用会在落库期被 DB_ERROR 拦截）
+      store: { create: async () => {} } as never,
+    });
+    registry.registerNotificationDriver({ name: 'stub', deliver });
+
+    const circular: Record<string, unknown> = { url: 'https://example.test/hook' };
+    circular['self'] = circular;
+    const rec = await manager.send({ title: '循环引用', channels: [{ driver: 'stub', target: circular }] });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const entry = recordDelivery.mock.calls[0]?.[0] as NotificationDeliveryEntry;
+    expect(entry.ok).toBe(true);
+    expect(entry.target).toBe('[unserializable target]');
+    expect(rec.id).toBeTruthy();
   });
 });

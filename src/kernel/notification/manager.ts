@@ -9,9 +9,15 @@
  * 5. 对投递计划逐个投递：registry.getNotificationDriver → deliver(payload, target)。
  *    投递计划 = 显式传入的 input.channels（优先）；未显式传入且注入了 getRoutes 时，
  *    读取默认路由规则（settings 'notify.routes'）按 level 匹配追加 channels。
- *    单渠道失败**不抛出**：logger.error 记录 + 失败计数，deliver 前后计 duration；
+ *    投递统一走指数退避重试（retry.ts 的 withDeliveryRetry）：口径按
+ *    resolveChannelRetry 解析（settings 'notify.retry' 覆盖 > webhook target.retries >
+ *    每驱动缺省表——webhook 3 次 500ms/1s/2s、email 2 次 2s/4s、其余不重试）；
+ *    VALIDATION_FAILED 等不可重试错误（HarnessError.retryable=false）立即抛出不重试。
+ *    单渠道失败**不抛出**：logger.error 记录 + 失败计数，deliver 前后计 duration（含重试）；
  *    未知驱动名同样跳过不抛；
- * 6. 每渠道结果数组作为第二事件 publish('notifications', 'notification.delivered',
+ * 6. 每渠道结果经可选的 deps.recordDelivery 回调落投递流水（集成方写 deliveries 表，
+ *    kind='notification'，target 脱敏摘要；同 chat 桥 DeliveryRecord 形状），随后把
+ *    结果数组作为第二事件 publish('notifications', 'notification.delivered',
  *    { id, results })（仅当投递计划非空时发布）。
  *
  * 注意：`notification.beforeSend` 埋点名已收编进 HOOK_POINTS
@@ -26,11 +32,18 @@ import type {
   ChannelLevel,
   NotificationPayload,
 } from '../channels/index.js';
-import { err } from '../errors/index.js';
+import { err, HarnessError } from '../errors/index.js';
 import type { Logger } from 'pino';
 import { z } from 'zod';
 
 import { HOOK_POINTS } from '../hooks/index.js';
+import {
+  normalizeRetryOverride,
+  resolveChannelRetry,
+  withDeliveryRetry,
+  type DeliveryRetryConfig,
+  type SleepFn,
+} from './retry.js';
 import type { NotificationRecord, NotificationStore } from './store.js';
 
 /** notification 域 hook 埋点（收编进 HOOK_POINTS 前的本地单一事实来源） */
@@ -48,8 +61,27 @@ export interface ChannelDeliveryResult {
   driver: string;
   /** 是否成功（未知驱动名/抛错均为 false） */
   ok: boolean;
-  /** deliver 前后耗时（毫秒；未知驱动名为 0） */
+  /** deliver 前后耗时（毫秒，含统一重试的退避等待；未知驱动名为 0） */
   durationMs: number;
+  /** 失败摘要（成功时省略） */
+  error?: string;
+}
+
+/**
+ * 投递流水条目（与 chat 桥 ChatBridgeDispatcher 的 DeliveryRecord 同形状；
+ * 集成方写 deliveries 表：kind='notification'、channel=驱动名、created_at=写入时刻）。
+ */
+export interface NotificationDeliveryEntry {
+  /** 渠道类型（本管理器固定 'notification'） */
+  kind: string;
+  /** 接收方标识（target 的脱敏 JSON 摘要；secret 类字段替换为 '***'） */
+  target: string;
+  /** 发送通道标识（本管理器 = 渠道驱动名） */
+  channel: string;
+  /** 是否成功 */
+  ok: boolean;
+  /** 投递耗时（毫秒，含重试退避；未知驱动名为 0） */
+  durationMs?: number;
   /** 失败摘要（成功时省略） */
   error?: string;
 }
@@ -89,6 +121,23 @@ export interface NotificationManagerDeps {
    * 给出即不读路由）。规则读取失败/形状非法仅 warn 并忽略（通知入库不受影响）。
    */
   getRoutes?: () => Promise<unknown>;
+  /**
+   * 重试口径覆盖读取器（可选；集成方接 settings('notify.retry')）。返回值经
+   * normalizeRetryOverride 校验：形状 {retries, baseMs} 合法即整体替代每驱动缺省
+   * 口径（见 retry.ts）；未注入/读取失败/形状非法均回落默认，仅 warn 不阻断。
+   */
+  getRetry?: () => Promise<unknown>;
+  /**
+   * 投递流水回调（可选；集成方接 core-services 的 db('deliveries') 落库手法，
+   * 同 chat 桥 dispatcher 的 recordDelivery）。每渠道投递结束（成功/失败/未知驱动）
+   * 各回调一次，target 为脱敏摘要；回调同步抛错仅 warn，不影响投递结果。
+   */
+  recordDelivery?: (entry: NotificationDeliveryEntry) => void;
+  /**
+   * 等待实现（可选；缺省 setTimeout）。供统一重试的指数退避使用，测试注入
+   * 记录器即可断言退避序列而无需真实等待。
+   */
+  sleep?: SleepFn;
 }
 
 /** send() 入参 */
@@ -176,6 +225,23 @@ function errorMessage(e: unknown): string {
 }
 
 /**
+ * 统一重试的口径判定：HarnessError 按自身 retryable 标志（VALIDATION_FAILED 等
+ * 配置类错误不重试），非 HarnessError（驱动内部裸抛的意外异常）按可重试处理。
+ */
+function isRetryableDeliveryError(e: unknown): boolean {
+  return !(e instanceof HarnessError) || e.retryable;
+}
+
+/** target → 脱敏 JSON 摘要（投递流水用；secret 类字段替换为 '***'，序列化失败有兜底） */
+function deliveryTargetLabel(target: unknown): string {
+  try {
+    return JSON.stringify(redactSecrets(target)) ?? '[unserializable target]';
+  } catch {
+    return '[unserializable target]';
+  }
+}
+
+/**
  * 通知中心编排器：通知生命周期 = 入库（inbox）→ SSE created 事件 → 渠道投递 →
  * SSE delivered 事件。投递永远不反向影响入库结果：send() 的成功即"通知已创建"。
  */
@@ -186,7 +252,8 @@ export class NotificationManager {
    * 创建并投递一条通知。
    *
    * @returns 已落库的通知记录（channels 字段为脱敏后的投递计划；每渠道投递结果
-   *   经 'notification.delivered' 事件异步可见，v1 不回写记录）
+   *   经 'notification.delivered' 事件异步可见，并经可选的 deps.recordDelivery
+   *   落投递流水；v1 不回写记录）
    * @throws HarnessError（VALIDATION_FAILED）入参非法，或 beforeSend hook 返回了
    *   非法形状；store 落库失败按原样上抛（DB_ERROR）。渠道投递失败不上抛。
    */
@@ -247,7 +314,9 @@ export class NotificationManager {
     // 5. SSE：created（入库即 inbox；站内信消费此事件渲染通知中心）
     this.deps.publish(TOPIC, 'notification.created', record);
 
-    // 6. 渠道投递：逐渠道隔离，单渠道失败不抛出（logger.error + 失败计数）
+    // 6. 渠道投递：逐渠道隔离，单渠道失败不抛出（logger.error + 失败计数）。
+    //    投递统一走 withDeliveryRetry 指数退避（口径解析见 retry.ts），
+    //    每渠道结果经 recordDelivery 落投递流水（deliveries 表，target 脱敏）。
     const channels = plan;
     if (channels.length > 0) {
       const payload: NotificationPayload = {
@@ -258,16 +327,23 @@ export class NotificationManager {
         data: value.data,
         createdAt: record.createdAt,
       };
+      const retryOverride = await this.#readRetryOverride();
       const results: ChannelDeliveryResult[] = [];
       for (const channel of channels) {
+        const targetLabel = deliveryTargetLabel(channel.target);
         const driver = this.deps.registry.getNotificationDriver(channel.driver);
         if (driver === undefined) {
           // 未知驱动名：跳过不抛，结果计失败，便于上层排查路由配置
-          results.push({
-            driver: channel.driver,
+          const missing =
+            `driver "${channel.driver}" not found (HARNESS-7002); register it via registry.registerNotificationDriver()`;
+          results.push({ driver: channel.driver, ok: false, durationMs: 0, error: missing });
+          this.#recordDelivery({
+            kind: 'notification',
+            target: targetLabel,
+            channel: channel.driver,
             ok: false,
             durationMs: 0,
-            error: `driver "${channel.driver}" not found (HARNESS-7002); register it via registry.registerNotificationDriver()`,
+            error: missing,
           });
           this.deps.logger.warn(
             { driver: channel.driver, notificationId: id },
@@ -276,14 +352,36 @@ export class NotificationManager {
           continue;
         }
         const start = performance.now();
+        const retry = resolveChannelRetry(channel.driver, channel.target, retryOverride);
         try {
           // target 在本 API 边界为 unknown（形状由各驱动 deliver 入口自行 zod 校验，
           // 见 channels 包 ChannelTargetConfig 契约），此处归一为契约类型
-          await driver.deliver(payload, channel.target as ChannelTargetConfig);
-          results.push({ driver: channel.driver, ok: true, durationMs: Math.round(performance.now() - start) });
+          await withDeliveryRetry(() => driver.deliver(payload, channel.target as ChannelTargetConfig), {
+            ...retry,
+            sleep: this.deps.sleep,
+            retryOn: isRetryableDeliveryError,
+          });
+          const durationMs = Math.round(performance.now() - start);
+          results.push({ driver: channel.driver, ok: true, durationMs });
+          this.#recordDelivery({
+            kind: 'notification',
+            target: targetLabel,
+            channel: channel.driver,
+            ok: true,
+            durationMs,
+          });
         } catch (e) {
           const durationMs = Math.round(performance.now() - start);
-          results.push({ driver: channel.driver, ok: false, durationMs, error: errorMessage(e) });
+          const failure = errorMessage(e);
+          results.push({ driver: channel.driver, ok: false, durationMs, error: failure });
+          this.#recordDelivery({
+            kind: 'notification',
+            target: targetLabel,
+            channel: channel.driver,
+            ok: false,
+            durationMs,
+            error: failure,
+          });
           this.deps.logger.error(
             { err: e, driver: channel.driver, notificationId: id, durationMs },
             `[notification] channel delivery failed via "${channel.driver}" (notification ${id})`,
@@ -295,6 +393,45 @@ export class NotificationManager {
     }
 
     return record;
+  }
+
+  /**
+   * settings 'notify.retry' → 重试口径覆盖：未注入/读取失败/形状非法均返回 null
+   * （用每驱动缺省口径），仅 warn 不阻断投递。
+   */
+  async #readRetryOverride(): Promise<DeliveryRetryConfig | null> {
+    const getRetry = this.deps.getRetry;
+    if (getRetry === undefined) return null;
+    let raw: unknown;
+    try {
+      raw = await getRetry();
+    } catch (e) {
+      this.deps.logger.warn({ err: e }, '[notification] retry settings read failed, default retry policy in effect');
+      return null;
+    }
+    const parsed = normalizeRetryOverride(raw);
+    if (parsed === null) {
+      this.deps.logger.warn(
+        { value: raw },
+        '[notification] retry settings invalid (need { retries: 0-10, baseMs: 0-60000 }), default retry policy in effect',
+      );
+      return null;
+    }
+    return parsed;
+  }
+
+  /** 投递流水回调（fire-and-forget）：未注入即 no-op；同步抛错仅 warn，不影响投递结果 */
+  #recordDelivery(entry: NotificationDeliveryEntry): void {
+    const recordDelivery = this.deps.recordDelivery;
+    if (recordDelivery === undefined) return;
+    try {
+      recordDelivery(entry);
+    } catch (e) {
+      this.deps.logger.warn(
+        { err: e, channel: entry.channel },
+        '[notification] delivery record callback failed (delivery result unaffected)',
+      );
+    }
   }
 
   /**

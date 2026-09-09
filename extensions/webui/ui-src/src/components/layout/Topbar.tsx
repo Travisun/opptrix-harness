@@ -278,7 +278,7 @@ export function Topbar({ onMobileNavOpen }: { onMobileNavOpen: () => void }): Re
         <MenuIcon aria-hidden />
       </Button>
       <h1 className="min-w-0 truncate text-sm font-semibold sm:text-base">
-        {current?.title ?? '控制台'}
+        {current?.title ?? 'Dashboard'}
       </h1>
 
       <div className="ml-auto flex items-center gap-1">
@@ -306,8 +306,8 @@ export function MobileNavSheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="left" className="w-64 gap-0 p-0" showCloseButton={false}>
         <SheetHeader className="border-b">
-          <SheetTitle className="text-left text-sm">Opptrix 控制台</SheetTitle>
-          <SheetDescription className="text-left text-xs">Harness OS 管理台</SheetDescription>
+          <SheetTitle className="text-left text-sm">Opptrix Harness</SheetTitle>
+          <SheetDescription className="text-left text-xs">Dashboard（管理台）</SheetDescription>
         </SheetHeader>
         <SidebarNav onNavigate={() => onOpenChange(false)} />
       </SheetContent>
