@@ -14,6 +14,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm audit --audit-level=high
+      # adm-zip/sharp/onnxruntime-node 传递依赖无上游修复（本地 OCR/推理能力已知代价），
+      # 门禁收敛为 critical；高危项逐条登记于 docs/dependencies.md 风险接受表
+      - run: npm audit --audit-level=critical
       - run: npm test -- --coverage
       - run: npm run build
