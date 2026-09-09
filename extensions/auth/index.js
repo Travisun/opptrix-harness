@@ -14,7 +14,15 @@
  * - h.auth.hashPassword(pw)     内核 scrypt 哈希（kernelCall auth.hashPassword）
  * - h.auth.verifyPassword(pw,h) 内核 scrypt 校验（kernelCall auth.verifyPassword）
  * - h.auth.hashToken(v)         内核 SHA-256 摘要（kernelCall auth.hashToken，返回 {hash} 64 位 hex）
+ * - h.auth.totpGenerate(acc)    内核 TOTP 密钥生成（kernelCall auth.totpGenerate，返回 {secret, uri}）
+ * - h.auth.totpVerify(input)    内核 TOTP 校验（kernelCall auth.totpVerify，window ±1，返回 {ok, delta}）
+ * - h.auth.verifyRootToken(tk)  内核 root 令牌常数时间校验（kernelCall auth.verifyRootToken，返回 {ok}）
  * - h.authProvider(fn)          注册 AuthProvider（需 manifest 权限 'auth:provider'）
+ *
+ * 强制 2FA（TOTP）：全员登录不放行未绑定用户——未绑定 → enrollmentRequired（enr 注册
+ * 令牌 → /2fa/setup → /2fa/enroll）；已绑定未带码 → mfaRequired（mfa 令牌 →
+ * /auth/login/2fa 或 login 带 totp 重试）。enr/mfa 令牌只存进程内存（10 分钟 TTL、
+ * 单用途）；root 令牌是唯一找回通道（POST /onboarding 重置 owner）。
  *
  * 令牌脱敏存储（T1 已交付，见 README）：sessions/api_keys 的 token_hash 列存
  * **令牌的 SHA-256 hex**（生成/校验时经 h.auth.hashToken 现算，明文令牌不落库、
@@ -26,7 +34,7 @@
  * @typedef {Object} HarnessApiLike
  * auth 扩展实际使用的 HarnessApi 子集（完整契约见仓库 types/harness.d.ts 与 README）。
  * @property {{ rootToken?: string }} [boot] 内核注入的引导态（rootToken 仅 builtin auth 可见）
- * @property {{ hashPassword(pw: string): Promise<string>, verifyPassword(pw: string, hash: string): Promise<boolean>, hashToken(value: string): Promise<{ hash: string }> }} auth 内核密码/摘要原语
+ * @property {{ hashPassword(pw: string): Promise<string>, verifyPassword(pw: string, hash: string): Promise<boolean>, hashToken(value: string): Promise<{ hash: string }>, totpGenerate(account: string): Promise<{ secret: string, uri: string }>, totpVerify(input: { secret: string, token: string }): Promise<{ ok: boolean, delta: number | null }>, verifyRootToken(token: string): Promise<{ ok: boolean }> }} auth 内核密码/摘要/TOTP 原语
  * @property {(register: (input: { token?: string, headers?: Record<string, unknown> }) => Promise<null | { userId: string, role: string, scopes: string[] }>) => void} authProvider AuthProvider 注册（激活期一次）
  * @property {{ schema(statements: string[]): Promise<void>, get(sql: string, params?: unknown[]): Promise<unknown>, all(sql: string, params?: unknown[]): Promise<unknown>, run(sql: string, params?: unknown[]): Promise<{ changes: number }> }} db
  * @property {{ get(path: string): Promise<unknown> }} config 只读内核配置
@@ -53,6 +61,17 @@ var AUTH_MIN_PASSWORD_LEN = 8;
 var AUTH_ROLES = ['admin', 'normal'];
 /** 令牌随机部分字节数（24 字节 = 48 hex 字符） */
 var AUTH_TOKEN_BYTES = 24;
+/** 内存令牌（enr/mfa）TTL：10 分钟——短时 + 单用途；进程重启即全失效（重新走流程） */
+var AUTH_MEM_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * 内存令牌存储（进程内、绝不落库）：key `'<kind>:<token>'`，value
+ * `{ kind, userId, username, pendingSecret, expiresAt }`。enr = 注册令牌
+ * （onboarding / 登录强制绑定通道），mfa = 登录第二步令牌。实例语义同
+ * AUTH_ROOT_TOKEN（worker 每次装载建新 VM，模块作用域不跨实例共享）。
+ * @type {Map<string, { kind: string, userId: string, username: string, pendingSecret: string, expiresAt: number }>}
+ */
+var AUTH_MEM_TOKENS = new Map();
 
 // ---------------------------------------------------------------------------
 // 小工具（顶层函数，供 setup 注册的处理器复用）
@@ -281,6 +300,107 @@ function authPublicUser(row) {
 }
 
 // ---------------------------------------------------------------------------
+// 内存令牌（enr / mfa：短时、单用途、不落库）+ 强制 2FA 共用件
+// ---------------------------------------------------------------------------
+
+/**
+ * 取内存令牌；过期即删除并视为不存在（惰性过期，无需清理任务）。
+ * @param {string} kind 'enr' | 'mfa'
+ * @param {unknown} token 令牌明文
+ * @returns {null | { kind: string, userId: string, username: string, pendingSecret: string, expiresAt: number }}
+ */
+function authMemGet(kind, token) {
+  if (typeof token !== 'string' || token === '') return null;
+  var entry = AUTH_MEM_TOKENS.get(kind + ':' + token);
+  if (entry === null || entry === undefined || typeof entry !== 'object') return null;
+  if (Date.now() > entry.expiresAt) {
+    AUTH_MEM_TOKENS.delete(kind + ':' + token);
+    return null;
+  }
+  return entry;
+}
+
+/**
+ * 写入内存令牌；顺带清扫全表过期项（写入频率低，扫全表成本可忽略，防无界增长）。
+ * @param {string} kind 'enr' | 'mfa'
+ * @param {string} token 令牌明文（仅存内存，不落库）
+ * @param {{ userId: string, username: string, pendingSecret: string }} payload 业务负载
+ * @returns {void}
+ */
+function authMemPut(kind, token, payload) {
+  var now = Date.now();
+  AUTH_MEM_TOKENS.forEach(function (v, k) {
+    if (v !== null && v !== undefined && v.expiresAt <= now) AUTH_MEM_TOKENS.delete(k);
+  });
+  AUTH_MEM_TOKENS.set(kind + ':' + token, {
+    kind: kind,
+    userId: payload.userId,
+    username: payload.username,
+    pendingSecret: payload.pendingSecret,
+    expiresAt: now + AUTH_MEM_TTL_MS,
+  });
+}
+
+/**
+ * 清掉某用户的全部内存令牌（重置 owner 后旧 enr/mfa 不得再可用）。
+ * @param {string} userId
+ * @returns {void}
+ */
+function authMemDropUser(userId) {
+  AUTH_MEM_TOKENS.forEach(function (v, k) {
+    if (v !== null && v !== undefined && v.userId === userId) AUTH_MEM_TOKENS.delete(k);
+  });
+}
+
+/** users 行是否已启用 TOTP（totp_enabled=1 且 totp_secret 非空——双条件防"半绑定"脏行） */
+function authTotpEnabledOf(row) {
+  var rec = /** @type {Record<string, unknown>} */ (row);
+  return Number(rec['totp_enabled']) === 1 && authStr(row, 'totp_secret') !== '';
+}
+
+/**
+ * 签发 7 天会话（login / 2fa/enroll / auth/login/2fa 共用）。
+ * @param {HarnessApiLike} h
+ * @param {unknown} user users 行（id/username/role）
+ * @returns {Promise<{ token: string, expiresAt: number, user: { id: string, username: string, role: string } }>}
+ */
+async function authIssueSession(h, user) {
+  var now = Date.now();
+  var token = 'ses_' + authRandomHex(AUTH_TOKEN_BYTES);
+  // 脱敏存储：token_hash 列只存 SHA-256 hex，明文仅在本次响应返回
+  var tokenHash = String((await h.auth.hashToken(token))['hash']);
+  var expiresAt = now + AUTH_SESSION_TTL_MS;
+  var userId = authStr(user, 'id');
+  await h.db.run(
+    'INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
+    ['ssn_' + authRandomHex(12), userId, tokenHash, expiresAt, now],
+  );
+  return {
+    token: token,
+    expiresAt: expiresAt,
+    user: { id: userId, username: authStr(user, 'username'), role: authStr(user, 'role') },
+  };
+}
+
+/**
+ * 为用户生成并登记 enr 注册令牌（绑定 pending secret；10 分钟 TTL；单用途）。
+ * @param {HarnessApiLike} h
+ * @param {unknown} user users 行（id/username）
+ * @returns {Promise<string>} 'enr_<48hex>'
+ */
+async function authEnrollTokenFor(h, user) {
+  var username = authStr(user, 'username');
+  var gen = await h.auth.totpGenerate(username);
+  var token = 'enr_' + authRandomHex(AUTH_TOKEN_BYTES);
+  authMemPut('enr', token, {
+    userId: authStr(user, 'id'),
+    username: username,
+    pendingSecret: String(gen['secret']),
+  });
+  return token;
+}
+
+// ---------------------------------------------------------------------------
 // 扩展入口
 // ---------------------------------------------------------------------------
 
@@ -290,10 +410,11 @@ defineExtension(async (h, ctx) => {
     throw new TypeError('auth extension: HarnessApi.db { schema, get, run } is required; kernel sandbox is too old');
   }
   if (!h.auth || typeof h.auth.hashPassword !== 'function' || typeof h.auth.verifyPassword !== 'function' ||
-      typeof h.auth.hashToken !== 'function') {
+      typeof h.auth.hashToken !== 'function' || typeof h.auth.totpGenerate !== 'function' ||
+      typeof h.auth.totpVerify !== 'function' || typeof h.auth.verifyRootToken !== 'function') {
     throw new TypeError(
-      'auth extension: HarnessApi.auth { hashPassword, verifyPassword, hashToken } is required ' +
-        '(kernel topics auth.hashPassword / auth.verifyPassword / auth.hashToken); ' +
+      'auth extension: HarnessApi.auth { hashPassword, verifyPassword, hashToken, totpGenerate, totpVerify, verifyRootToken } is required ' +
+        '(kernel topics auth.hashPassword / auth.verifyPassword / auth.hashToken / auth.totpGenerate / auth.totpVerify / auth.verifyRootToken); ' +
         'kernel is too old — upgrade the kernel',
     );
   }
@@ -311,6 +432,8 @@ defineExtension(async (h, ctx) => {
       'username TEXT NOT NULL UNIQUE,' +
       'password_hash TEXT NOT NULL,' +
       "role TEXT NOT NULL DEFAULT 'normal' CHECK (role IN ('admin','normal'))," +
+      'totp_secret TEXT,' +
+      'totp_enabled INTEGER DEFAULT 0,' +
       'created_at INTEGER NOT NULL)',
     'CREATE TABLE IF NOT EXISTS sessions (' +
       'id TEXT PRIMARY KEY,' +
@@ -330,6 +453,20 @@ defineExtension(async (h, ctx) => {
       'created_at INTEGER NOT NULL)',
     'CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)',
   ]);
+
+  // ---- 1.4 TOTP 列迁移（强制 2FA，幂等）：旧库缺列则补齐 -------------------
+  // 强制 2FA 引入 users.totp_secret / users.totp_enabled；新库由上面的 CREATE TABLE
+  // 直接携带，旧库（本特性之前建的）按 PRAGMA table_info 检查缺列后 ALTER 补齐。
+  var userCols = await h.db.all('PRAGMA table_info(users)');
+  var userColNames = /** @type {Record<string, unknown>[]} */ (Array.isArray(userCols) ? userCols : []).map(function (r) {
+    return authStr(r, 'name');
+  });
+  if (userColNames.indexOf('totp_secret') === -1) {
+    await h.db.run('ALTER TABLE users ADD COLUMN totp_secret TEXT');
+  }
+  if (userColNames.indexOf('totp_enabled') === -1) {
+    await h.db.run('ALTER TABLE users ADD COLUMN totp_enabled INTEGER DEFAULT 0');
+  }
 
   // ---- 1.5 令牌哈希迁移（T1 升级兼容）：清除旧版明文令牌残留行 --------------
   // 旧版本把明文令牌（'ses_<48hex>' / 'ak_<48hex>'，含 's'/'k'/'_' 等非 hex 字符）
@@ -365,19 +502,14 @@ defineExtension(async (h, ctx) => {
   }
   AUTH_ROOT_TOKEN = rootToken;
 
-  // owner 引导：users 表为空且拿到 rootToken 时，创建可登录的 owner（break-glass 入口）。
-  // 只在空表时执行一次；rootToken 轮换后 owner 密码不自动跟随（用 PATCH /users/:id 改密，见 README）。
-  if (rootToken !== undefined) {
-    var countRow = await h.db.get('SELECT COUNT(*) AS n FROM users');
-    if (countRow && Number(authStr(countRow, 'n') || '0') === 0) {
-      var now = Date.now();
-      await h.db.run(
-        'INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)',
-        ['usr_' + authRandomHex(12), 'owner', String(await h.auth.hashPassword(rootToken)), 'admin', now],
-      );
-      h.log.info('auth: owner bootstrapped from root token', { username: 'owner' });
-    }
-  }
+  // owner 不再由 root 令牌自动引导（v0.2 起）：管理员账户一律通过 Web Onboarding
+  // 向导创建（/admin → /onboarding：root 令牌仅作所有权校验 + 设置账号密码 + 强制绑定 2FA）。
+  // rootToken 仍保留为 onboarding 的所有权证明与找回通道（见 POST /auth/onboarding）。
+  var hasOwner = false;
+  var countRow = await h.db.get('SELECT COUNT(*) AS n FROM users');
+  hasOwner = !!(countRow && Number(authStr(countRow, 'n') || '0') > 0);
+  h.log.info('auth: onboarding ' + (hasOwner ? 'completed' : 'pending (open /admin to initialize the admin account)'),
+    { needsOnboarding: !hasOwner });
 
   // ---- 3. 注册 AuthProvider（内核对每个受保护请求派发；激活期一次）----------
   h.authProvider(async (input) => {
@@ -394,7 +526,9 @@ defineExtension(async (h, ctx) => {
   // （userId/令牌类型），且要区分会话与 API Key，内核 AuthProxy 的二元判定不够用。
   var routeOpts = { auth: 'public' };
 
-  // POST /api/v1/auth/login — 用户名密码登录，建 7 天会话
+  // POST /api/v1/auth/login — 用户名密码登录 + 强制 2FA 分支：
+  // 已绑定 TOTP：缺码 → mfaRequired + mfaToken；带码 → 校验通过签发会话 / 错码 401。
+  // 未绑定（全员强制）：不放行会话 → enrollmentRequired + enr 注册令牌（绑定流程）。
   h.route('POST', '/auth/login', async (req) => {
     var body = authBodyOf(req.body);
     var username = typeof body['username'] === 'string' ? body['username'].trim() : '';
@@ -403,7 +537,7 @@ defineExtension(async (h, ctx) => {
       return authInvalid('username and password are required (strings)');
     }
     var user = await h.db.get(
-      'SELECT id, username, password_hash, role FROM users WHERE username = ?',
+      'SELECT id, username, password_hash, role, totp_secret, totp_enabled FROM users WHERE username = ?',
       [username],
     );
     if (!user || typeof user !== 'object') {
@@ -415,20 +549,26 @@ defineExtension(async (h, ctx) => {
     if (!ok) {
       return authUnauthorized('invalid credentials');
     }
-    var now = Date.now();
-    var token = 'ses_' + authRandomHex(AUTH_TOKEN_BYTES);
-    // 脱敏存储：token_hash 列只存 SHA-256 hex，明文仅在本次响应返回
-    var tokenHash = String((await h.auth.hashToken(token))['hash']);
-    var expiresAt = now + AUTH_SESSION_TTL_MS;
-    await h.db.run(
-      'INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
-      ['ssn_' + authRandomHex(12), authStr(user, 'id'), tokenHash, expiresAt, now],
-    );
-    return {
-      token: token,
-      expiresAt: expiresAt,
-      user: { id: authStr(user, 'id'), username: authStr(user, 'username'), role: authStr(user, 'role') },
-    };
+    if (authTotpEnabledOf(user)) {
+      var totpCode = typeof body['totp'] === 'string' ? body['totp'] : '';
+      if (totpCode === '') {
+        // 第一步通过：签发短时 mfa 令牌（续走 POST /auth/login/2fa，或带 totp 重试本接口）
+        var mfaToken = 'mfa_' + authRandomHex(AUTH_TOKEN_BYTES);
+        authMemPut('mfa', mfaToken, {
+          userId: authStr(user, 'id'),
+          username: authStr(user, 'username'),
+          pendingSecret: '',
+        });
+        return { mfaRequired: true, mfaToken: mfaToken };
+      }
+      var mfaCheck = await h.auth.totpVerify({ secret: authStr(user, 'totp_secret'), token: totpCode });
+      if (mfaCheck === null || typeof mfaCheck !== 'object' || mfaCheck['ok'] !== true) {
+        return authUnauthorized('invalid 2fa code');
+      }
+      return await authIssueSession(h, user);
+    }
+    // totp_enabled=0：强制 2FA——登录不签发会话，进入绑定流程（enr 令牌已预置 pending secret）
+    return { enrollmentRequired: true, enrollToken: await authEnrollTokenFor(h, user) };
   }, routeOpts);
 
   // POST /api/v1/auth/logout — 注销当前会话（仅会话令牌；API Key / root 令牌无会话可注销）
@@ -551,6 +691,169 @@ defineExtension(async (h, ctx) => {
     }
     await h.db.run('UPDATE api_keys SET revoked = 1 WHERE id = ?', [id]);
     return { ok: true, revoked: true };
+  }, routeOpts);
+
+  // ---- 4.5 Onboarding 引导 + 全员强制 2FA（TOTP）---------------------------
+  // 全部声明 public：门在处理器内自查（root 令牌门 / enr·mfa 内存令牌门 / 会话门），
+  // 端点契约与前端逐字对齐（见 README「Onboarding 与强制 2FA」流程图）。
+
+  // GET /api/v1/onboarding/status — 是否需要初始化引导（users 表为空 = true）
+  h.route('GET', '/auth/onboarding/status', async () => {
+    var countRow = await h.db.get('SELECT COUNT(*) AS n FROM users');
+    var n = countRow !== null && typeof countRow === 'object' ? Number(authStr(countRow, 'n') || '0') : 0;
+    return { needsOnboarding: n === 0 };
+  }, routeOpts);
+
+  // POST /api/v1/onboarding — root 令牌门：users 空 → 创建首个 admin；
+  // 非空 → 找回通道：重置 owner（密码改写、TOTP 清空、会话/API Key 全清）。
+  // 成功统一返回 enr 注册令牌（10 分钟 TTL、单用途），前端续走 2fa/setup → 2fa/enroll。
+  h.route('POST', '/auth/onboarding', async (req) => {
+    var body = authBodyOf(req.body);
+    var rootToken = typeof body['rootToken'] === 'string' ? body['rootToken'] : '';
+    // root 令牌校验走内核常数时间比较（内核 root 令牌即找回通道，不信任本 VM 内存副本）
+    var rootCheck = await h.auth.verifyRootToken(rootToken);
+    if (rootCheck === null || typeof rootCheck !== 'object' || rootCheck['ok'] !== true) {
+      return authUnauthorized('root token verification failed');
+    }
+    var password = typeof body['password'] === 'string' ? body['password'] : '';
+    if (password.length < AUTH_MIN_PASSWORD_LEN) {
+      return authInvalid('password must be a string of at least ' + AUTH_MIN_PASSWORD_LEN + ' characters');
+    }
+    var username = typeof body['username'] === 'string' ? body['username'].trim() : '';
+    if (username === '') username = 'owner';
+    if (username.length > 100) {
+      return authInvalid('username must be a string of 1-100 characters after trim');
+    }
+    var now = Date.now();
+    var countRow = await h.db.get('SELECT COUNT(*) AS n FROM users');
+    var isEmpty = countRow === null || typeof countRow !== 'object' || Number(authStr(countRow, 'n') || '0') === 0;
+    var userId;
+    if (isEmpty) {
+      // fresh onboarding：创建首个 admin（username 缺省 'owner'）
+      userId = 'usr_' + authRandomHex(12);
+      await h.db.run(
+        'INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)',
+        [userId, username, String(await h.auth.hashPassword(password)), 'admin', now],
+      );
+      h.log.info('auth: onboarding created the first admin', { username: username });
+    } else {
+      // 找回通道：固定重置 owner（忽略 username 入参），凭据全部换血
+      username = 'owner';
+      var owner = await h.db.get('SELECT id FROM users WHERE username = ?', [username]);
+      if (owner !== null && typeof owner === 'object') {
+        userId = authStr(owner, 'id');
+        await h.db.run(
+          'UPDATE users SET password_hash = ?, totp_secret = NULL, totp_enabled = 0 WHERE id = ?',
+          [String(await h.auth.hashPassword(password)), userId],
+        );
+      } else {
+        // 退化情形（owner 被删/改名）：重建 owner，保证 root 令牌永远是可用找回通道
+        userId = 'usr_' + authRandomHex(12);
+        await h.db.run(
+          'INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)',
+          [userId, username, String(await h.auth.hashPassword(password)), 'admin', now],
+        );
+      }
+      await h.db.run('DELETE FROM sessions WHERE user_id = ?', [userId]);
+      await h.db.run('DELETE FROM api_keys WHERE user_id = ?', [userId]);
+      authMemDropUser(userId);
+      h.log.info('auth: onboarding reset owner credentials (break-glass recovery)', { username: username });
+    }
+    // enr 注册令牌：绑定用户 + 预置 pending secret（GET /2fa/setup 可刷新）
+    var enrollToken = 'enr_' + authRandomHex(AUTH_TOKEN_BYTES);
+    var gen = await h.auth.totpGenerate(username);
+    authMemPut('enr', enrollToken, {
+      userId: userId,
+      username: username,
+      pendingSecret: String(gen['secret']),
+    });
+    return { enrollmentRequired: true, enrollToken: enrollToken };
+  }, routeOpts);
+
+  // GET /api/v1/2fa/setup?enrollToken=… — enr 令牌门：生成 TOTP 密钥 + otpauth URI，
+  // pending secret 暂存内存绑定 enrollToken（重复调用 = 重扫二维码，以最后一次为准）。
+  h.route('GET', '/auth/2fa/setup', async (req) => {
+    var q = req.query ? req.query : {};
+    var entry = authMemGet('enr', q['enrollToken']);
+    if (entry === null) return authUnauthorized('enrollment/mfa token expired or invalid');
+    var gen = await h.auth.totpGenerate(entry.username);
+    entry.pendingSecret = String(gen['secret']);
+    return { uri: String(gen['uri']), secret: String(gen['secret']) };
+  }, routeOpts);
+
+  // POST /api/v1/2fa/enroll — enr 令牌门：校验首枚 TOTP（对 pending secret），
+  // 通过 → 写 users.totp_secret/totp_enabled=1、enr 单次消费（成功即焚）→ 签发会话。
+  h.route('POST', '/auth/2fa/enroll', async (req) => {
+    var body = authBodyOf(req.body);
+    var enrollToken = typeof body['enrollToken'] === 'string' ? body['enrollToken'] : '';
+    var entry = authMemGet('enr', enrollToken);
+    if (entry === null) return authUnauthorized('enrollment/mfa token expired or invalid');
+    var code = typeof body['code'] === 'string' ? body['code'] : '';
+    var pending = typeof entry.pendingSecret === 'string' ? entry.pendingSecret : '';
+    if (code === '' || pending === '') {
+      return authInvalid('code is required; call GET /2fa/setup first to provision a TOTP secret');
+    }
+    var check = await h.auth.totpVerify({ secret: pending, token: code });
+    if (check === null || typeof check !== 'object' || check['ok'] !== true) {
+      return authBadRequest('invalid 2fa code');
+    }
+    var user = await h.db.get('SELECT id, username, role FROM users WHERE id = ?', [entry.userId]);
+    if (user === null || typeof user !== 'object') {
+      // 用户已被删：令牌作废（与"过期/不存在"同一形状，不泄露细节）
+      AUTH_MEM_TOKENS.delete('enr:' + enrollToken);
+      return authUnauthorized('enrollment/mfa token expired or invalid');
+    }
+    await h.db.run('UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?', [pending, entry.userId]);
+    AUTH_MEM_TOKENS.delete('enr:' + enrollToken); // 单次消费：enroll 成功即焚
+    return await authIssueSession(h, user);
+  }, routeOpts);
+
+  // POST /api/v1/auth/2fa/disable — 会话门：验密码 + 验当前 TOTP 后解绑
+  // （未绑定时幂等返回；解绑后下次登录强制重新绑定——与「强制 2FA」一致）。
+  h.route('POST', '/auth/2fa/disable', async (req) => {
+    var session = await authRequireSession(h, req);
+    if (session === null) return authUnauthorized('a session token (ses_*) is required');
+    var body = authBodyOf(req.body);
+    var password = typeof body['password'] === 'string' ? body['password'] : '';
+    var code = typeof body['code'] === 'string' ? body['code'] : '';
+    var user = await h.db.get(
+      'SELECT id, password_hash, totp_secret, totp_enabled FROM users WHERE id = ?',
+      [session.userId],
+    );
+    if (user === null || typeof user !== 'object') return authUnauthorized('session user no longer exists');
+    var pwOk = await h.auth.verifyPassword(password, authStr(user, 'password_hash'));
+    if (!pwOk) return authUnauthorized('invalid credentials');
+    if (authTotpEnabledOf(user)) {
+      var check = await h.auth.totpVerify({ secret: authStr(user, 'totp_secret'), token: code });
+      if (check === null || typeof check !== 'object' || check['ok'] !== true) {
+        return authUnauthorized('invalid 2fa code');
+      }
+      await h.db.run('UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = ?', [session.userId]);
+    }
+    return { ok: true };
+  }, routeOpts);
+
+  // POST /api/v1/auth/login/2fa — mfa 令牌门：校验 TOTP 后签发会话
+  // （与 login 带 totp 第二步等价；前端二选一调用）。
+  h.route('POST', '/auth/login/2fa', async (req) => {
+    var body = authBodyOf(req.body);
+    var mfaToken = typeof body['mfaToken'] === 'string' ? body['mfaToken'] : '';
+    var entry = authMemGet('mfa', mfaToken);
+    if (entry === null) return authUnauthorized('enrollment/mfa token expired or invalid');
+    var code = typeof body['totp'] === 'string' ? body['totp'] : '';
+    var user = await h.db.get(
+      'SELECT id, username, role, totp_secret, totp_enabled FROM users WHERE id = ?',
+      [entry.userId],
+    );
+    if (user === null || typeof user !== 'object' || !authTotpEnabledOf(user)) {
+      return authUnauthorized('enrollment/mfa token expired or invalid');
+    }
+    var check = await h.auth.totpVerify({ secret: authStr(user, 'totp_secret'), token: code });
+    if (check === null || typeof check !== 'object' || check['ok'] !== true) {
+      return authUnauthorized('invalid 2fa code');
+    }
+    AUTH_MEM_TOKENS.delete('mfa:' + mfaToken); // 单用途：成功即焚（错码保留令牌可重试，直至过期）
+    return await authIssueSession(h, user);
   }, routeOpts);
 
   // ---- 5. users 管理（/api/v1/users*，admin/root）---------------------------

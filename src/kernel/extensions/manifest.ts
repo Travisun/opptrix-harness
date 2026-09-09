@@ -9,8 +9,10 @@
  * 权限清单（白名单外的权限一律拒绝，禁止扩展自造）：
  * http / events / hooks / cron / notify:send / notify:driver / chat:write / chat:bridge /
  * files:read / files:write / tasks / sandbox / llm / storage / db / ui / auth:provider /
- * rpc:call（跨扩展 RPC 全量）或 rpc:call:<id>（定向目标扩展）/
- * net:out（泛域名出口）或 net:out:<domain>（精确域名出口）。
+ * skills（技能库读面：skills.list/get/refresh；skills.register 贡献免权限——按调用方
+ * extId 记名、禁用即摘除）/ mcp:client（扩展桥的 MCP 客户端调用：tools/resources/prompts）/
+ * plugins（插件目录读面：plugins.list）/ rpc:call（跨扩展 RPC 全量）或 rpc:call:<id>
+ * （定向目标扩展）/ net:out（泛域名出口）或 net:out:<domain>（精确域名出口）。
  */
 import { basename } from 'node:path';
 
@@ -112,6 +114,13 @@ const PERMISSION_WHITELIST: ReadonlySet<string> = new Set([
   'rpc:call',
   // auth 内置扩展专用：内核 scrypt 密码哈希 + AuthProvider 注册（auth.* topics 与 host.authVerify）
   'auth:provider',
+  // skills 技能库读面（skills.list/get/refresh；skills.register 贡献面免权限——按调用方
+  // extId 记名、扩展禁用即由内核摘除，见 core-services 桥工厂的权限闸注释）
+  'skills',
+  // 扩展桥的 MCP 客户端调用（mcp.servers.list / mcp.tools.* 桥 topics 的统一权限闸）
+  'mcp:client',
+  // 插件目录读面（plugins.list 桥 topic）
+  'plugins',
 ]);
 
 /** net:out:<domain> 的域名形状（hostname：点分字母数字连字符段，允许单段如 localhost） */

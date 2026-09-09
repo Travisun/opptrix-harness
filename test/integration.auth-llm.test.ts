@@ -3,13 +3,14 @@
  *
  * 覆盖 auth 内置扩展与 LLM Gateway 的完整接线链路：
  * - builtin 自动启用：boot 后 auth 扩展 enabled=true（manager 首次登记 builtin 行即 enabled）；
- * - rootToken 注入链：Kernel loadBootstrap（仅 builtin auth）→ worker 注入闸 → h.boot/ctx →
- *   auth 扩展 owner 引导 → POST /api/v1/auth/login（owner 密码 = rootToken）→ ses_ 会话；
+ * - owner 引导（v0.2 语义）：激活期不再自动建号——POST /api/v1/auth/onboarding
+ *   （rootToken 所有权门）创建 owner → POST /api/v1/auth/login（owner/onboarding 密码）→
+ *   强制 2FA：enrollmentRequired → /2fa/setup + /2fa/enroll（真实 otplib TOTP）→ ses_ 会话；
  * - AuthProvider 接线：ses/ak 令牌经 authChecker → AuthProviderRegistry → host.authVerify
  *   → worker 校验（核心断言：GET /api/v1/system/info 用 ses 令牌 200）；
  * - mount 路由：auth 扩展声明的 '/auth/*'、'/users*' 挂载到 /api/v1 前缀；
- * - break-glass：disable auth 后 rootToken 直连仍可用（authChecker root 分支），
- *   re-enable 后 login 恢复；
+ * - 核心内置扩展保护（HARNESS-1007 core-builtin）：builtin auth disable/uninstall → 403；
+ *   root 令牌直连（authChecker root 分支）在 auth 启用时同样 200；
  * - LLM 全链路穿透：PUT /api/v1/llm/providers（apiKey 明文 → secrets）→ settings →
  *   LlmGateway → openai-chat adapter → 本地 mock OpenAI server → POST /chat 200；
  * - doc-demo：h.expose('parse') 服务 + 路由（files API 上传真文件 → /ext/doc-demo/parse）；
@@ -31,13 +32,17 @@ import type { FastifyInstance } from 'fastify';
 
 import { CONTAINER_KEYS, Kernel } from '../src/kernel/Kernel.js';
 import { loadConfig } from '../src/kernel/config/index.js';
+// 强制 2FA E2E：enroll 码用 otplib 按 setup 返回的真 secret 现算（内核 totpVerify 同库校验）
+import { generate as totpGenerateCode } from 'otplib';
 
 // ---------------------------------------------------------------------------
 // 环境：真实 Kernel（临时 dataDir、端口 0、静音日志、dev worker、固定 rootToken）
 // ---------------------------------------------------------------------------
 
-/** 固定 rootToken（≥32 字符；owner 引导密码 + break-glass 直连） */
+/** 固定 rootToken（≥32 字符；onboarding 所有权门 + root 直连 + break-glass 找回通道） */
 const ROOT_TOKEN = 'e2e-root-token-0000000000000000000000000000000000000000000000000000';
+/** owner 账号密码（v0.2 语义：owner 一律经 POST /auth/onboarding 创建，root 令牌不再是登录密码） */
+const OWNER_PASSWORD = 'owner-pass-8';
 /** mock OpenAI 供应商的模型名与明文 apiKey（PUT providers 携带 → secrets 转存） */
 const MODEL = 'e2e-mock-model';
 const API_KEY = 'sk-e2e-plain-key';
@@ -57,6 +62,62 @@ const mockSeen: { authz: Array<string | undefined>; bodies: unknown[] } = { auth
 let ownerSes = '';
 let akToken = '';
 let bobSes = '';
+/** owner enrollment 时的 TOTP secret（re-enable 用例走"login 带 totp 直登"分支复用） */
+let ownerTotpSecret = '';
+
+/**
+ * owner 引导（v0.2 语义，boot 后登录前必须先执行）：
+ * POST /api/v1/auth/onboarding（root 令牌所有权门）——users 空表 → fresh 创建首个 admin。
+ * 激活期不再自动建号（needsOnboarding=users 空表），owner 不存在时 login 一律 401。
+ */
+async function onboardOwner(): Promise<void> {
+  const status = await app.inject({ method: 'GET', url: '/api/v1/auth/onboarding/status' });
+  expect(status.statusCode).toBe(200);
+  expect((status.json() as { needsOnboarding: boolean }).needsOnboarding).toBe(true); // users 空表
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/onboarding',
+    payload: { rootToken: ROOT_TOKEN, password: OWNER_PASSWORD },
+  });
+  expect(res.statusCode).toBe(200);
+  expect(res.json()).toMatchObject({ enrollmentRequired: true }); // 返回 enr 注册令牌，续走 2FA 绑定
+}
+
+/**
+ * 强制 2FA enrollment 全链（真实内核 totpGenerate/totpVerify）：
+ * login → enrollmentRequired → GET /api/v1/auth/2fa/setup → otplib 现算码 → POST /api/v1/auth/2fa/enroll → 会话。
+ * 注：/2fa/* 未加入内核 auth-mount 前缀（auth→/api/v1/auth|users），此处走 /ext/{id}/* 通配派发；
+ * mount 前缀接线属内核集成工作包（见 extensions/auth/README.md「集成对齐点」）。
+ */
+async function enrollLogin(username: string, password: string): Promise<{
+  token: string;
+  user: { username: string; role: string };
+  secret: string;
+}> {
+  const first = await app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/login',
+    payload: { username, password },
+  });
+  expect(first.statusCode).toBe(200);
+  const step1 = first.json() as { enrollmentRequired?: boolean; enrollToken?: string; token?: string };
+  expect(step1.enrollmentRequired).toBe(true);
+  expect(step1.token).toBeUndefined(); // 强制 2FA：未绑定不放行会话
+
+  const setup = await app.inject({ method: 'GET', url: `/api/v1/auth/2fa/setup?enrollToken=${step1.enrollToken}` });
+  expect(setup.statusCode).toBe(200);
+  const { secret } = setup.json() as { uri: string; secret: string };
+
+  const enroll = await app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/2fa/enroll',
+    payload: { enrollToken: step1.enrollToken, code: await totpGenerateCode({ secret }) },
+  });
+  expect(enroll.statusCode).toBe(200);
+  const body = enroll.json() as { token: string; user: { username: string; role: string } };
+  return { ...body, secret };
+}
 
 beforeAll(async () => {
   dataDir = await mkdtemp(path.join(tmpdir(), 'opptrix-auth-llm-'));
@@ -166,17 +227,13 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(authExt?.mount).toBe('auth');
   });
 
-  it('POST /api/v1/auth/login owner/rootToken → 200 ses_ 令牌（rootToken 注入 → owner 引导生效）', async () => {
-    const res = await app.inject({
-      method: 'POST',
-      url: '/api/v1/auth/login',
-      payload: { username: 'owner', password: ROOT_TOKEN },
-    });
-    expect(res.statusCode).toBe(200);
-    const body = res.json() as { token: string; user: { username: string; role: string } };
+  it('onboarding 创建 owner → login 强制 2FA enrollment → ses_ 令牌（v0.2：激活不自动建号，owner 经 onboarding 门创建）', async () => {
+    await onboardOwner(); // boot 后第一步：root 令牌门建号（否则 owner 不存在 → login 401）
+    const body = await enrollLogin('owner', OWNER_PASSWORD);
     expect(body.token).toMatch(/^ses_[0-9a-f]{48}$/);
     expect(body.user).toMatchObject({ username: 'owner', role: 'admin' });
     ownerSes = body.token;
+    ownerTotpSecret = body.secret;
   });
 
   it('GET /api/v1/auth/me（ses ?token=）→ owner/admin/session（SEC-7：auth mount 派发裁剪 authorization，凭据走 query 通道）', async () => {
@@ -218,7 +275,7 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(res.json()).toMatchObject({ code: 'HARNESS-1006' });
   });
 
-  it('bob（normal）：admin 建号 → login → PUT /api/v1/llm/providers → 403', async () => {
+  it('bob（normal）：admin 建号 → login（强制 2FA 同样 enrollment）→ PUT /api/v1/llm/providers → 403', async () => {
     const created = await app.inject({
       method: 'POST',
       url: `/api/v1/users?token=${ownerSes}`,
@@ -227,13 +284,8 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(created.statusCode).toBe(200);
     expect(created.json()).toMatchObject({ username: 'bob', role: 'normal' });
 
-    const login = await app.inject({
-      method: 'POST',
-      url: '/api/v1/auth/login',
-      payload: { username: 'bob', password: 'bob-pass-8' },
-    });
-    expect(login.statusCode).toBe(200);
-    bobSes = (login.json() as { token: string }).token;
+    const body = await enrollLogin('bob', 'bob-pass-8'); // 强制 2FA 对 normal 用户一视同仁
+    bobSes = body.token;
 
     const put = await app.inject({
       method: 'PUT',
@@ -327,47 +379,63 @@ describe('阶段 10 总装配 E2E：auth 内置扩展 + LLM Gateway', () => {
     expect(parsed.json()).toEqual({ fileId, lines: 2, words: 4, chars: text.length });
   });
 
-  it('disable auth → /api/v1/auth/me 503（路由墓碑）；system/info 用 ses → 401（provider 已注销）', async () => {
+  it('核心内置扩展保护：disable/uninstall auth → 403 HARNESS-1007 core-builtin；auth 路由与 provider 不受影响', async () => {
+    // HARNESS-1007：builtin===true 的核心扩展不可停用（停用 auth = 全员 401，恢复只能改库）
     const off = await app.inject({
       method: 'POST',
       url: '/api/v1/extensions/auth/disable',
       headers: { authorization: `Bearer ${ROOT_TOKEN}` },
     });
-    expect(off.statusCode).toBe(200);
+    expect(off.statusCode).toBe(403);
+    expect(off.json()).toMatchObject({ code: 'HARNESS-1007', detail: { reason: 'core-builtin' } });
 
-    // auth 路由已摘表：503 SERVICE_UNAVAILABLE（与 /ext/* 禁用墓碑语义一致）
-    const me = await app.inject({ method: 'GET', url: '/api/v1/auth/me', headers: { authorization: `Bearer ${ownerSes}` } });
-    expect(me.statusCode).toBe(503);
+    // 卸载同受保护（核心扩展锁定，防"先卸载再绕过"）
+    const gone = await app.inject({
+      method: 'POST',
+      url: '/api/v1/extensions/auth/uninstall',
+      headers: { authorization: `Bearer ${ROOT_TOKEN}` },
+    });
+    expect(gone.statusCode).toBe(403);
+    expect(gone.json()).toMatchObject({ code: 'HARNESS-1007', detail: { reason: 'core-builtin' } });
 
-    // worker 已卸载 + provider 已注销：ses 令牌在内核受保护 API 上不再被认可
+    // 保护生效：auth 路由仍在表、provider 仍校验（与 disable 后的 503 墓碑/401 语义相区分）
+    const me = await app.inject({ method: 'GET', url: `/api/v1/auth/me?token=${ownerSes}` });
+    expect(me.statusCode).toBe(200);
     const info = await app.inject({ method: 'GET', url: '/api/v1/system/info', headers: { authorization: `Bearer ${ownerSes}` } });
-    expect(info.statusCode).toBe(401);
-    const infoAk = await app.inject({ method: 'GET', url: '/api/v1/system/info', headers: { authorization: `Bearer ${akToken}` } });
-    expect(infoAk.statusCode).toBe(401);
+    expect(info.statusCode).toBe(200);
+    const list = await app.inject({ method: 'GET', url: '/api/v1/extensions', headers: { authorization: `Bearer ${ROOT_TOKEN}` } });
+    expect((list.json() as Array<{ id: string; enabled: boolean }>).find((s) => s.id === 'auth')?.enabled).toBe(true);
   });
 
-  it('break-glass：disable auth 后 system/info 用 rootToken 仍 200（authChecker root 直连）', async () => {
+  it('root 令牌直连：auth 启用状态下 system/info 用 rootToken 仍 200（authChecker root 分支不依赖会话）', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/system/info', headers: { authorization: `Bearer ${ROOT_TOKEN}` } });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ name: 'opptrix-harness' });
   });
 
-  it('re-enable auth → login 又可用（新会话生效，路由恢复）', async () => {
-    const on = await app.inject({
+  it('owner 已绑 2FA：login 不带码 → mfaRequired；带 totp 现算 → 直登新会话（强制 2FA 直登分支）', async () => {
+    // owner 已绑定 TOTP（enrollment 时绑定）：不带码不放行会话
+    const noTotp = await app.inject({
       method: 'POST',
-      url: '/api/v1/extensions/auth/enable',
-      headers: { authorization: `Bearer ${ROOT_TOKEN}` },
+      url: '/api/v1/auth/login',
+      payload: { username: 'owner', password: OWNER_PASSWORD },
     });
-    expect(on.statusCode).toBe(200);
+    expect(noTotp.statusCode).toBe(200);
+    expect(noTotp.json()).toMatchObject({ mfaRequired: true });
 
     const login = await app.inject({
       method: 'POST',
       url: '/api/v1/auth/login',
-      payload: { username: 'owner', password: ROOT_TOKEN },
+      payload: {
+        username: 'owner',
+        password: OWNER_PASSWORD,
+        totp: await totpGenerateCode({ secret: ownerTotpSecret }),
+      },
     });
     expect(login.statusCode).toBe(200);
     expect((login.json() as { token: string }).token).toMatch(/^ses_[0-9a-f]{48}$/);
 
+    // 原会话不受新登录影响（多端并存）
     const me = await app.inject({ method: 'GET', url: `/api/v1/auth/me?token=${ownerSes}` });
     expect(me.statusCode).toBe(200);
   });

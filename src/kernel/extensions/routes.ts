@@ -103,6 +103,8 @@ export interface ExtRoutesDeps {
   maxConcurrentPerExt: number;
   /** ExtensionManager 的启用位：false 表示扩展已被禁用（即使路由表仍在）→ 503 */
   isExtEnabled(extId: string): boolean;
+  /** 该扩展是否属于内置池（受信第一方）：决定是否保留 authorization 头 */
+  isBuiltinExt?: (extId: string) => boolean;
   counters?: ExtRouteCounters;
   /** 可选 warn 日志（drain 超时等异常路径）；未注入时以 counters 替代 */
   logger?: ExtRouteLogger;
@@ -128,6 +130,7 @@ const EXT_HEADER_ALLOWLIST: ReadonlySet<string> = new Set([
   'user-agent',
   'accept',
   'x-requested-with',
+  'authorization',
   'x-harness-signature',
   'x-harness-timestamp',
 ]);
@@ -138,10 +141,19 @@ const EXT_HEADER_ALLOWLIST: ReadonlySet<string> = new Set([
  */
 export function sanitizeExtHeaders(
   headers: Record<string, string | string[] | undefined>,
+  opts?: { keepAuthorization?: boolean },
 ): Record<string, string | string[] | undefined> {
+  // 安全默认：authorization 一律剥离（防调用方令牌被扩展代码收割）；
+  // 仅受信第一方（内置池，如 auth 扩展自身）由调用方显式 keepAuthorization 放行
+  const keepAuth = opts?.keepAuthorization === true;
   const out: Record<string, string | string[] | undefined> = {};
   for (const [name, value] of Object.entries(headers)) {
-    if (EXT_HEADER_ALLOWLIST.has(name.toLowerCase())) out[name] = value;
+    const lower = name.toLowerCase();
+    if (lower === 'authorization') {
+      if (keepAuth) out[name] = value;
+      continue;
+    }
+    if (EXT_HEADER_ALLOWLIST.has(lower)) out[name] = value;
   }
   return out;
 }
@@ -258,6 +270,7 @@ function rawBodyOf(request: FastifyRequest): string | undefined {
 function buildDispatchRequest(
   request: FastifyRequest,
   params: Record<string, string>,
+  keepAuthorizationOpt?: boolean,
 ): ExtDispatchRequest {
   const method = request.method;
   let body: unknown = null;
@@ -273,7 +286,11 @@ function buildDispatchRequest(
     params,
     query: (request.query ?? {}) as Record<string, unknown>,
     // SEC-7：白名单裁剪（authorization/cookie 等凭据头不下发给扩展）
-    headers: sanitizeExtHeaders(request.headers as Record<string, string | string[] | undefined>),
+    headers: sanitizeExtHeaders(request.headers as Record<string, string | string[] | undefined>, {
+      // 内置池（受信第一方，如 auth）保留 authorization 以支持标准 Bearer；
+      // 社区池剥离——防止调用方令牌被第三方扩展代码收割（stripAuthorization 由调用方按池决定）
+      keepAuthorization: keepAuthorizationOpt === true,
+    }),
     body,
     ...(rawBody !== undefined ? { rawBody } : {}),
     requestId: String(request.id),
@@ -440,7 +457,7 @@ export class ExtRouteRegistry {
       }
 
       // ④ body/rawBody（见 buildDispatchRequest）
-      const dispatchRequest = buildDispatchRequest(request, matched.params);
+      const dispatchRequest = buildDispatchRequest(request, matched.params, this.deps.isBuiltinExt?.(extId) === true);
       const timeoutMs = entry.timeoutMs ?? this.deps.defaultTimeoutMs;
 
       // ⑤ dispatch（超时 → HANDLER_TIMEOUT）；extId 随行供集成方消歧跨扩展同名路由

@@ -4,15 +4,18 @@
  * - GET  /api/v1/system/info    内核运行时信息（含 counters 快照）
  * - GET  /api/v1/system/doctor  环境体检（doctor.runDoctor）
  * - POST /api/v1/system/backup  数据库备份（未注入 runDbBackup 时 501 NOT_IMPLEMENTED）
+ * - GET  /api/v1/system/logs    内核日志查询（admin；未注入 logs 时 501 NOT_IMPLEMENTED）
  * - GET  /api/v1/system/openapi OpenAPI 文档位置（指向 /api/v1/openapi.json）
  *
  * 约定：
  * - 全部路由前置统一鉴权（Authorization: Bearer 或 ?token=，由 extractToken 提取，
  *   checker 校验失败抛 HarnessError UNAUTHORIZED → 401 HARNESS-1006）；
  * - 计数：onResponse 钩子内对 /api/v1 前缀请求 inc('api.requests', { route })；
- * - 这些路由不接收外部 body/query 业务入参，无需 zod schema（token 提取本身已做类型收窄）。
+ * - 这些路由本身不接收外部 body 业务入参；唯一例外是 logs 的 query（zod 校验，
+ *   失败 → 400 HARNESS-1009），其余路由 token 提取已做类型收窄、无业务入参。
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { z } from 'zod';
 
 import { extractToken } from '../kernel/auth/authProxy.js';
 import type { AuthIdentity, AuthVerifyInput } from '../kernel/auth/types.js';
@@ -37,6 +40,29 @@ export interface BackupInfo {
   createdAt: string;
 }
 
+/** GET /api/v1/system/logs 单行日志（logs 表视图；data 已由接线方 JSON.parse，损坏 → null） */
+export interface SystemLogEntry {
+  /** UTC epoch ms */
+  ts: number;
+  /** pino 级别名（info/warn/error/…） */
+  level: string;
+  /** 日志 scope（缺省 ''） */
+  scope: string;
+  /** 日志消息 */
+  message: string;
+  /** 附加字段（结构化 JSON；损坏或无附加字段为 null） */
+  data: unknown;
+}
+
+/** 可选的日志查询器（由内核 SQLite 日志汇接线；未注入时 logs 端点返回 501） */
+export interface SystemLogSource {
+  /**
+   * 按条件查询日志行。倒序（最新在前）由接线方保证；
+   * level 缺省 = 不过滤级别；limit 已由路由 zod 收窄到 1..1000。
+   */
+  list(opts: { level?: string; limit: number }): Promise<SystemLogEntry[]>;
+}
+
 /** registerSystemRoutes 依赖集合 */
 export interface SystemRoutesDeps {
   config: HarnessConfig;
@@ -46,7 +72,15 @@ export interface SystemRoutesDeps {
   counters: Counters;
   /** 可选的数据库备份执行器 */
   runDbBackup?: RunDbBackup;
+  /** 可选的日志查询器（内核 SQLite 日志汇；未注入时 logs 端点 501） */
+  logs?: SystemLogSource;
 }
+
+/** GET /api/v1/system/logs 的 query schema（limit 1..1000 缺省 200；level 可选 pino 级别名） */
+const logsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(1000).default(200),
+  level: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).optional(),
+});
 
 /**
  * 向 Fastify 实例注册系统 API 路由与请求计数钩子。
@@ -109,6 +143,33 @@ export function registerSystemRoutes(app: FastifyInstance, deps: SystemRoutesDep
     const { path, sizeBytes } = await deps.runDbBackup(config);
     const info: BackupInfo = { path, sizeBytes, createdAt: new Date().toISOString() };
     return info;
+  });
+
+  app.get('/api/v1/system/logs', { schema: { tags: ['system'] } }, async (request) => {
+    const identity = await authenticate(request);
+    // 日志可能泄露内部实现细节——与 backup 同款 admin 门禁（root 放行）
+    if (identity.role !== 'root' && identity.role !== 'admin') {
+      throw err('FORBIDDEN', {
+        message: 'system logs require role admin or root',
+        detail: { role: identity.role },
+      });
+    }
+    const parsed = logsQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      throw err('VALIDATION_FAILED', { detail: parsed.error.issues });
+    }
+    if (deps.logs === undefined) {
+      throw err('NOT_IMPLEMENTED', {
+        detail:
+          'system logs are not wired into this kernel (no log source registered) — ' +
+          'provide deps.logs when registering system routes to enable this endpoint',
+      });
+    }
+    const items = await deps.logs.list({
+      limit: parsed.data.limit,
+      ...(parsed.data.level !== undefined ? { level: parsed.data.level } : {}),
+    });
+    return { items };
   });
 
   app.get('/api/v1/system/openapi', { schema: { tags: ['system'] } }, async (request) => {

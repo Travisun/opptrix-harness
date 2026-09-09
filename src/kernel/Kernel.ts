@@ -54,7 +54,7 @@ import { createCoreServices, type CoreServices } from './providers/core-services
 import { ExtensionManager, type ExtRouteTableEntry } from './extensions/manager.js';
 import { ExtRouteRegistry, sanitizeExtHeaders, type ExtDispatchResult } from './extensions/routes.js';
 import { ExtensionServiceRegistry } from './extensions/registry.js';
-import { createKernelHandlers, type AuthProviderRegistration } from './extensions/kernel-handlers.js';
+import { createKernelHandlers, type AuthProviderRegistration, type KernelBridgeHandlers } from './extensions/kernel-handlers.js';
 import { UiRegistry } from './extensions/ui-registry.js';
 import { registerExtensionRoutes, type ExtensionsApiDeps } from '../api/extensions.js';
 import { registerExtAssets, type ExtAssetDir } from './extensions/assets.js';
@@ -111,6 +111,17 @@ export const CONTAINER_KEYS = {
   // ---- 升级与沙箱（阶段 11 总装配登记，见 #runBoot 的接线段）----
   /** SandboxManager（Docker 工作区沙箱编排；kernel-handlers 的 sandbox.exec 懒解析此键） */
   sandbox: 'sandbox',
+  // ---- Skills / MCP / 插件（OS 能力目录，createCoreServices 总装配登记）----
+  /** SkillRegistry（技能目录事实聚合读模型；REST /api/v1/skills 与扩展桥 skills.* 共用） */
+  skillsRegistry: 'skills.registry',
+  /** McpConfigStore（<dataDir>/mcp/config.json 原子持久化） */
+  mcpConfig: 'mcp.config',
+  /** McpRegistry（MCP Host/Client 连接编排；REST /api/v1/mcp/* 与扩展桥 mcp.* 共用） */
+  mcpRegistry: 'mcp.registry',
+  /** PluginRegistry（插件包发现/聚合/贡献注入；REST /api/v1/plugins* 与扩展桥 plugins.* 共用） */
+  pluginsRegistry: 'plugins.registry',
+  /** skills/mcp/plugins 三桥 handler 并表（createKernelHandlers 的 extraBridges 懒解析源） */
+  extBridges: 'ext.bridges',
   // ---- 扩展子系统（阶段 9 总装配登记，见 #runBoot 的扩展接线段）----
   /** ExtensionManager（扩展生命周期编排/自愈） */
   extManager: 'ext.manager',
@@ -529,8 +540,25 @@ export class Kernel {
         },
       };
 
-      // worker→kernel 的内核服务实现表（KERNEL_TOPICS 的落点；经桥透传）
-      const bridgeHandlers = createKernelHandlers({ kernel: this, auth: authProviderCallbacks });
+      // worker→kernel 的内核服务实现表（KERNEL_TOPICS 的落点；经桥透传）。
+      // extraBridges 用懒代理：skills/mcp/plugins 三桥的并表由 createCoreServices 登记
+      // 容器 'ext.bridges'，属性取值时才 resolve（与 kernel-handlers 的 llmGateway 懒
+      // 解析同款模式——装配顺序变化或裸装配缺桥时都不会炸）。
+      const extraBridgesProxy: KernelBridgeHandlers = new Proxy(
+        {},
+        {
+          get: (_target, prop) => {
+            if (typeof prop !== 'string') return undefined;
+            if (!this.container.has(CONTAINER_KEYS.extBridges)) return undefined;
+            return this.container.resolve<KernelBridgeHandlers>(CONTAINER_KEYS.extBridges)[prop];
+          },
+        },
+      );
+      const bridgeHandlers = createKernelHandlers({
+        kernel: this,
+        auth: authProviderCallbacks,
+        extraBridges: extraBridgesProxy,
+      });
 
       const extSvcRegistry = new ExtensionServiceRegistry({
         dispatcher: {
@@ -606,6 +634,14 @@ export class Kernel {
         onServicesChanged: (extId, services) => {
           if (services === null) {
             extSvcRegistry.suspend(extId);
+            // skills 贡献生命周期联动：扩展禁用/崩溃本地摘除时，同步摘除其经
+            // skills.register 贡献的技能（幂等；未贡献过的 extId 静默）。容器键由
+            // createCoreServices 登记——裸装配缺该服务时跳过，不阻断 disable 流程。
+            if (this.container.has(CONTAINER_KEYS.skillsRegistry)) {
+              this.container
+                .resolve<{ removeContributed(extId: string): void }>(CONTAINER_KEYS.skillsRegistry)
+                .removeContributed(extId);
+            }
             return;
           }
           extSvcRegistry.register(extId, services);
@@ -704,6 +740,40 @@ export class Kernel {
             checker: authChecker,
             counters,
             runDbBackup: (cfg) => createBackup(cfg, db),
+            // GET /api/v1/system/logs — SQLite 日志汇查询（logs 表倒序；data 损坏 JSON → null）
+            logs: {
+              list: async (opts) => {
+                const base = db('logs');
+                const filtered = opts.level !== undefined ? base.where('level', opts.level) : base;
+                const rows = (await filtered
+                  .select('ts', 'level', 'scope', 'message', 'data')
+                  .orderBy('id', 'desc')
+                  .limit(opts.limit)) as Array<{
+                  ts: number;
+                  level: string;
+                  scope: string | null;
+                  message: string;
+                  data: string | null;
+                }>;
+                return rows.map((row) => {
+                  let data: unknown = null;
+                  if (typeof row.data === 'string' && row.data !== '') {
+                    try {
+                      data = JSON.parse(row.data);
+                    } catch {
+                      data = null; // 损坏行不拖垮整个列表
+                    }
+                  }
+                  return {
+                    ts: Number(row.ts),
+                    level: String(row.level),
+                    scope: row.scope == null ? '' : String(row.scope),
+                    message: row.message == null ? '' : String(row.message),
+                    data,
+                  };
+                });
+              },
+            },
           });
           registerCronRoutes(extra, {
             checker: authChecker,
@@ -764,6 +834,8 @@ export class Kernel {
             },
             defaultTimeoutMs: this.config.routeTimeoutMs,
             maxConcurrentPerExt: this.config.maxConcurrentPerExt,
+            isBuiltinExt: (extId) =>
+              extManager.list().find((x) => x.id === extId)?.host === 'builtin',
             isExtEnabled: (extId) => extManager?.list().some((s) => s.id === extId && s.enabled) === true,
             counters,
             logger: { warn: (msg, obj) => this.logger.warn(obj ?? {}, msg) },
@@ -852,7 +924,10 @@ export class Kernel {
                 method: request.method,
                 params,
                 query: (request.query ?? {}) as Record<string, unknown>,
-                headers: sanitizeExtHeaders(request.headers as Record<string, string | string[] | undefined>),
+                headers: sanitizeExtHeaders(request.headers as Record<string, string | string[] | undefined>, {
+                  // auth 为受信第一方：保留 authorization（标准 Bearer 凭据通道）
+                  keepAuthorization: true,
+                }),
                 body:
                   method === 'POST' || method === 'PUT' || method === 'PATCH'
                     ? (request.body ?? null)

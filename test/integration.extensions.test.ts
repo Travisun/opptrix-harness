@@ -107,8 +107,8 @@ describe('扩展子系统总装配 E2E', () => {
     const routes = res.json() as Array<{ extId: string }>;
     expect(routes.some((r) => r.extId === 'hello-world')).toBe(false);
     expect(routes.some((r) => r.extId === TMP_EXT_ID)).toBe(false);
-    // 阶段 10：builtin auth 默认启用，其 11 条路由在表
-    expect(routes.filter((r) => r.extId === 'auth')).toHaveLength(11);
+    // 阶段 10：builtin auth 默认启用，其 17 条路由在表（11 基础 + 6 onboarding/2FA）
+    expect(routes.filter((r) => r.extId === 'auth')).toHaveLength(17);
   });
 
   it('GET /api/v1/extensions/:id 返回单个扩展详情（含 manifest）', async () => {

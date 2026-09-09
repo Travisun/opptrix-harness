@@ -468,6 +468,12 @@ export interface HarnessApi {
     hashToken(value: string): Promise<{ hash: string }>;
     /** 校验明文密码与 hash；hash 格式非法/参数越界一律 false（不抛） */
     verifyPassword(password: string, hash: string): Promise<boolean>;
+    /** 生成 TOTP 密钥：account 进 otpauth URI label（`otpauth://totp/Opptrix%20Harness:<account>`） */
+    totpGenerate(account: string): Promise<{ secret: string; uri: string }>;
+    /** 校验 TOTP 令牌（window ±1）；格式非法一律 ok:false（不抛） */
+    totpVerify(input: { secret: string; token: string }): Promise<{ ok: boolean; delta: number | null }>;
+    /** 常数时间校验内核 root 令牌（break-glass；令牌本身从不落库） */
+    verifyRootToken(token: string): Promise<{ ok: boolean }>;
   };
   /** 调用其他扩展暴露的服务（内核 broker 中转，topic 'host.call'） */
   call(targetExtId: string, method: string, args?: unknown): Promise<unknown>;
@@ -779,6 +785,35 @@ export function createHarnessApi(opts: HarnessApiOptions): HarnessApi {
       }
       return reply as { hash: string };
     },
+    totpGenerate: async (account: string): Promise<{ secret: string; uri: string }> => {
+      const reply = (await callKernel(KERNEL_TOPICS.authTotpGenerate, { account })) as {
+        secret?: unknown;
+        uri?: unknown;
+      } | null;
+      if (reply === null || typeof reply !== 'object' || typeof reply['secret'] !== 'string' || typeof reply['uri'] !== 'string') {
+        throw new TypeError('auth.totpGenerate: kernel reply is missing the "secret"/"uri" strings');
+      }
+      return { secret: reply['secret'], uri: reply['uri'] };
+    },
+    totpVerify: async (input: { secret: string; token: string }): Promise<{ ok: boolean; delta: number | null }> => {
+      const reply = (await callKernel(KERNEL_TOPICS.authTotpVerify, input)) as {
+        ok?: unknown;
+        delta?: unknown;
+      } | null;
+      if (reply === null || typeof reply !== 'object' || typeof reply['ok'] !== 'boolean') {
+        throw new TypeError('auth.totpVerify: kernel reply is missing the "ok" boolean');
+      }
+      return { ok: reply['ok'], delta: typeof reply['delta'] === 'number' ? (reply['delta'] as number) : null };
+    },
+    verifyRootToken: async (token: string): Promise<{ ok: boolean }> => {
+      const reply = (await callKernel(KERNEL_TOPICS.authVerifyRootToken, { token })) as {
+        ok?: unknown;
+      } | null;
+      if (reply === null || typeof reply !== 'object' || typeof reply['ok'] !== 'boolean') {
+        throw new TypeError('auth.verifyRootToken: kernel reply is missing the "ok" boolean');
+      }
+      return reply as { ok: boolean };
+    },
   });
 
   const http = Object.freeze({
@@ -1016,6 +1051,9 @@ export function exposeHarnessApiInVm(api: HarnessApi, bridge: RealmBridge): unkn
       hashPassword: asyncFn((password: string) => api.auth.hashPassword(password)),
       verifyPassword: asyncFn((password: string, hash: string) => api.auth.verifyPassword(password, hash)),
       hashToken: asyncFn((value: string) => api.auth.hashToken(value)),
+      totpGenerate: asyncFn((account: string) => api.auth.totpGenerate(account)),
+      totpVerify: asyncFn((input: { secret: string; token: string }) => api.auth.totpVerify(input)),
+      verifyRootToken: asyncFn((token: string) => api.auth.verifyRootToken(token)),
     }),
     call: asyncFn((targetExtId: string, method: string, args?: unknown) => api.call(targetExtId, method, args)),
     // ---- 注册类 API（宿主侧捕获 VM 函数进 collector）----

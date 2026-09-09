@@ -8,7 +8,7 @@
  * （new Kernel() 构造阶段抛错，pino 实例还不存在）时的最后输出通道；
  * Kernel 构造完成之后一律使用 kernel logger（pino），见 logError()。
  */
-import { Kernel } from './kernel/Kernel.js';
+import { CONTAINER_KEYS, Kernel } from './kernel/Kernel.js';
 import { loadDotenv } from './kernel/config/index.js';
 
 /** 仅限 logger 未就绪期的兜底输出（见文件头注释的唯一例外说明） */
@@ -68,6 +68,39 @@ async function main(): Promise<void> {
     logError('kernel boot failed', e);
     process.exit(1);
   }
+  printWelcomeBanner(kernel);
+}
+
+/** 首启人读横幅：管理台地址 / 账号 / 凭据位置（人类可读，不经 pino JSON） */
+function printWelcomeBanner(kernel: Kernel): void {
+  const config = kernel.getConfig();
+  const auth = kernel.container.has(CONTAINER_KEYS.authIdentity)
+    ? (kernel.container.resolve<import('./kernel/auth/types.js').AuthIdentity>(CONTAINER_KEYS.authIdentity) as unknown as {
+        token: string;
+        source: string;
+      })
+    : null;
+  const host = config.host === '0.0.0.0' || config.host === '::' ? 'localhost' : config.host;
+  const line = '─'.repeat(64);
+  const credLine =
+    auth?.source === 'env'
+      ? `  密码     HARNESS_TOKEN 环境变量值（自定义 root 令牌）`
+      : `  初始密码  文件 ${config.dataDir}/root-token 的内容（cat 即可查看）`;
+  const out = [
+    '',
+    line,
+    `  ✅ Opptrix Harness OS 已就绪（${config.env}）`,
+    line,
+    `  管理台   http://${host}:${config.port}/admin`,
+    `  账号     owner`,
+    credLine,
+    `  API      http://${host}:${config.port}/api/v1 （Bearer ${config.dataDir}/root-token 内容）`,
+    `  数据目录  ${config.dataDir}`,
+    line,
+    '',
+  ].join('\n');
+  // 面向运维的人类可读输出：pino JSON 对首启指引不友好（文档化例外，同 fallbackError）
+  process.stdout.write(out + '\n');
 }
 
 main().catch((e) => {

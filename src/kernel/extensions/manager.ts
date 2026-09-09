@@ -94,6 +94,8 @@ export interface ExtSummary {
   dir?: string;
   /** 所在池滑动窗口内的 worker 崩溃次数（池级，非单扩展） */
   crashCount: number;
+  /** 第三方扩展人工授信时间（epoch ms）；受信第一方恒为 null */
+  trustedAt?: number | null;
   lastError: string | null;
 }
 
@@ -613,6 +615,15 @@ export class ExtensionManager {
 
   /** 停用扩展（逆序摘除 → host.unload → enabled=0）。未激活时幂等 no-op。 */
   async disable(id: string): Promise<void> {
+    // 核心内置扩展保护：auth/webui 等随镜像交付的第一方扩展不可停用/卸载
+    // （停用 auth = 全员 401、停用 webui = 管理台消失；恢复只能进数据目录改库）
+    const summary = this.list().find((x) => x.id === id);
+    if (summary?.builtin === true) {
+      throw err('FORBIDDEN', {
+        message: `builtin extension "${id}" cannot be disabled (core extensions are locked)`,
+        detail: { id, reason: 'core-builtin' },
+      });
+    }
     return this.#withLock(id, () => this.#disableLocked(id));
   }
 
@@ -638,6 +649,13 @@ export class ExtensionManager {
    * <dataDir>/extensions/<id>/（仓库内置扩展目录不受影响）；keep（默认）保留全部文件。
    */
   async uninstall(id: string, opts?: { purge?: boolean }): Promise<void> {
+    const summary = this.list().find((x) => x.id === id);
+    if (summary?.builtin === true) {
+      throw err('FORBIDDEN', {
+        message: `builtin extension "${id}" cannot be uninstalled (core extensions are locked)`,
+        detail: { id, reason: 'core-builtin' },
+      });
+    }
     return this.#withLock(id, async () => {
       try {
         await this.#disableLocked(id);
