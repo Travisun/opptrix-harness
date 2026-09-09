@@ -1058,6 +1058,19 @@ export class Kernel {
         }
         if (assetDirs.length > 0) registerExtAssets(app, assetDirs);
 
+        // 浏览器在 /admin 下 ./assets/* 的相对路径会解析为根级 /assets/*——
+        // 此处补一条兜底路由指向 webui 的 ui/assets 目录（消除 404）
+        if (adminUiRoot !== undefined) {
+          const uiAssetsRoot = adminUiRoot;
+          void app.register(async (assetScope) => {
+            await assetScope.register(fastifyStatic, {
+              root: uiAssetsRoot,
+              prefix: '/assets/',
+              decorateReply: false,
+            });
+          });
+        }
+
         // ---- /admin 直接服务管理台 SPA（取代旧 GET /admin 302 → /ext/{id}/ui/）----
         // 与 /ext/{id}/ui/ 各自处于兄弟封装上下文：fastify 同实例只允许一份 reply 装饰，
         // 根实例上的 registerExtAssets 全部 decorateReply:false；此处单独开一个插件
@@ -1067,18 +1080,27 @@ export class Kernel {
         // - SPA base 为 './' + HashRouter：无需服务端 rewrite/目录索引兜底。
         // 无 ui-mount 扩展时不注册 → /admin 落 fastify notFound（404，语义与旧 404 一致）。
         if (adminUiRoot !== undefined) {
-          const adminRoot = adminUiRoot;
           void app.register(async (admin) => {
             await admin.register(fastifyStatic, {
-              root: adminRoot,
+              root: adminUiRoot,
               prefix: '/admin/',
               index: 'index.html',
             });
+            // /admin（无尾斜杠）→ 302 到 /admin/（保证相对路径正确解析）
             admin.get(
               '/admin',
               { schema: { hide: true } },
               async (_request, reply) => reply.redirect('/admin/'),
             );
+          });
+          // 兜底：浏览器在 /admin（无尾斜杠）下把 ./assets/... 解析为 /assets/...
+          // → 注册 /assets/* 路由指向同一目录，彻底消除 404
+          void app.register(async (assets) => {
+            await assets.register(fastifyStatic, {
+              root: adminUiRoot,
+              prefix: '/assets/',
+              decorateReply: false,
+            });
           });
         }
       }
