@@ -50,6 +50,7 @@ import { registerLlmRoutes } from '../../api/llm.js';
 import { registerMemoryRoutes } from '../../api/memory.js';
 import { registerMcpRoutes } from '../../api/mcp.js';
 import { registerNotificationRoutes } from '../../api/notifications.js';
+import { createChannelConfigStore } from '../notification/channel-configs.js';
 import { runAgentLoop, type AgentLoopToolRuntime } from '../agents/runner.js';
 import { SubagentManager } from '../agents/manager.js';
 import { SubagentStore } from '../agents/store.js';
@@ -223,6 +224,7 @@ export function createCoreServices(kernel: Kernel): CoreServices {
   // notification — 通知中心（入库 → SSE created → 渠道投递）
   // -------------------------------------------------------------------------
   const notifyStore = new NotificationStore(db);
+  const channelConfigStore = createChannelConfigStore(settings);
   const notifyManager = new NotificationManager({
     store: notifyStore,
     registry,
@@ -230,6 +232,10 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     publish,
     logger,
     secrets,
+    getChannelConfigs: async () => {
+      const configs = await channelConfigStore.listEnabled();
+      return configs.map((ch) => ({ driver: ch.type, target: ch.target }));
+    },
     // 默认渠道路由规则（settings 'notify.routes'，与 REST routes API 同一落点）：
     // send 未显式传入 channels 时按 level 匹配追加投递计划
     getRoutes: () => settings.get(NOTIFY_ROUTES_KEY, [] as unknown),
@@ -876,6 +882,7 @@ export function createCoreServices(kernel: Kernel): CoreServices {
         });
       });
       registerNotificationRoutes(app, {
+        channelConfigs: channelConfigStore,
         checker,
         store: notifyStore,
         getRoutes: () => settings.get(NOTIFY_ROUTES_KEY, [] as unknown),

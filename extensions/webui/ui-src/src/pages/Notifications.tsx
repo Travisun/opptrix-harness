@@ -25,6 +25,7 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Pagination } from '@/components/pagination';
 import {
   Select,
   SelectContent,
@@ -66,6 +67,9 @@ import {
  */
 
 const LEVEL_OPTIONS = ['info', 'success', 'warning', 'error'] as const;
+
+/** 收件箱客户端分页基数（与其他页面统一每页 20 条） */
+const NTF_PAGE_SIZE = 20;
 
 /** 渠道类型候选（与内核 NOTIFY_CHANNEL_TYPES 一致） */
 const CHANNEL_TYPE_OPTIONS: NotificationChannelType[] = ['webhook', 'email', 'console'];
@@ -173,6 +177,8 @@ export default function NotificationsPage(): React.ReactNode {
   const [sendBody, setSendBody] = useState('');
   const [sendLevel, setSendLevel] = useState<string>('info');
   const [sending, setSending] = useState(false);
+  /** 收件箱客户端分页页码（数据一次性拉取 + 前端切片） */
+  const [page, setPage] = useState(1);
   /** 路由规则 Dialog */
   const [routesOpen, setRoutesOpen] = useState(false);
   const [rules, setRules] = useState<NotificationRouteRule[]>([]);
@@ -331,6 +337,12 @@ export default function NotificationsPage(): React.ReactNode {
   }, [rules]);
 
   const unreadCount = (items ?? []).filter((it) => it.readAt === null || it.readAt === undefined).length;
+
+  // 收件箱客户端分页：当前页切片（page 超界由 Pagination 内部收敛展示）
+  const ntfTotal = (items ?? []).length;
+  const ntfTotalPages = Math.max(1, Math.ceil(ntfTotal / NTF_PAGE_SIZE));
+  const safePage = Math.min(page, ntfTotalPages);
+  const pagedItems = (items ?? []).slice((safePage - 1) * NTF_PAGE_SIZE, safePage * NTF_PAGE_SIZE);
 
   // ---------------------------------------------------------------------------
   // 渠道管理（多渠道实例 CRUD + 测试发送）
@@ -553,10 +565,11 @@ export default function NotificationsPage(): React.ReactNode {
         </EmptyState>
       )}
 
-      {/* 通知列表 */}
+      {/* 通知列表（客户端分页） */}
       {!loading && error === null && (items ?? []).length > 0 && (
-        <div className="flex flex-col gap-2">
-          {(items ?? []).map((item) => {
+        <>
+          <div className="flex flex-col gap-2">
+            {pagedItems.map((item) => {
             const unread = item.readAt === null || item.readAt === undefined;
             const expanded = expandedId === item.id;
             const dataText =
@@ -614,7 +627,9 @@ export default function NotificationsPage(): React.ReactNode {
               </Card>
             );
           })}
-        </div>
+          </div>
+          <Pagination page={safePage} pageSize={NTF_PAGE_SIZE} total={ntfTotal} onPageChange={setPage} />
+        </>
       )}
         </TabsContent>
 

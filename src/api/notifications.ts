@@ -2,11 +2,7 @@
  * notifications — 通知中心 REST API（/api/v1/notifications*）。
  *
  * 路由（读操作任意已认证身份；写操作要求 role root|admin，否则 FORBIDDEN；
-<<<<<<< Updated upstream
  * 渠道配置例外——凭据读取同样要求 admin）：
-=======
- * 渠道实例 CRUD 五端点因 target 含凭据字段，读写一律 admin 门禁）：
->>>>>>> Stashed changes
  * - GET  /api/v1/notifications              列表 ?unread=1&level=&limit=1..500 → { items, unread }
  * - POST /api/v1/notifications/:id/read     标记单条已读 → { ok: true }（不存在 → 404 HARNESS-3004）
  * - POST /api/v1/notifications/read-all     全部已读 → { updated: n }
@@ -17,11 +13,16 @@
  *                                           passSecretRef 只回引用名不回值；未接线 → 501）
  * - PUT  /api/v1/notifications/channels     覆写渠道配置（zod 校验 + 未知键剥离 → settings）→ { ok: true }
  * - GET  /api/v1/notifications/drivers      可用驱动清单 { notification: [], chat: [] }
- * - GET  /api/v1/notifications/channels/list        渠道实例配置列表（含 enabled；admin）
- * - POST /api/v1/notifications/channels             创建渠道实例 → 201 配置（admin）
- * - PUT  /api/v1/notifications/channels/:id         更新 name/target/enabled → 配置 | 404（admin）
- * - DELETE /api/v1/notifications/channels/:id       删除 → { ok: true } | 404（admin）
- * - PATCH /api/v1/notifications/channels/:id/toggle 启停切换（body 可选 {enabled}，缺省取反）→ 配置 | 404（admin）
+ *
+ * 多渠道实例 CRUD（全部 admin/root 门禁；target 含凭据，读也需 admin；未接线 → 501）：
+ * - GET    /api/v1/notifications/channel-configs            渠道实例列表 → { items }
+ * - POST   /api/v1/notifications/channel-configs            创建（type enum + name 必填
+ *                                                           + target 按类型 zod 校验）→ 201 配置
+ * - PUT    /api/v1/notifications/channel-configs/:id        更新（name/target/enabled）→ 配置
+ * - DELETE /api/v1/notifications/channel-configs/:id        删除 → { ok: true }（不存在 → 404）
+ * - PATCH  /api/v1/notifications/channel-configs/:id/toggle 切换启停（body {enabled?} 缺省取反）→ 配置
+ *   实例配置持久化在 settings 'notify.channelConfigs'（createChannelConfigStore），
+ *   NotificationManager 派发时经 deps.getChannelConfigs 取全部启用实例投递。
  *
  * 约定：
  * - 鉴权：token 经 extractToken（Authorization: Bearer 优先，其次 ?token=）交
@@ -29,31 +30,21 @@
  * - 入参全部 zod 校验；body 非法 JSON（解析失败）与 zod 校验失败统一
  *   400 HARNESS-1009 VALIDATION_FAILED（detail = issues）；
  * - 读取走 deps.store（NotificationStore 契约），路由规则走 deps.getRoutes/setRoutes，
-<<<<<<< Updated upstream
  *   渠道配置走可选的 deps.getChannels/setChannels（settings 'notify.channels.*'，
  *   未注入即 501），直发走可选的 deps.send（未注入即 501，保持本模块对投递实现不可知）。
  * - 密钥安全：渠道配置里 SMTP 密码只存 secrets 引用名（passSecretRef），本模块不接
  *   secrets、不解析引用——GET 永远只回引用名；PUT 经 zod strip 丢弃一切未知键
  *  （如 pass/password 明文），落 settings 的形状恒为白名单字段。
-=======
- *   直发走可选的 deps.send（未注入即 501，保持本模块对投递实现不可知）；
- * - 渠道实例 CRUD 走可选的 deps.channelStore（NotificationChannelStore 实例，
- *   未注入即 501）；target 按 type 经 channelTargetSchemaFor 二次校验
- *   （webhook: {url,…}；email: {smtp,from,to}；console: 空对象），与各驱动契约同形。
->>>>>>> Stashed changes
  */
 import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import { extractToken } from '../kernel/auth/authProxy.js';
+import { err, HarnessError } from '../kernel/errors/index.js';
 import {
   NOTIFY_CHANNEL_TYPES,
-  channelTargetSchemaFor,
-  type ChannelCreateInput,
-  type ChannelUpdatePatch,
-  type NotificationChannelConfig,
-} from '../kernel/notification/channel-store.js';
-import { err, HarnessError } from '../kernel/errors/index.js';
+  type ChannelConfigStore,
+} from '../kernel/notification/channel-configs.js';
 
 /** 列表查询缺省 limit（服务端兜底，防全表拉取） */
 const DEFAULT_LIST_LIMIT = 50;
@@ -71,17 +62,13 @@ export interface NotificationSendInput {
   level: string;
   /** 缺省 null */
   data: unknown;
-  /** 缺省 []（通知中心 UI 始终展示；渠道投递由路由规则/启用渠道决定） */
+  /** 缺省 []（通知中心 UI 始终展示；渠道投递由路由规则决定） */
   channels: string[];
   /**
    * 与 channels 同下标的投递目标（仅当请求以对象形 `[{driver, target}]` 显式给出
    * 渠道时携带；纯字符串形请求保持既有形状不带本字段）。集成方把它映射为
    * manager 投递计划的 target；未携带时各渠道按既有语义以空 target 投递
-<<<<<<< Updated upstream
    * （由各驱动自行校验——渠道配置 UI 的「测试发送」依赖本字段携带表单值）。
-=======
-   * （由各驱动自行校验——渠道管理 UI 的「测试发送」依赖本字段携带表单值）。
->>>>>>> Stashed changes
    */
   channelTargets?: unknown[];
 }
@@ -129,16 +116,11 @@ export interface NotificationRoutesDeps {
    */
   send?: (input: NotificationSendInput) => Promise<unknown>;
   /**
-   * 多渠道实例配置存储（可选；集成方接 NotificationChannelStore 实例，settings
-   * 'notify.channelConfigs' 落点）。未注入时渠道 CRUD 五端点返回 501 NOT_IMPLEMENTED。
+   * 多渠道实例配置存取（可选；集成方接 createChannelConfigStore(settings)，与
+   * NotificationManager 的 deps.getChannelConfigs 共用同一实例）。未注入时
+   * /api/v1/notifications/channel-configs* 五端点返回 501 NOT_IMPLEMENTED。
    */
-  channelStore?: {
-    list(): Promise<NotificationChannelConfig[]>;
-    get(id: string): Promise<NotificationChannelConfig | null>;
-    create(input: ChannelCreateInput): Promise<NotificationChannelConfig>;
-    update(id: string, patch: ChannelUpdatePatch): Promise<NotificationChannelConfig | null>;
-    remove(id: string): Promise<boolean>;
-  };
+  channelConfigs?: ChannelConfigStore;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,11 +249,7 @@ const sendBodySchema = z.object({
   data: z.unknown().optional(),
   /**
    * 渠道两形：'driver'（既有契约，target 由集成方给空对象）或
-<<<<<<< Updated upstream
    * { driver, target }（渠道配置 UI「测试发送」携带当前表单值）。
-=======
-   * { driver, target }（渠道管理 UI「测试发送」携带当前表单值）。
->>>>>>> Stashed changes
    */
   channels: z
     .array(
@@ -298,34 +276,26 @@ const routeRuleSchema = z.object({
 /** PUT /api/v1/notifications/routes 请求体：规则数组 */
 const routesBodySchema = z.array(routeRuleSchema).max(100);
 
-// ---------------------------------------------------------------------------
-// 渠道实例 CRUD（/api/v1/notifications/channels*）：deps.channelStore 落点的入参 schema
-// ---------------------------------------------------------------------------
-
-/** 渠道类型（= 驱动注册名） */
-const channelTypeSchema = z.enum(NOTIFY_CHANNEL_TYPES);
-
-/** target 基础形状（对象）；按 type 的严格校验在 handler 内经 channelTargetSchemaFor 二段执行 */
-const channelTargetSchema = z.record(z.string(), z.unknown());
-
-/** POST /api/v1/notifications/channels 请求体：type + name 必填，target 缺省 {} */
-const channelCreateBodySchema = z.object({
-  type: channelTypeSchema,
-  name: z.string().trim().min(1).max(128),
-  target: channelTargetSchema.default({}),
+/** POST /api/v1/notifications/channel-configs 请求体：type enum + name 必填 +
+ * target 可选（缺省 {}，console 无必填字段）；target 严格校验（url / smtp.host 等
+ * 按 type）由 store.create 二段执行并同样落 400 VALIDATION_FAILED */
+const channelConfigCreateBodySchema = z.object({
+  type: z.enum(NOTIFY_CHANNEL_TYPES),
+  name: z.string().min(1).max(128),
+  target: z.record(z.string(), z.unknown()).optional(),
 });
 
-/** PUT /api/v1/notifications/channels/:id 请求体：name/target/enabled 至少一项 */
-const channelUpdateBodySchema = z
+/** PUT /api/v1/notifications/channel-configs/:id 请求体：全部可选（部分更新），空 patch 拒绝 */
+const channelConfigUpdateBodySchema = z
   .object({
-    name: z.string().trim().min(1).max(128).optional(),
+    name: z.string().min(1).max(128).optional(),
     enabled: z.boolean().optional(),
-    target: channelTargetSchema.optional(),
+    target: z.record(z.string(), z.unknown()).optional(),
   })
-  .refine((patch) => Object.keys(patch).length > 0, { message: 'at least one of name / enabled / target required' });
+  .refine((patch) => Object.keys(patch).length > 0, { message: 'update patch is empty' });
 
-/** PATCH /api/v1/notifications/channels/:id/toggle 请求体：enabled 可选（缺省取反） */
-const channelToggleBodySchema = z.object({ enabled: z.boolean().optional() }).default({});
+/** PATCH /api/v1/notifications/channel-configs/:id/toggle 请求体：enabled 缺省 = 取反当前值 */
+const channelConfigToggleBodySchema = z.object({ enabled: z.boolean().optional() });
 
 // ---------------------------------------------------------------------------
 // 辅助
@@ -336,21 +306,9 @@ function notificationNotFound(id: string): HarnessError {
   return err('EXT_NOT_FOUND', { message: `notification "${id}" not found`, detail: { id } });
 }
 
-/** 渠道实例未找到（同 404 HARNESS-3004 语义） */
-function channelNotFound(id: string): HarnessError {
-  return err('EXT_NOT_FOUND', { message: `notification channel "${id}" not found`, detail: { id } });
-}
-
-/** target 按 type 严格校验：合法返回 null，非法返回 VALIDATION_FAILED（detail = issues） */
-function validateChannelTarget(type: string, target: Record<string, unknown>): HarnessError | null {
-  const schema = channelTargetSchemaFor(type);
-  if (schema === null) return null;
-  const check = schema.safeParse(target);
-  if (check.success) return null;
-  return err('VALIDATION_FAILED', {
-    message: `channel target invalid for type "${type}"`,
-    detail: check.error.issues,
-  });
+/** 渠道实例配置未找到（同 404 HARNESS-3004 口径） */
+function channelConfigNotFound(id: string): HarnessError {
+  return err('EXT_NOT_FOUND', { message: `notification channel config "${id}" not found`, detail: { id } });
 }
 
 /** fastify JSON body 解析类错误码（仅这两个映射为 VALIDATION_FAILED，其余交回全局兜底） */
@@ -403,6 +361,16 @@ export function registerNotificationRoutes(app: FastifyInstance, deps: Notificat
         detail: { role: identity.role },
       });
     }
+  };
+
+  // 渠道实例配置存取（target 含凭据）：未接线 → 501（与 getChannels/setChannels 同口径）
+  const requireChannelConfigs = (): ChannelConfigStore => {
+    if (deps.channelConfigs === undefined) {
+      throw err('NOT_IMPLEMENTED', {
+        message: 'notification channel configs are not wired (no deps.channelConfigs provider registered)',
+      });
+    }
+    return deps.channelConfigs;
   };
 
   const routeOptions = { schema: { tags: ['notifications'] } };
@@ -555,115 +523,97 @@ export function registerNotificationRoutes(app: FastifyInstance, deps: Notificat
     },
   );
 
+  // ---------------------------------------------------------------------------
+  // 多渠道实例 CRUD（全部 admin 门禁——target 含凭据，读也需 admin；
+  // 未接线 deps.channelConfigs → 501）。
+  // 双路径注册（同一组 handler）：/channel-configs 为规范路径；/channels、
+  // /channels/list、/channels/:id、/channels/:id/toggle 为既有通知中心 UI 消费的
+  // 兼容别名（GET /channels 单渠道配置与 GET /channels/list 实例列表互不冲突）。
+  // ---------------------------------------------------------------------------
+
+  // 渠道实例列表（含 enabled=false）
+  const listChannelConfigs = async (request: FastifyRequest): Promise<unknown> => {
+    await requireAdmin(request);
+    const store = requireChannelConfigs();
+    return { items: await store.list() };
+  };
+
+  // 创建实例（target 按 type zod 校验在 store.create 内执行，非法同样落 400）
+  const createChannelConfig = async (request: FastifyRequest, reply: FastifyReply): Promise<unknown> => {
+    await requireAdmin(request);
+    const store = requireChannelConfigs();
+    const parsed = channelConfigCreateBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      throw err('VALIDATION_FAILED', {
+        message: 'channel config must be { type, name, target? } (target validated per type)',
+        detail: parsed.error.issues,
+      });
+    }
+    const config = await store.create(parsed.data.type, parsed.data.name, parsed.data.target ?? {});
+    reply.code(201);
+    return config;
+  };
+
+  // 部分更新（name/target/enabled）
+  const updateChannelConfig = async (request: FastifyRequest): Promise<unknown> => {
+    await requireAdmin(request);
+    const store = requireChannelConfigs();
+    const { id } = request.params as { id: string };
+    const parsed = channelConfigUpdateBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      throw err('VALIDATION_FAILED', {
+        message: 'channel update must contain at least one of name / enabled / target',
+        detail: parsed.error.issues,
+      });
+    }
+    const next = await store.update(id, parsed.data);
+    if (next === null) throw channelConfigNotFound(id);
+    return next;
+  };
+
+  // 删除实例
+  const deleteChannelConfig = async (request: FastifyRequest): Promise<unknown> => {
+    await requireAdmin(request);
+    const store = requireChannelConfigs();
+    const { id } = request.params as { id: string };
+    const removed = await store.remove(id);
+    if (!removed) throw channelConfigNotFound(id);
+    return { ok: true };
+  };
+
+  // 切换启停（body {enabled?} 缺省 = 取反当前值）
+  const toggleChannelConfig = async (request: FastifyRequest): Promise<unknown> => {
+    await requireAdmin(request);
+    const store = requireChannelConfigs();
+    const { id } = request.params as { id: string };
+    const parsed = channelConfigToggleBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      throw err('VALIDATION_FAILED', { message: 'toggle body must be { enabled?: boolean }', detail: parsed.error.issues });
+    }
+    const next = await store.toggle(id, parsed.data.enabled);
+    if (next === null) throw channelConfigNotFound(id);
+    return next;
+  };
+
+  const channelConfigRouteOptions = { ...routeOptions, errorHandler: mapBodyParseError };
+
+  // 规范路径
+  app.get('/api/v1/notifications/channel-configs', routeOptions, listChannelConfigs);
+  app.post('/api/v1/notifications/channel-configs', channelConfigRouteOptions, createChannelConfig);
+  app.put('/api/v1/notifications/channel-configs/:id', channelConfigRouteOptions, updateChannelConfig);
+  app.delete('/api/v1/notifications/channel-configs/:id', routeOptions, deleteChannelConfig);
+  app.patch('/api/v1/notifications/channel-configs/:id/toggle', channelConfigRouteOptions, toggleChannelConfig);
+
+  // 既有通知中心 UI 消费的兼容别名（同一组 handler，行为完全一致）
+  app.get('/api/v1/notifications/channels/list', routeOptions, listChannelConfigs);
+  app.post('/api/v1/notifications/channels', channelConfigRouteOptions, createChannelConfig);
+  app.put('/api/v1/notifications/channels/:id', channelConfigRouteOptions, updateChannelConfig);
+  app.delete('/api/v1/notifications/channels/:id', routeOptions, deleteChannelConfig);
+  app.patch('/api/v1/notifications/channels/:id/toggle', channelConfigRouteOptions, toggleChannelConfig);
+
   // GET /api/v1/notifications/drivers — 可用驱动清单（读操作）
   app.get('/api/v1/notifications/drivers', routeOptions, async (request) => {
     await authenticate(request);
     return deps.drivers();
   });
-
-  // ---------------------------------------------------------------------------
-  // 渠道实例 CRUD（多渠道管理；target 含凭据字段 → 五端点一律 admin 门禁；
-  // deps.channelStore 未注入 → 501，保持本模块对持久化实现不可知）
-  // ---------------------------------------------------------------------------
-
-  const requireChannelStore = (): NonNullable<NotificationRoutesDeps['channelStore']> => {
-    if (deps.channelStore === undefined) {
-      throw err('NOT_IMPLEMENTED', {
-        message: 'notification channel store is not wired (no deps.channelStore provider registered)',
-      });
-    }
-    return deps.channelStore;
-  };
-
-  // GET /api/v1/notifications/channels/list — 全部渠道实例（含 enabled=false）
-  app.get('/api/v1/notifications/channels/list', routeOptions, async (request) => {
-    await requireAdmin(request);
-    const items = await requireChannelStore().list();
-    return { items };
-  });
-
-  // POST /api/v1/notifications/channels — 创建渠道实例（201 配置）
-  app.post(
-    '/api/v1/notifications/channels',
-    { ...routeOptions, errorHandler: mapBodyParseError },
-    async (request, reply) => {
-      await requireAdmin(request);
-      const store = requireChannelStore();
-      const parsed = channelCreateBodySchema.safeParse(request.body);
-      if (!parsed.success) {
-        throw err('VALIDATION_FAILED', {
-          message: 'channel body must be { type: webhook|email|console, name: string, target?: object }',
-          detail: parsed.error.issues,
-        });
-      }
-      const targetError = validateChannelTarget(parsed.data.type, parsed.data.target);
-      if (targetError !== null) throw targetError;
-      const config = await store.create(parsed.data);
-      reply.code(201);
-      return config;
-    },
-  );
-
-  // PUT /api/v1/notifications/channels/:id — 部分更新（name/target/enabled）
-  app.put(
-    '/api/v1/notifications/channels/:id',
-    { ...routeOptions, errorHandler: mapBodyParseError },
-    async (request) => {
-      await requireAdmin(request);
-      const store = requireChannelStore();
-      const { id } = request.params as { id: string };
-      const parsed = channelUpdateBodySchema.safeParse(request.body);
-      if (!parsed.success) {
-        throw err('VALIDATION_FAILED', {
-          message: 'channel update body must be { name?, enabled?, target? } (at least one field)',
-          detail: parsed.error.issues,
-        });
-      }
-      if (parsed.data.target !== undefined) {
-        const current = await store.get(id);
-        if (current === null) throw channelNotFound(id);
-        const targetError = validateChannelTarget(current.type, parsed.data.target);
-        if (targetError !== null) throw targetError;
-      }
-      const next = await store.update(id, parsed.data);
-      if (next === null) throw channelNotFound(id);
-      return next;
-    },
-  );
-
-  // DELETE /api/v1/notifications/channels/:id — 删除（{ ok: true } | 404）
-  app.delete('/api/v1/notifications/channels/:id', routeOptions, async (request) => {
-    await requireAdmin(request);
-    const { id } = request.params as { id: string };
-    const ok = await requireChannelStore().remove(id);
-    if (!ok) throw channelNotFound(id);
-    return { ok: true };
-  });
-
-  // PATCH /api/v1/notifications/channels/:id/toggle — 启停切换（body 可选 { enabled }，缺省取反）
-  app.patch(
-    '/api/v1/notifications/channels/:id/toggle',
-    { ...routeOptions, errorHandler: mapBodyParseError },
-    async (request) => {
-      await requireAdmin(request);
-      const store = requireChannelStore();
-      const { id } = request.params as { id: string };
-      const parsed = channelToggleBodySchema.safeParse(request.body ?? {});
-      if (!parsed.success) {
-        throw err('VALIDATION_FAILED', {
-          message: 'toggle body must be { enabled?: boolean }',
-          detail: parsed.error.issues,
-        });
-      }
-      let nextEnabled = parsed.data.enabled;
-      if (nextEnabled === undefined) {
-        const current = await store.get(id);
-        if (current === null) throw channelNotFound(id);
-        nextEnabled = !current.enabled;
-      }
-      const next = await store.update(id, { enabled: nextEnabled });
-      if (next === null) throw channelNotFound(id);
-      return next;
-    },
-  );
 }
