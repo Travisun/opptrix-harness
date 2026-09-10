@@ -90,6 +90,8 @@ declare global {
     llm: LlmApi;
     /** 沙箱 Workspace 容器（dockerode；未启用/无权限时抛 HARNESS-6xxx） */
     sandbox: SandboxApi;
+    /** 沙箱化代码执行会话（受控子进程；需 manifest 权限 'sandbox'） */
+    coding: CodingApi;
     /** 系统信息与资源水位（只读策划面） */
     system: SystemApi;
     /** 引导态（冻结；缺省空对象）：rootToken 仅 builtin auth 扩展可见 */
@@ -98,6 +100,8 @@ declare global {
     auth: AuthApi;
     /** 调用其他扩展（或本扩展）经 h.expose 暴露的服务（manifest 需声明 'rpc:call' 或 'rpc:call:<targetExtId>'；自调用豁免） */
     call(targetExtId: string, method: string, args?: unknown): Promise<unknown>;
+    /** 浏览器自动化内核引擎（Playwright 跑在内核主线程；manifest 需声明 'browser' 权限） */
+    browser: BrowserApi;
 
     // ---- 注册类 API（仅激活期可用；被贡献收集器捕获，随 host.load 回报内核）----
     /** 注册 HTTP 路由，最终挂载于 `/ext/{id}` 前缀下 */
@@ -335,6 +339,29 @@ declare global {
     exec(input: unknown): Promise<unknown>;
   }
 
+  /** 沙箱化代码执行会话（kernel CodingEngine；需 manifest 权限 'sandbox'）。
+   * 会话目录 `<dataDir>/coding-workspaces/<sessionId>/`（sessionId 缺省 "default"）；
+   * 命令白名单 + shell:false argv 直传 + 超时 kill + 输出 256KB 截断 + 每会话 1 进程
+   * （忙时抛 HARNESS SANDBOX_BUSY）；路径参数一律会话目录内相对（绝对路径与 ".." 拒绝）。 */
+  interface CodingApi {
+    /** 执行白名单命令：{ sessionId?, cmd, args?, cwd?, timeoutMs?, env? } → { exitCode, stdout, stderr, durationMs, truncated, timedOut } */
+    exec(input: unknown): Promise<unknown>;
+    /** 执行源码：{ sessionId?, language: 'node'|'python', code, timeoutMs? } → 同 exec（临时文件自动清理） */
+    runCode(input: unknown): Promise<unknown>;
+    /** 写会话文件：{ sessionId?, path, content } → { path, size } */
+    fsWrite(input: unknown): Promise<unknown>;
+    /** 读会话文件：{ sessionId?, path } → { path, size, content, truncated } */
+    fsRead(input: unknown): Promise<unknown>;
+    /** 列会话目录（一级）：{ sessionId?, path? } → [{ name, size, dir }] */
+    fsList(input: unknown): Promise<unknown>;
+    /** 列出全部会话：{} → [{ id, dir, createdAt }] */
+    sessions(): Promise<unknown>;
+    /** 重置会话（清空目录）：{ sessionId? } → { id, dir, createdAt } */
+    resetSession(input: unknown): Promise<unknown>;
+    /** 删除会话：{ sessionId } → { deleted: boolean } */
+    deleteSession(input: unknown): Promise<unknown>;
+  }
+
   interface SystemApi {
     /** 系统信息（版本/env/uptime/counters） */
     info(): Promise<unknown>;
@@ -342,10 +369,20 @@ declare global {
     stats(): Promise<unknown>;
   }
 
+  /** 浏览器自动化内核引擎（kernel BrowserEngine，Playwright 跑在内核主线程；需 manifest 权限 'browser'）。
+   * 浏览器二进制默认不下载：未安装时 status().installed=false，install() 触发后台下载（幂等）。 */
+  interface BrowserApi {
+    /** 运行态快照：installed=chromium 已装 / running=浏览器实例存活 / installing=后台安装中 */
+    status(): Promise<{ installed: boolean; running: boolean; installing: boolean; lastError: string | null }>;
+    /** 触发后台安装 chromium（幂等；立即返回 { started }，完成态经 status 观察） */
+    install(): Promise<{ started: boolean; installed?: boolean; installing?: boolean }>;
+    /** 读取引擎截图文件（file 必须是 browser_screenshot 工具产出的 <uuid>.png，防穿越） */
+    readScreenshot(file: string): Promise<{ file: string; mime: string; base64: string }>;
+  }
+
   /** 扩展私有 KV 存储（内核 ext_kv 表；值 JSON 序列化落库，损坏读回 null） */
   interface StorageApi {
-    get(key: string): Promise<unknown>;
-    set(key: string, value: unknown): Promise<unknown>;
+    get(key: string): Promise<unknown>;    set(key: string, value: unknown): Promise<unknown>;
     delete(key: string): Promise<unknown>;
   }
 

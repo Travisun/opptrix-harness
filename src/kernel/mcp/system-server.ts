@@ -31,17 +31,25 @@ import { err, HarnessError } from '../errors/index.js';
 import { CONTAINER_KEYS, type Kernel, type UpdaterFacade } from '../Kernel.js';
 import type { CronRunEntry } from '../cron/store.js';
 import {
+  createBrowserTools,
+  createCodingTools,
   createExtractTools,
+  createHtmlReportTools,
   createSystemTools,
   SYSTEM_TOOLS_CONTAINER_KEY,
   type SystemTool,
   type SystemToolContext,
 } from './system-tools.js';
 import type { FileExtractService } from '../fileextract/service.js';
+import type { BrowserEngine } from '../browser/index.js';
 
 /**
  * 系统工具目录：内置目录 + fileextract 域的 files_extract（容器 'fileextract.service'
- * 懒解析——core-services 已登记该服务，裸装配缺失时工具收敛为 HARNESS-9001 结果对象）。
+ * 懒解析——core-services 已登记该服务，裸装配缺失时工具收敛为 HARNESS-9001 结果对象）
+ * + report_ 域的四个报告工具（createHtmlReportTools：容器 'ext.manager' 懒解析，桥接
+ * 社区扩展 html-report）+ coding_ 域的六个代码执行工具（createCodingTools：容器
+ * 'coding.engine' 懒解析，受内核白名单门约束）+ browser_ 域的八个浏览器工具
+ * （createBrowserTools：容器 'browser.engine' 懒解析，Playwright 跑内核主线程）。
  * SystemToolRuntime（执行）与 buildMcpServer（SDK 注册）共用同一清单，防目录漂移。
  */
 function buildSystemToolCatalog(kernel: Kernel): SystemTool[] {
@@ -49,6 +57,13 @@ function buildSystemToolCatalog(kernel: Kernel): SystemTool[] {
     createExtractTools(() => ({
       service: kernel.container.has(CONTAINER_KEYS.fileExtract)
         ? kernel.container.resolve<FileExtractService>(CONTAINER_KEYS.fileExtract)
+        : undefined,
+    })),
+    createHtmlReportTools(),
+    createCodingTools(),
+    createBrowserTools(() => ({
+      engine: kernel.container.has(CONTAINER_KEYS.browserEngine)
+        ? kernel.container.resolve<BrowserEngine>(CONTAINER_KEYS.browserEngine)
         : undefined,
     })),
   );

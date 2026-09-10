@@ -222,6 +222,19 @@ describe('HOST_METHODS / KERNEL_TOPICS 契约', () => {
   memoryForget: 'memory.forget',
   asrStatus: 'asr.status',
   asrTranscribe: 'asr.transcribe',
+      // ---- 浏览器自动化（内核引擎；'browser' 权限）----
+      browserStatus: 'browser.status',
+      browserInstall: 'browser.install',
+      browserScreenshot: 'browser.screenshot',
+      // ---- coding 沙箱化代码执行会话（kernel CodingEngine；'sandbox' 权限）----
+      codingExec: 'coding.exec',
+      codingRunCode: 'coding.runCode',
+      codingFsWrite: 'coding.fs.write',
+      codingFsRead: 'coding.fs.read',
+      codingFsList: 'coding.fs.list',
+      codingSessions: 'coding.sessions',
+      codingSessionReset: 'coding.session.reset',
+      codingSessionDelete: 'coding.session.delete',
       // ---- auth 内置扩展支撑（auth:provider）----
       authHashToken: 'auth.hashToken',
       authTotpGenerate: 'auth.totpGenerate',

@@ -443,6 +443,17 @@ export interface HarnessApi {
   ui: { register(fragment: { pages?: UiPageContribution[]; menu?: UiMenuContribution[] }): void };
   llm: { chat(input: unknown): Promise<unknown> };
   sandbox: { exec(input: unknown): Promise<unknown> };
+  /** 沙箱化代码执行会话（需 manifest 'sandbox' 权限；payload 形状见 coding 桥线格式） */
+  coding: {
+    exec(input: unknown): Promise<unknown>;
+    runCode(input: unknown): Promise<unknown>;
+    fsWrite(input: unknown): Promise<unknown>;
+    fsRead(input: unknown): Promise<unknown>;
+    fsList(input: unknown): Promise<unknown>;
+    sessions(): Promise<unknown>;
+    resetSession(input: unknown): Promise<unknown>;
+    deleteSession(input: unknown): Promise<unknown>;
+  };
   system: { info(): Promise<unknown>; stats(): Promise<unknown> };
   /**
    * 引导态（冻结对象）：内核随 load 注入；缺省为空冻结对象。
@@ -477,6 +488,19 @@ export interface HarnessApi {
   };
   /** 调用其他扩展暴露的服务（内核 broker 中转，topic 'host.call'） */
   call(targetExtId: string, method: string, args?: unknown): Promise<unknown>;
+  /**
+   * 浏览器自动化内核引擎（Playwright 跑在内核主线程；引擎 src/kernel/browser）。
+   * 调用方 manifest 必须声明 'browser' 权限（缺 → 内核侧 FORBIDDEN）。
+   * 浏览器二进制默认不下载：未安装时 status.install=false、install() 触发后台安装。
+   */
+  browser: {
+    /** 运行态快照：{ installed, running, installing, lastError } */
+    status(): Promise<{ installed: boolean; running: boolean; installing: boolean; lastError: string | null }>;
+    /** 触发后台安装 chromium（幂等；立即返回，不等完成） */
+    install(): Promise<{ started: boolean; installed?: boolean; installing?: boolean }>;
+    /** 读取引擎截图文件 → { file, mime, base64 }（file 必须是 browser_screenshot 产出的 <uuid>.png） */
+    readScreenshot(file: string): Promise<{ file: string; mime: string; base64: string }>;
+  };
   // ---- 注册类 API（仅激活期；被 collector 捕获，不进 kernelCall）----
   route(method: string, path: string, handler: RouteHandler, opts?: RouteOptions): void;
   webhook(path: string, handler: RouteHandler, opts?: WebhookOptions): void;
@@ -743,6 +767,22 @@ export function createHarnessApi(opts: HarnessApiOptions): HarnessApi {
     exec: (input: unknown): Promise<unknown> => callKernel(KERNEL_TOPICS.sandboxExec, input),
   });
 
+  /**
+   * 沙箱化代码执行会话（kernel CodingEngine，经 coding.* 桥 topic）。
+   * 调用方 manifest 必须声明 'sandbox' 权限（缺 → 内核侧 FORBIDDEN）。
+   * sessionId 缺省 "default"；路径参数一律会话目录内相对（内核引擎钉死）。
+   */
+  const coding = Object.freeze({
+    exec: (input: unknown): Promise<unknown> => callKernel(KERNEL_TOPICS.codingExec, input),
+    runCode: (input: unknown): Promise<unknown> => callKernel(KERNEL_TOPICS.codingRunCode, input),
+    fsWrite: (input: unknown): Promise<unknown> => callKernel(KERNEL_TOPICS.codingFsWrite, input),
+    fsRead: (input: unknown): Promise<unknown> => callKernel(KERNEL_TOPICS.codingFsRead, input),
+    fsList: (input: unknown): Promise<unknown> => callKernel(KERNEL_TOPICS.codingFsList, input),
+    sessions: (): Promise<unknown> => callKernel(KERNEL_TOPICS.codingSessions, {}),
+    resetSession: (input: unknown): Promise<unknown> => callKernel(KERNEL_TOPICS.codingSessionReset, input),
+    deleteSession: (input: unknown): Promise<unknown> => callKernel(KERNEL_TOPICS.codingSessionDelete, input),
+  });
+
   const system = Object.freeze({
     info: (): Promise<unknown> => callKernel(KERNEL_TOPICS.systemInfo, {}),
     stats: (): Promise<unknown> => callKernel(KERNEL_TOPICS.systemStats, {}),
@@ -856,6 +896,7 @@ export function createHarnessApi(opts: HarnessApiOptions): HarnessApi {
     ui,
     llm,
     sandbox: sandboxExec,
+    coding,
     system,
     boot,
     auth,
@@ -864,6 +905,33 @@ export function createHarnessApi(opts: HarnessApiOptions): HarnessApi {
         throw new TypeError('call: targetExtId and method must be non-empty strings');
       }
       return callKernel(TOPIC_HOST_CALL, { targetExtId, method, args });
+    },
+
+    // 浏览器自动化内核引擎（权限闸在内核桥：manifest 需声明 'browser'）
+    browser: {
+      status: (): Promise<{ installed: boolean; running: boolean; installing: boolean; lastError: string | null }> =>
+        callKernel(KERNEL_TOPICS.browserStatus, {}) as Promise<{
+          installed: boolean;
+          running: boolean;
+          installing: boolean;
+          lastError: string | null;
+        }>,
+      install: (): Promise<{ started: boolean; installed?: boolean; installing?: boolean }> =>
+        callKernel(KERNEL_TOPICS.browserInstall, {}) as Promise<{
+          started: boolean;
+          installed?: boolean;
+          installing?: boolean;
+        }>,
+      readScreenshot: (file: string): Promise<{ file: string; mime: string; base64: string }> => {
+        if (typeof file !== 'string' || file === '') {
+          throw new TypeError('browser.readScreenshot: file must be a non-empty string');
+        }
+        return callKernel(KERNEL_TOPICS.browserScreenshot, { file }) as Promise<{
+          file: string;
+          mime: string;
+          base64: string;
+        }>;
+      },
     },
 
     // ---- 注册类 API（激活期闸门；捕获进 collector）----
@@ -1035,6 +1103,16 @@ export function exposeHarnessApiInVm(api: HarnessApi, bridge: RealmBridge): unkn
     sandbox: bridge.makeVmObject({
       exec: asyncFn((input: unknown) => api.sandbox.exec(input)),
     }),
+    coding: bridge.makeVmObject({
+      exec: asyncFn((input: unknown) => api.coding.exec(input)),
+      runCode: asyncFn((input: unknown) => api.coding.runCode(input)),
+      fsWrite: asyncFn((input: unknown) => api.coding.fsWrite(input)),
+      fsRead: asyncFn((input: unknown) => api.coding.fsRead(input)),
+      fsList: asyncFn((input: unknown) => api.coding.fsList(input)),
+      sessions: asyncFn(() => api.coding.sessions()),
+      resetSession: asyncFn((input: unknown) => api.coding.resetSession(input)),
+      deleteSession: asyncFn((input: unknown) => api.coding.deleteSession(input)),
+    }),
     system: bridge.makeVmObject({
       info: asyncFn(() => api.system.info()),
       stats: asyncFn(() => api.system.stats()),
@@ -1056,6 +1134,11 @@ export function exposeHarnessApiInVm(api: HarnessApi, bridge: RealmBridge): unkn
       verifyRootToken: asyncFn((token: string) => api.auth.verifyRootToken(token)),
     }),
     call: asyncFn((targetExtId: string, method: string, args?: unknown) => api.call(targetExtId, method, args)),
+    browser: bridge.makeVmObject({
+      status: asyncFn(() => api.browser.status()),
+      install: asyncFn(() => api.browser.install()),
+      readScreenshot: asyncFn((file: string) => api.browser.readScreenshot(file)),
+    }),
     // ---- 注册类 API（宿主侧捕获 VM 函数进 collector）----
     route: syncFn(
       (method: string, path: string, handler: unknown, opts?: RouteOptions) =>

@@ -112,7 +112,9 @@ import {
 import type { McpRegistryLike, PluginMcpServerConfig, ScriptRunnerLike } from '../plugins/types.js';
 import { createFileExtractBridge, EXTRACT_TASK_NAME, FileExtractService } from '../fileextract/index.js';
 import type { ExtractResult, ExtractTaskArgs, ExtractTaskPool } from '../fileextract/types.js';
+import { CodingEngine, createCodingBridge } from '../coding/index.js';
 import { createAsrBridge, AsrManager } from '../asr/index.js';
+import { BrowserEngine, createBrowserBridge } from '../browser/index.js';
 import type { SandboxManager } from '../sandbox/manager.js';
 import { createSkillsBridge, deleteSkill, SkillRegistry, writeSkill } from '../skills/index.js';
 import { TaskManager, TaskStore, TaskWorkerPool } from '../tasks/index.js';
@@ -533,6 +535,25 @@ export function createCoreServices(kernel: Kernel): CoreServices {
   kernel.container.instance(CONTAINER_KEYS.fileExtract, fileExtractService);
 
   // -------------------------------------------------------------------------
+  // coding — 沙箱化代码执行会话（受控子进程路径：会话目录 + 命令白名单 + argv 直传）。
+  // 引擎无独立生命周期（目录即事实、无定时器）；扩展桥 coding.* 与系统 MCP 工具
+  // coding_* 共用同一实例（容器 'coding.engine'）。选型依据见 src/kernel/coding/index.ts。
+  // -------------------------------------------------------------------------
+  const codingEngine = new CodingEngine({ dataDir: config.dataDir, logger });
+  kernel.container.instance(CONTAINER_KEYS.coding, codingEngine);
+
+  // -------------------------------------------------------------------------
+  // browser — 浏览器自动化内核引擎（Playwright 跑内核主线程；方案 B，doc-extract 同款）。
+  // 扩展沙箱（worker_threads + vm.Context 受限 require）无法加载 Playwright——探针
+  // 证据见 extensions/browser/README.md。浏览器二进制默认不下载（~150MB 重依赖）：
+  // 未安装时工具/桥统一收敛 browser_not_installed 结构化错误，POST /ext/browser/install
+  // 触发后台安装。扩展桥 browser.*（manifest 'browser' 权限）与系统 MCP 工具 browser_*
+  // 共用同一实例（容器 'browser.engine'）。
+  // -------------------------------------------------------------------------
+  const browserEngine = new BrowserEngine({ dataDir: config.dataDir, logger });
+  kernel.container.instance(CONTAINER_KEYS.browserEngine, browserEngine);
+
+  // -------------------------------------------------------------------------
   // agents —— LLM 子代理运行时（严格父子树；工具循环 = 系统 MCP 工具目录）
   // -------------------------------------------------------------------------
   // 系统工具运行时由 Kernel 在 /mcp 接线时创建并 attach（共享槽）；
@@ -945,6 +966,20 @@ export function createCoreServices(kernel: Kernel): CoreServices {
       service: fileExtractService,
       requirePermission: (extId, topic, permission) => requireExtPermission(extId, topic, permission),
     }),
+    // coding 桥（OS 能力层）：自带扩展端点闸，权限经 requirePermission 闭包以
+    // 'sandbox' 收口（进程/文件类高危能力，与 sandbox.exec 同门；权限名在
+    // extensions/manifest.ts 白名单）。
+    ...createCodingBridge({
+      engine: codingEngine,
+      requirePermission: (extId, topic, permission) => requireExtPermission(extId, topic, permission),
+    }),
+    // browser 桥（OS 能力层）：自带扩展端点闸，权限经 requirePermission 闭包以
+    // 'browser' 收口（权限名在 extensions/manifest.ts 白名单）。引擎在内核主线程，
+    // 扩展壳（extensions/browser）经它把 status/install/screenshots 暴露为扩展路由。
+    ...createBrowserBridge({
+      service: browserEngine,
+      requirePermission: (extId, topic, permission) => requireExtPermission(extId, topic, permission),
+    }),
   });
 
   return {
@@ -1085,6 +1120,12 @@ export function createCoreServices(kernel: Kernel): CoreServices {
         await fileExtractService.close();
       } catch (cause) {
         logger.warn({ err: cause }, 'core-services: fileextract ocr close during shutdown warned');
+      }
+      // 浏览器单例释放 + 后台安装子进程终止（幂等不抛；失败不阻断关停）
+      try {
+        await browserEngine.stop();
+      } catch (cause) {
+        logger.warn({ err: cause }, 'core-services: browser engine close during shutdown warned');
       }
       // 优雅断开全部 MCP 连接（stdio 子进程/HTTP 会话）；配置损坏等异常不阻断关停
       try {

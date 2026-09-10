@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   ArchiveIcon,
   ArrowLeftIcon,
   BoxesIcon,
+  FileTextIcon,
   Loader2Icon,
   MessageSquarePlusIcon,
   NetworkIcon,
@@ -16,9 +17,10 @@ import {
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
-import { api } from '@/lib/api';
+import { api, getToken } from '@/lib/api';
 import { connectSse, type SseEventData } from '@/lib/sse';
 import { cn } from '@/lib/utils';
 
@@ -93,8 +95,61 @@ function formatToolArgs(argsJson: string): string {
   }
 }
 
-/** 单条消息气泡：user 右对齐 / assistant 左对齐（tool_calls 折叠）/ system 居中小字 */
-function MessageBubble({ message }: { message: AgentMessage }): React.ReactNode {
+/**
+ * system 工具结果消息 → 成功创建的报告 id（report_create 的 {ok,reportId} 形状）。
+ * 轨迹落库契约：assistant 工具调用轮的 tool 结果以 system 角色落（content 为 JSON 文本）。
+ */
+function extractCreatedReportId(content: string): string | null {
+  try {
+    const obj = JSON.parse(content) as { ok?: unknown; reportId?: unknown };
+    return obj.ok === true && typeof obj.reportId === 'string' && obj.reportId !== '' ? obj.reportId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 按消息顺序配对 report_create 调用与其 system 结果：assistant 消息携带的每个
+ * report_create 调用，按序消费其后最近的成功结果消息（一条结果只配一个调用）。
+ */
+function mapReportPreviews(messages: AgentMessage[]): Map<string, string[]> {
+  const byMessage = new Map<string, string[]>();
+  /** messageId → 尚未配到结果的 report_create 调用数 */
+  const quota = new Map<string, number>();
+  const order: string[] = [];
+  for (const m of messages) {
+    if (m.role === 'assistant') {
+      const calls = (m.toolCalls ?? []).filter((tc) => tc.name === 'report_create').length;
+      if (calls > 0) {
+        quota.set(m.id, calls);
+        order.push(m.id);
+      }
+      continue;
+    }
+    if (m.role === 'system' && order.length > 0) {
+      const reportId = extractCreatedReportId(m.content);
+      if (reportId === null) continue;
+      const owner = order[0];
+      if (owner === undefined) continue;
+      byMessage.set(owner, [...(byMessage.get(owner) ?? []), reportId]);
+      const left = (quota.get(owner) ?? 1) - 1;
+      quota.set(owner, left);
+      if (left <= 0) order.shift();
+    }
+  }
+  return byMessage;
+}
+
+/** 单条消息气泡：user 右对齐 / assistant 左对齐（tool_calls 折叠 + 报告预览入口）/ system 居中小字 */
+function MessageBubble({
+  message,
+  previewReports,
+  onPreviewReport,
+}: {
+  message: AgentMessage;
+  previewReports?: string[];
+  onPreviewReport?: (reportId: string) => void;
+}): React.ReactNode {
   if (message.role === 'system') {
     return (
       <div className="flex justify-center">
@@ -139,6 +194,24 @@ function MessageBubble({ message }: { message: AgentMessage }): React.ReactNode 
             tokens {message.usage.inputTokens} → {message.usage.outputTokens}
           </div>
         )}
+        {/* report_create 成功后的报告预览入口（iframe 内嵌，CSP 由扩展预览路由下发） */}
+        {previewReports !== undefined && previewReports.length > 0 && onPreviewReport !== undefined && (
+          <div className="mt-1.5 flex flex-wrap gap-1.5 border-t pt-1.5">
+            {previewReports.map((reportId, i) => (
+              <Button
+                key={reportId}
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1 rounded-full px-2.5 text-xs"
+                onClick={() => onPreviewReport(reportId)}
+              >
+                <FileTextIcon className="size-3.5" aria-hidden />
+                {previewReports.length > 1 ? `📄 预览报告 ${i + 1}` : '📄 预览报告'}
+              </Button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -153,6 +226,8 @@ export default function AgentChatPage(): React.ReactNode {
   const [connected, setConnected] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState('');
+  /** 正在预览的报告（Dialog 内 iframe 加载扩展预览路由；null = 关闭） */
+  const [previewReport, setPreviewReport] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   /** 活动会话 id 的 ref（SSE 回调与 send 闭包读取现值，避免陈旧闭包） */
@@ -160,6 +235,15 @@ export default function AgentChatPage(): React.ReactNode {
   activeIdRef.current = activeId;
 
   const activeSession = sessions.find((s) => s.id === activeId) ?? null;
+
+  /** report_create 调用 ↔ 成功结果的按序配对（assistant 消息底部的「预览报告」入口） */
+  const reportPreviews = useMemo(() => mapReportPreviews(messages), [messages]);
+
+  /** 预览 iframe 地址：扩展路由 auth:'user'，token 走 ?token= 查询通道（extractToken 契约） */
+  const previewUrl = (reportId: string): string => {
+    const token = getToken();
+    return `/ext/html-report/reports/${encodeURIComponent(reportId)}${token !== '' ? `?token=${encodeURIComponent(token)}` : ''}`;
+  };
 
   /** 会话列表刷新（发送后重取以反映 last_message_at 排序变化） */
   const refreshSessions = useCallback(async (): Promise<void> => {
@@ -405,7 +489,14 @@ export default function AgentChatPage(): React.ReactNode {
               <p className="max-w-sm text-xs">向助手提问，或让助手调用系统工具（技能 / 定时任务 / 文件 / MCP…）。</p>
             </div>
           ) : (
-            messages.map((m) => <MessageBubble key={m.id} message={m} />)
+            messages.map((m) => (
+              <MessageBubble
+                key={m.id}
+                message={m}
+                previewReports={reportPreviews.get(m.id)}
+                onPreviewReport={setPreviewReport}
+              />
+            ))
           )}
           {sending && (
             <div className="text-muted-foreground flex items-center gap-2 text-xs">
@@ -487,6 +578,26 @@ export default function AgentChatPage(): React.ReactNode {
           <p className="text-muted-foreground mt-1.5 text-[11px]">Enter 发送，Shift+Enter 换行</p>
         </div>
       </section>
+
+      {/* ---- 报告预览（iframe 内嵌扩展预览路由；响应自带防脚本 CSP）---- */}
+      <Dialog open={previewReport !== null} onOpenChange={(open) => (open ? undefined : setPreviewReport(null))}>
+        <DialogContent className="flex max-h-[85vh] w-[min(920px,92vw)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[min(920px,92vw)]">
+          <DialogHeader className="border-b border-border px-4 py-3">
+            <DialogTitle className="text-sm">报告预览</DialogTitle>
+            <DialogDescription className="text-xs">
+              {previewReport !== null ? previewUrl(previewReport).split('?')[0] : ''}
+            </DialogDescription>
+          </DialogHeader>
+          {previewReport !== null && (
+            <iframe
+              key={previewReport}
+              src={previewUrl(previewReport)}
+              title="HTML 报告预览"
+              className="h-[68vh] w-full flex-1 bg-white"
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -125,6 +125,9 @@ const PERMISSION_WHITELIST: ReadonlySet<string> = new Set([
   'memory',
   // 语音识别（asr.status/asr.transcribe 桥 topics 的统一权限闸）
   'asr',
+  // 浏览器自动化（browser.status/install/screenshot 桥 topics 的统一权限闸；
+  // 引擎在内核主线程，Playwright 无法进扩展沙箱——见 extensions/browser/README.md）
+  'browser',
 ]);
 
 /** net:out:<domain> 的域名形状（hostname：点分字母数字连字符段，允许单段如 localhost） */

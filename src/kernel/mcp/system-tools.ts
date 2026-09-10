@@ -3,7 +3,7 @@
  *
  * 把 Harness OS 的全部系统操作暴露为标准 MCP 工具（按域前缀命名：
  * skills_ / cron_ / notifications_ / extensions_ / files_ / mcp_ / plugins_ /
- * subagents_ / logs_ / update_ / system_），供两类调用方复用：
+ * subagents_ / logs_ / update_ / system_ / report_），供两类调用方复用：
  * - 外部 LLM/系统：经 `/mcp` 端点（Streamable HTTP，见 system-server.ts）调用；
  * - 内部扩展：经 h.mcp 桥（serverId='system'，见 bridge.ts 的目录合并）调用。
  *
@@ -26,8 +26,15 @@
 import type { Knex } from 'knex';
 import { z } from 'zod';
 
+import { HOST_METHODS } from '../../extension-host/protocol.js';
 import { CONTAINER_KEYS, type Kernel, type UpdaterFacade } from '../Kernel.js';
 import { SUBAGENT_STATUSES, SUBAGENT_TERMINAL_STATUSES } from '../agents/types.js';
+import {
+  BrowserBusyError,
+  BrowserNotInstalledError,
+  BrowserScreenshotNameError,
+  BrowserUrlRejectedError,
+} from '../browser/index.js';
 import { FACADE_CONTAINER_KEYS } from '../Facades.js';
 import type { HarnessConfig } from '../config/index.js';
 import type { CronJobRecord } from '../cron/scheduler.js';
@@ -235,11 +242,12 @@ function sleep(ms: number): Promise<void> {
  * 构建系统工具目录（每次调用返回全新数组；定义本身无状态，可安全复用）。
  * execute 的入参已在 runtime/SDK 层校验，此处再以 guard 兜底保证「工具不抛」。
  *
- * @param extra 集成方追加的工具（如 createExtractTools 产出的 files_extract；
- *   由 Kernel /mcp 接线处合并，保持既有目录零破坏）。
+ * @param extraGroups 集成方追加的工具组（如 createExtractTools 产出的 files_extract、
+ *   createHtmlReportTools 产出的报告四工具；由 Kernel /mcp 接线处合并，保持既有目录
+ *   零破坏）。
  */
-export function createSystemTools(extra: SystemTool[] = []): SystemTool[] {
-  return [...createBuiltinSystemTools(), ...extra];
+export function createSystemTools(...extraGroups: SystemTool[][]): SystemTool[] {
+  return [...createBuiltinSystemTools(), ...extraGroups.flat()];
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +322,502 @@ export function createExtractTools(getDeps: () => ExtractToolsDeps | undefined):
             truncated,
             text: truncated ? result.text.slice(0, EXTRACT_TOOL_TEXT_MAX_BYTES) : result.text,
           });
+        }),
+    ),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// 代码执行工具（coding_ 域；沙箱化会话引擎 src/kernel/coding）
+// ---------------------------------------------------------------------------
+
+/**
+ * CodingEngine 的结构视图（src/kernel/coding/engine.ts 的契约面；工具层只依赖此形状）。
+ * 安全边界（白名单 / argv 直传 / 路径钉死 / 超时 / 截断 / BUSY）由引擎统一收口，
+ * 工具层只做转发与结果归一。
+ */
+interface CodingEngineLike {
+  runInSession(
+    sessionId: string,
+    input: { cmd: string; args?: string[]; cwd?: string; timeoutMs?: number; env?: Record<string, string> },
+  ): Promise<Record<string, unknown>>;
+  runCode(
+    sessionId: string,
+    input: { language: 'node' | 'python'; code: string; timeoutMs?: number },
+  ): Promise<Record<string, unknown>>;
+  fsWrite(sessionId: string, relPath: string, content: string): Promise<unknown>;
+  fsRead(sessionId: string, relPath: string): Promise<unknown>;
+  fsList(sessionId: string, relPath?: string): Promise<unknown>;
+  listSessions(): Promise<unknown>;
+  resetSession(sessionId: string): Promise<unknown>;
+  deleteSession(sessionId: string): Promise<unknown>;
+}
+
+/** 容器懒解析 CodingEngine（未登记 → undefined，工具收敛为 HARNESS-9001 结果对象） */
+function resolveCodingEngine(ctx: SystemToolContext): CodingEngineLike | undefined {
+  if (!ctx.kernel.container.has(CONTAINER_KEYS.coding)) return undefined;
+  return ctx.kernel.container.resolve<CodingEngineLike>(CONTAINER_KEYS.coding);
+}
+
+/** coding_* 工具共用sessionId schema（缺省 "default"，语义由引擎侧归一） */
+const codingSessionIdShape = z.string().min(1).max(128).optional();
+
+/**
+ * 构建代码执行工具目录（coding_exec / coding_run_code / coding_fs_write /
+ * coding_fs_read / coding_fs_list / coding_sessions；集成方在 buildSystemToolCatalog
+ * 合并）。安全红线：不提供任意 shell——命令面受内核引擎白名单门约束（见
+ * src/kernel/coding/engine.ts 模块头注释的安全基线与已知局限）。
+ */
+export function createCodingTools(): SystemTool[] {
+  return [
+    defineTool(
+      'coding_exec',
+      '在持久代码会话目录内执行白名单命令（node/python3/pip/npm/npx/git/curl/ls/cat/grep 等；'
+      + '非 shell：args 为 argv 数组，shell 元字符按字面量传递；输出各 256KB 截断；'
+      + '每会话并发 1 进程；超时上限 120s）。',
+      {
+        sessionId: codingSessionIdShape,
+        cmd: z.string().min(1).max(128),
+        args: z.array(z.string()).max(256).optional(),
+        cwd: z.string().max(1024).optional(),
+        timeoutMs: z.number().int().positive().max(600_000).optional(),
+        env: z.record(z.string(), z.string()).optional(),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const engine = resolveCodingEngine(ctx);
+          if (!engine) {
+            return fail(
+              'HARNESS-9001',
+              'coding engine is not registered in this kernel assembly (see src/kernel/coding/engine.ts)',
+            );
+          }
+          const result = await engine.runInSession(
+            typeof args['sessionId'] === 'string' ? String(args['sessionId']) : 'default',
+            {
+              cmd: String(args['cmd']),
+              ...(Array.isArray(args['args']) ? { args: (args['args'] as unknown[]).map(String) } : {}),
+              ...(typeof args['cwd'] === 'string' ? { cwd: String(args['cwd']) } : {}),
+              ...(typeof args['timeoutMs'] === 'number' ? { timeoutMs: args['timeoutMs'] as number } : {}),
+              ...(args['env'] !== undefined && typeof args['env'] === 'object'
+                ? { env: args['env'] as Record<string, string> }
+                : {}),
+            },
+          );
+          return ok({ ...result });
+        }),
+    ),
+    defineTool(
+      'coding_run_code',
+      '在持久代码会话内执行一段源码（language: node|python；写入会话临时文件运行后清理；'
+      + '受同一白名单/超时/输出上限约束；stdout/stderr 返回给模型）。',
+      {
+        sessionId: codingSessionIdShape,
+        language: z.enum(['node', 'python']),
+        code: z.string().min(1).max(256 * 1024),
+        timeoutMs: z.number().int().positive().max(600_000).optional(),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const engine = resolveCodingEngine(ctx);
+          if (!engine) {
+            return fail(
+              'HARNESS-9001',
+              'coding engine is not registered in this kernel assembly (see src/kernel/coding/engine.ts)',
+            );
+          }
+          const result = await engine.runCode(
+            typeof args['sessionId'] === 'string' ? String(args['sessionId']) : 'default',
+            {
+              language: args['language'] === 'python' ? 'python' : 'node',
+              code: String(args['code']),
+              ...(typeof args['timeoutMs'] === 'number' ? { timeoutMs: args['timeoutMs'] as number } : {}),
+            },
+          );
+          return ok({ ...result });
+        }),
+    ),
+    defineTool(
+      'coding_fs_write',
+      '向代码会话目录写文件（path 为会话内相对路径，绝对路径与 .. 穿越拒绝；content 为 UTF-8 文本，上限 2MB）。',
+      {
+        sessionId: codingSessionIdShape,
+        path: z.string().min(1).max(1024),
+        content: z.string().max(2 * 1024 * 1024),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const engine = resolveCodingEngine(ctx);
+          if (!engine) {
+            return fail(
+              'HARNESS-9001',
+              'coding engine is not registered in this kernel assembly (see src/kernel/coding/engine.ts)',
+            );
+          }
+          const result = await engine.fsWrite(
+            typeof args['sessionId'] === 'string' ? String(args['sessionId']) : 'default',
+            String(args['path']),
+            String(args['content'] ?? ''),
+          );
+          return ok({ ...(result as Record<string, unknown>) });
+        }),
+    ),
+    defineTool(
+      'coding_fs_read',
+      '读取代码会话目录内文件（path 会话内相对；文本返回，256KB 截断）。',
+      {
+        sessionId: codingSessionIdShape,
+        path: z.string().min(1).max(1024),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const engine = resolveCodingEngine(ctx);
+          if (!engine) {
+            return fail(
+              'HARNESS-9001',
+              'coding engine is not registered in this kernel assembly (see src/kernel/coding/engine.ts)',
+            );
+          }
+          const result = await engine.fsRead(
+            typeof args['sessionId'] === 'string' ? String(args['sessionId']) : 'default',
+            String(args['path']),
+          );
+          return ok({ ...(result as Record<string, unknown>) });
+        }),
+    ),
+    defineTool(
+      'coding_fs_list',
+      '列出代码会话目录的一级内容（path 缺省会话根；返回 [{name,size,dir}]）。',
+      {
+        sessionId: codingSessionIdShape,
+        path: z.string().max(1024).optional(),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const engine = resolveCodingEngine(ctx);
+          if (!engine) {
+            return fail(
+              'HARNESS-9001',
+              'coding engine is not registered in this kernel assembly (see src/kernel/coding/engine.ts)',
+            );
+          }
+          const result = await engine.fsList(
+            typeof args['sessionId'] === 'string' ? String(args['sessionId']) : 'default',
+            typeof args['path'] === 'string' ? String(args['path']) : undefined,
+          );
+          return ok({ entries: result });
+        }),
+    ),
+    defineTool(
+      'coding_sessions',
+      '列出全部代码执行会话（[{id, dir, createdAt}]；会话目录即工作区，coding_exec 等按 sessionId 复用）。',
+      {},
+      (_args, ctx) =>
+        guard(async () => {
+          const engine = resolveCodingEngine(ctx);
+          if (!engine) {
+            return fail(
+              'HARNESS-9001',
+              'coding engine is not registered in this kernel assembly (see src/kernel/coding/engine.ts)',
+            );
+          }
+          return ok({ sessions: await engine.listSessions() });
+        }),
+    ),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// 浏览器自动化工具（browser_ 域；内核引擎 src/kernel/browser，Playwright 跑内核主线程）
+// ---------------------------------------------------------------------------
+
+/**
+ * BrowserEngine 的结构视图（src/kernel/browser/engine.ts 的契约面；工具层只依赖此形状）。
+ * 安全边界（URL 白名单 / 单例 mutex / 空闲回收 / 崩溃恢复 / 截图防穿越）由引擎统一收口，
+ * 工具层只做转发与结果归一。
+ */
+interface BrowserEngineLike {
+  navigate(url: string): Promise<{ title: string; url: string; status: number }>;
+  snapshot(): Promise<{ snapshot: string; truncated: boolean }>;
+  click(input: { selector: string }): Promise<unknown>;
+  type(input: { selector: string; text: string }): Promise<unknown>;
+  pressKey(input: { key: string }): Promise<unknown>;
+  screenshot(input: { fullPage?: boolean }): Promise<{ path: string; file: string; url: string }>;
+  close(): Promise<void>;
+  status(): Promise<{ installed: boolean; running: boolean; installing: boolean; lastError: string | null }>;
+}
+
+/**
+ * browser_* 工具的依赖注入面（**直接注入模式**，与 createExtractTools 同款）：
+ * 集成方在 buildSystemToolCatalog 传 `() => ({ engine })`；引擎未装配（裸装配）时
+ * 工具收敛为 HARNESS-9001 结果对象，不影响其余域工具。
+ */
+export type BrowserToolsDeps = { engine?: BrowserEngineLike };
+
+/**
+ * 引擎错误 → 结构化结果对象（业务码直出；HarnessError 保留全码，其余 INTERNAL）。
+ * browser_not_installed 按需求形状携带 `hint`（如何安装浏览器），面向 LLM 可操作。
+ */
+function browserErrorResult(e: unknown): Record<string, unknown> {
+  if (e instanceof BrowserNotInstalledError) {
+    return { ok: false, error: { code: e.code, message: e.message, hint: e.hint } };
+  }
+  if (e instanceof BrowserUrlRejectedError) {
+    return fail(e.code, e.message, { url: e.url });
+  }
+  if (e instanceof BrowserBusyError || e instanceof BrowserScreenshotNameError) {
+    return fail(e.code, e.message);
+  }
+  if (e instanceof HarnessError) {
+    return fail(e.code, e.message, e.detail);
+  }
+  return fail('INTERNAL', e instanceof Error ? e.message : String(e));
+}
+
+/** browser_* 工具共用执行壳：引擎缺失 → HARNESS-9001；引擎异常 → 结构化结果（工具不抛） */
+async function runBrowserTool(
+  engine: BrowserEngineLike | undefined,
+  run: (engine: BrowserEngineLike) => Promise<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  if (engine === undefined) {
+    return fail(
+      'HARNESS-9001',
+      'browser engine is not registered in this kernel assembly (see src/kernel/browser/engine.ts)',
+    );
+  }
+  try {
+    return await run(engine);
+  } catch (e) {
+    return browserErrorResult(e);
+  }
+}
+
+/**
+ * 构建浏览器自动化工具目录（browser_navigate / browser_snapshot / browser_click /
+ * browser_type / browser_press_key / browser_screenshot / browser_close / browser_status；
+ * 集成方在 buildSystemToolCatalog 注入容器懒解析的引擎 getter）。
+ * 浏览器二进制默认不下载：未安装时全部页面类工具收敛为 browser_not_installed
+ * 结构化错误（携带 hint），browser_status / browser_close 不受影响。
+ */
+export function createBrowserTools(getDeps: () => BrowserToolsDeps | undefined): SystemTool[] {
+  return [
+    defineTool(
+      'browser_navigate',
+      '导航单例浏览器到指定 URL 并返回页面 { title, url, status }（仅允许 http/https，'
+      + 'file:// 与其余协议被拒；导航超时 30s；浏览器 10 分钟空闲自动关闭，调用时按需冷启动）。',
+      { url: z.string().min(1).max(2048) },
+      (args) =>
+        runBrowserTool(getDeps()?.engine, async (engine) =>
+          ok({ ...(await engine.navigate(String(args['url']))) })),
+    ),
+    defineTool(
+      'browser_snapshot',
+      '获取当前页面的可访问性 aria 快照文本（≤50KB 截断）——阅读页面结构/文本的首选工具。',
+      {},
+      () =>
+        runBrowserTool(getDeps()?.engine, async (engine) => {
+          const result = await engine.snapshot();
+          return ok({ snapshot: result.snapshot, truncated: result.truncated });
+        }),
+    ),
+    defineTool(
+      'browser_click',
+      '点击当前页面中匹配 selector 的元素（CSS/文本选择器；30s 内未出现则超时）。',
+      { selector: z.string().min(1).max(2048) },
+      (args) =>
+        runBrowserTool(getDeps()?.engine, async (engine) => {
+          await engine.click({ selector: String(args['selector']) });
+          return ok({ done: true });
+        }),
+    ),
+    defineTool(
+      'browser_type',
+      '向当前页面中匹配 selector 的输入元素输入文本（fill 语义：先清空原值再写入）。',
+      { selector: z.string().min(1).max(2048), text: z.string().max(64 * 1024) },
+      (args) =>
+        runBrowserTool(getDeps()?.engine, async (engine) => {
+          await engine.type({ selector: String(args['selector']), text: String(args['text'] ?? '') });
+          return ok({ done: true });
+        }),
+    ),
+    defineTool(
+      'browser_press_key',
+      '向当前页面发送一次键盘按键（如 Enter / Tab / Escape / ArrowDown；page.keyboard.press 语义）。',
+      { key: z.string().min(1).max(64) },
+      (args) =>
+        runBrowserTool(getDeps()?.engine, async (engine) => {
+          await engine.pressKey({ key: String(args['key']) });
+          return ok({ done: true });
+        }),
+    ),
+    defineTool(
+      'browser_screenshot',
+      '对当前页面截图（PNG 落数据目录；fullPage=true 时整页滚动截图），返回 { path, file, url }'
+      + '——url 即扩展路由 GET /ext/browser/screenshots/:file（auth:user）。',
+      { fullPage: z.boolean().optional() },
+      (args) =>
+        runBrowserTool(getDeps()?.engine, async (engine) =>
+          ok({ ...(await engine.screenshot({ fullPage: args['fullPage'] === true })) })),
+    ),
+    defineTool(
+      'browser_close',
+      '关闭浏览器实例释放资源（幂等；下次页面类工具调用会自动重新冷启动）。',
+      {},
+      () =>
+        runBrowserTool(getDeps()?.engine, async (engine) => {
+          await engine.close();
+          return ok({ done: true });
+        }),
+    ),
+    defineTool(
+      'browser_status',
+      '查询浏览器引擎运行态：{ installed, running, installing, lastError }（installed=false 时先调'
+      + ' POST /ext/browser/install 触发后台安装，完成后再用页面类工具）。',
+      {},
+      () =>
+        runBrowserTool(getDeps()?.engine, async (engine) =>
+          ok({ ...(await engine.status()) })),
+    ),
+  ];
+}
+
+
+
+/**
+ * html-report 扩展 id（extensions/html-report；本域工具桥接的唯一目标）。
+ *
+ * 扩展机制 v1 无工具注册贡献点（贡献点仅 route/cron/event/hook/service/ui），
+ * 因此报告工具在内核目录静态登记、执行**桥接到扩展**：读容器 extManager（扩展
+ * 注册表）→ 目标扩展已启用 → bridgeFor → host.call('reports.<method>')。扩展侧
+ * 逻辑（长度校验/UUID 防穿越/存储/删除）见 extensions/html-report/index.js。
+ */
+export const HTML_REPORT_EXT_ID = 'html-report';
+
+/** html-report 扩展暴露的服务名（h.expose('reports', { create/list/get/delete })） */
+const HTML_REPORT_SERVICE = 'reports';
+
+/** report_create 的 HTML 字节上限（2MB；扩展侧以 UTF-8 字节精确复核） */
+export const HTML_REPORT_MAX_BYTES = 2 * 1024 * 1024;
+
+/** reportId 形状（UUID；路径穿越防护的第一道闸——`../` 等形状在此被拒） */
+const HTML_REPORT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** ExtensionManager 的结构视图（工具层不 import manager 实现，只依赖此形状） */
+interface ExtManagerLike {
+  list(): Array<{ id: string; enabled: boolean }>;
+  bridgeFor(extId: string): {
+    callToWorker(extId: string, topic: string, payload: unknown, timeoutMs?: number): Promise<unknown>;
+  } | null;
+}
+
+/**
+ * 解析 html-report 扩展的桥接调用器（读扩展注册表 → 启用位 → 所在池的桥）。
+ * 未装配 extManager / 扩展未发现 / 未启用 / worker 不在 → 抛 HarnessError，
+ * 由 guard 统一收敛为 {ok:false,error} 结果对象（工具不抛契约）。
+ */
+function htmlReportCall(ctx: SystemToolContext): (method: string, args: unknown) => Promise<unknown> {
+  const manager = required<ExtManagerLike>(ctx, CONTAINER_KEYS.extManager);
+  const summary = manager.list().find((s) => s.id === HTML_REPORT_EXT_ID);
+  if (summary === undefined) {
+    throw err('EXT_NOT_FOUND', {
+      message: `extension "${HTML_REPORT_EXT_ID}" is not discovered (expected under the extensions directories)`,
+    });
+  }
+  if (summary.enabled !== true) {
+    throw err('SERVICE_UNAVAILABLE', {
+      message: `extension "${HTML_REPORT_EXT_ID}" is not enabled (enable it first, e.g. POST /api/v1/extensions/${HTML_REPORT_EXT_ID}/enable)`,
+      detail: { extId: HTML_REPORT_EXT_ID },
+    });
+  }
+  const bridge = manager.bridgeFor(HTML_REPORT_EXT_ID);
+  if (bridge === null || bridge === undefined) {
+    throw err('SERVICE_UNAVAILABLE', {
+      message: `extension "${HTML_REPORT_EXT_ID}" worker is not running`,
+      detail: { extId: HTML_REPORT_EXT_ID },
+    });
+  }
+  return (method, args) =>
+    bridge.callToWorker(HTML_REPORT_EXT_ID, HOST_METHODS.callService, {
+      service: HTML_REPORT_SERVICE,
+      method,
+      args,
+    });
+}
+
+/**
+ * 构建报告工具目录（html-report 域，桥接社区扩展 html-report；无外部依赖注入，
+ * 全部经容器懒解析——与 builtin 工具同款装配方式，由 buildSystemToolCatalog 并表）。
+ */
+export function createHtmlReportTools(): SystemTool[] {
+  return [
+    defineTool(
+      'report_create',
+      '保存一份 LLM 生成的 HTML 报告（≤2MB）供 WebUI 内嵌预览（返回 reportId、path 与预览地址 '
+        + '/ext/html-report/reports/{reportId}；由社区扩展 html-report 存储于数据目录）。',
+      {
+        title: z.string().min(1).max(256),
+        html: z.string().min(1).max(HTML_REPORT_MAX_BYTES),
+        session_id: z.string().min(1).max(256).optional(),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          // 字节精确复核（zod max 按 UTF-16 码元计，多字节字符可绕过，此处兜底 2MB）
+          const html = String(args['html']);
+          const bytes = Buffer.byteLength(html, 'utf8');
+          if (bytes > HTML_REPORT_MAX_BYTES) {
+            return fail('HARNESS-1005', `html exceeds ${HTML_REPORT_MAX_BYTES} bytes`, {
+              bytes,
+              maxBytes: HTML_REPORT_MAX_BYTES,
+            });
+          }
+          const call = htmlReportCall(ctx);
+          const created = (await call('create', {
+            title: String(args['title']),
+            html,
+            ...(args['session_id'] !== undefined ? { sessionId: String(args['session_id']) } : {}),
+          })) as Record<string, unknown>;
+          return ok(created);
+        }),
+    ),
+    defineTool(
+      'report_list',
+      '列出已保存的 HTML 报告（按创建时间降序；可按 session_id 过滤，不含 HTML 正文）。',
+      {
+        session_id: z.string().min(1).max(256).optional(),
+        limit: z.number().int().min(1).max(200).optional(),
+        offset: z.number().int().min(0).optional(),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const call = htmlReportCall(ctx);
+          const listed = (await call('list', {
+            ...(args['session_id'] !== undefined ? { sessionId: String(args['session_id']) } : {}),
+            ...(args['limit'] !== undefined ? { limit: Number(args['limit']) } : {}),
+            ...(args['offset'] !== undefined ? { offset: Number(args['offset']) } : {}),
+          })) as Record<string, unknown>;
+          return ok(listed);
+        }),
+    ),
+    defineTool(
+      'report_get',
+      '读取单个 HTML 报告（标题 + HTML 正文 + 元数据；reportId 为 UUID）。',
+      { reportId: z.string().regex(HTML_REPORT_ID_RE, 'reportId must be a UUID') },
+      (args, ctx) =>
+        guard(async () => {
+          const call = htmlReportCall(ctx);
+          const got = (await call('get', { reportId: String(args['reportId']) })) as Record<string, unknown>;
+          return ok(got);
+        }),
+    ),
+    defineTool(
+      'report_delete',
+      '删除单个 HTML 报告（存储与预览入口一并失效；reportId 为 UUID）。',
+      { reportId: z.string().regex(HTML_REPORT_ID_RE, 'reportId must be a UUID') },
+      (args, ctx) =>
+        guard(async () => {
+          const call = htmlReportCall(ctx);
+          const removed = (await call('delete', { reportId: String(args['reportId']) })) as Record<string, unknown>;
+          return ok(removed);
         }),
     ),
   ];

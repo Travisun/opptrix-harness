@@ -104,6 +104,22 @@ export const KERNEL_TOPICS = {
   memoryForget: 'memory.forget',
   asrStatus: 'asr.status',
   asrTranscribe: 'asr.transcribe',
+  // ---- 浏览器自动化（内核引擎，Playwright 跑在内核主线程；扩展壳 h.browser.* 转发）----
+  /** 运行态快照 {} → { installed, running, installing, lastError }（需 'browser' 权限） */
+  browserStatus: 'browser.status',
+  /** 触发后台安装 chromium（幂等，不等完成）（需 'browser' 权限） */
+  browserInstall: 'browser.install',
+  /** 读取截图文件 { file } → { file, mime, base64 }（uuid 形状校验防穿越；需 'browser' 权限） */
+  browserScreenshot: 'browser.screenshot',
+  // ---- Coding（沙箱化代码执行会话；引擎 src/kernel/coding，需 'sandbox' 权限）----
+  codingExec: 'coding.exec',
+  codingRunCode: 'coding.runCode',
+  codingFsWrite: 'coding.fs.write',
+  codingFsRead: 'coding.fs.read',
+  codingFsList: 'coding.fs.list',
+  codingSessions: 'coding.sessions',
+  codingSessionReset: 'coding.session.reset',
+  codingSessionDelete: 'coding.session.delete',
   /** SHA-256 摘要（令牌脱敏存储等）：{ value } → { hash }（需 'auth:provider' 权限） */
   authHashToken: 'auth.hashToken',
   authTotpGenerate: 'auth.totpGenerate',

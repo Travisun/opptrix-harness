@@ -69,6 +69,8 @@ export const ERR_CODES = {
   SANDBOX_TIMEOUT: { domain: 'SANDBOX', seq: 2, status: 504, message: 'sandbox command timeout', retryable: true },
   SANDBOX_ERROR: { domain: 'SANDBOX', seq: 3, status: 500, message: 'sandbox error', retryable: false },
   SANDBOX_NOT_FOUND: { domain: 'SANDBOX', seq: 4, status: 404, message: 'sandbox workspace not found', retryable: false },
+  /** coding 会话并发门（CodingEngine）：每会话同时至多 1 个进程，忙时拒绝（BUSY 信号） */
+  SANDBOX_BUSY: { domain: 'SANDBOX', seq: 5, status: 409, message: 'coding session busy (one process per session)', retryable: true },
   // ---- DELIVERY 7xxx ----
   DELIVERY_FAILED: { domain: 'DELIVERY', seq: 1, status: 502, message: 'channel delivery failed', retryable: true },
   DELIVERY_DRIVER_NOT_FOUND: { domain: 'DELIVERY', seq: 2, status: 404, message: 'channel driver not found', retryable: false },

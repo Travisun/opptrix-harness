@@ -77,6 +77,7 @@ export const KNOWN_PERMISSIONS: readonly string[] = [
   'plugins',
   'memory',
   'asr',
+  'browser',
 ];
 
 /** 精确权限 → 中文说明（含 task 约定的 secrets/files 展示别名；未知权限走 permissionLabel 兜底） */
@@ -106,6 +107,7 @@ export const PERMISSION_LABELS: Readonly<Record<string, string>> = {
   plugins: '插件目录读取',
   memory: '全局记忆',
   asr: '语音识别',
+  browser: '浏览器自动化',
   secrets: '凭据读取',
 };
 
