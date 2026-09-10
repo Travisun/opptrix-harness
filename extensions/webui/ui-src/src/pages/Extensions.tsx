@@ -5,7 +5,6 @@ import {
   PackageXIcon,
   RefreshCwIcon,
   SearchIcon,
-  ShieldCheckIcon,
   TriangleAlertIcon,
   UploadCloudIcon,
 } from 'lucide-react';
@@ -21,7 +20,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Label } from '@/components/ui/label';
 import { Pagination } from '@/components/pagination';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
@@ -39,7 +37,10 @@ import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { ExtensionCard } from '@/pages/Extensions/ExtensionCard';
 import { InstallConfirmDialog } from '@/pages/Extensions/InstallConfirmDialog';
+import { TrustDialog } from '@/pages/Extensions/TrustDialog';
+import type { TrustDialogTarget } from '@/pages/Extensions/TrustDialog';
 import { MAX_EXTENSION_ZIP_BYTES, isDuplicateInstallError } from '@/pages/Extensions/shared';
+import { isTrustRequired, trustPermissions } from '@/pages/Extensions/trust';
 import type { ExtensionInstallResponse } from '@/pages/Extensions/shared';
 import {
   EmptyState,
@@ -51,7 +52,7 @@ import type {
   ServiceEntry,
   UiSnapshotEntry,
 } from '@/pages/_shared';
-import { errText, isApiError } from '@/pages/_shared';
+import { errText } from '@/pages/_shared';
 
 /**
  * Extensions — 扩展管理。
@@ -75,18 +76,6 @@ import { errText, isApiError } from '@/pages/_shared';
  */
 
 type ExtAction = 'enable' | 'disable' | 'reload' | 'uninstall';
-
-/** 信任闸命中（线上 code 为 HARNESS-3012 / EXT_TRUST_REQUIRED，状态 403） */
-function isTrustRequired(e: unknown): boolean {
-  return isApiError(e) && e.status === 403 && ['HARNESS-3012', 'EXT_TRUST_REQUIRED'].includes(e.code);
-}
-
-/** 从信任闸错误的 detail 提取声明权限清单 */
-function trustPermissions(e: unknown): string[] {
-  if (!isApiError(e) || e.detail === null || typeof e.detail !== 'object') return [];
-  const perms = (e.detail as { permissions?: unknown }).permissions;
-  return Array.isArray(perms) ? perms.filter((p): p is string => typeof p === 'string') : [];
-}
 
 export default function ExtensionsPage(): React.ReactNode {
   const [extensions, setExtensions] = useState<ExtSummary[] | null>(null);
@@ -472,46 +461,26 @@ export default function ExtensionsPage(): React.ReactNode {
         onConfirm={() => void confirmInstall()}
       />
 
-      {/* 信任确认 Dialog */}
-      <Dialog open={trustTarget !== null} onOpenChange={(open) => !open && setTrustTarget(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <ShieldCheckIcon className="size-5 text-amber-500" aria-hidden />
-              信任此扩展并启用？
-            </DialogTitle>
-            <DialogDescription>
-              「{trustTarget?.ext.manifest?.displayName ?? trustTarget?.ext.id}」来自不受信目录（本地扩展池），首次启用需要人工授信。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex flex-col gap-3 text-sm">
-            <div className="flex flex-col gap-1.5">
-              <Label className="text-muted-foreground text-xs">该扩展声明的权限</Label>
-              <div className="flex flex-wrap gap-1.5">
-                {trustTarget !== null && trustTarget.permissions.length > 0 ? (
-                  trustTarget.permissions.map((p) => (
-                    <Badge key={p} variant="outline" className="font-mono text-[11px]">
-                      {p}
-                    </Badge>
-                  ))
-                ) : (
-                  <span className="text-muted-foreground text-xs">（未声明权限）</span>
-                )}
-              </div>
-            </div>
-            <p className="text-destructive flex items-start gap-1.5 text-xs leading-relaxed">
-              <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-              信任表示你确认该扩展来源可靠。启用后它将获得以上权限（网络访问、存储、通知等），请仅授信你了解的扩展。
-            </p>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setTrustTarget(null)}>
-              取消
-            </Button>
-            <Button onClick={() => void confirmTrust()}>确认信任并启用</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* 信任确认 Dialog（403 HARNESS-3012 → 安全披露 → 确认后带 {confirmTrust:true} 重试授信） */}
+      <TrustDialog
+        target={
+          trustTarget === null
+            ? null
+            : ({
+                extId: trustTarget.ext.id,
+                displayName: trustTarget.ext.manifest?.displayName,
+                version: trustTarget.ext.version,
+                host: trustTarget.ext.host,
+                source: trustTarget.ext.dir ?? '本地扩展目录（数据卷 extensions/）',
+                permissions: trustTarget.permissions,
+              } satisfies TrustDialogTarget)
+        }
+        busy={trustTarget !== null && busy[trustTarget.ext.id] === 'enable'}
+        onOpenChange={(open) => {
+          if (!open) setTrustTarget(null);
+        }}
+        onConfirm={() => void confirmTrust()}
+      />
 
       {/* 卸载确认 Dialog */}
       <Dialog open={uninstallTarget !== null} onOpenChange={(open) => !open && setUninstallTarget(null)}>

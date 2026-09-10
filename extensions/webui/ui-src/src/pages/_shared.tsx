@@ -99,6 +99,8 @@ export interface ExtSummary {
   contributions?: { routes: number; crons: number; events: number; hooks: number; services: number };
   dir?: string;
   crashCount: number;
+  /** 第三方扩展人工授信时间（epoch ms）；受信第一方恒为 null（内核 ExtSummary.trustedAt） */
+  trustedAt?: number | null;
   lastError: string | null;
 }
 
