@@ -30,8 +30,22 @@ import {
 function wrapProviderError(e: unknown): never {
   throw err('LLM_PROVIDER_ERROR', {
     message: e instanceof Error ? e.message : String(e),
+    // 提供方侧失败是排障高频点：带 errorKind 与内层 cause 链摘要进 detail
+    //（REST 面已鉴权；堆栈只进日志面——HarnessError.cause 由 logSink 序列化）
+    detail: {
+      errorKind: e instanceof Error ? e.name : typeof e,
+      causeChain: causeChainOf(e),
+    },
     cause: e,
   });
+}
+
+/** 提取 cause 链摘要（最多 3 层，每层 type+message；排障 SDK/undici 包装错误） */
+function causeChainOf(e: unknown, depth = 0): string[] {
+  if (depth >= 3 || e === null || e === undefined || typeof e !== 'object') return [];
+  const err = e as { name?: string; message?: string; cause?: unknown };
+  const line = `${err.name ?? 'unknown'}: ${err.message ?? ''}`;
+  return [line, ...causeChainOf(err.cause, depth + 1)];
 }
 
 function clientOf(cfg: LlmProviderConfig, apiKey: string): OpenAI {
@@ -39,7 +53,8 @@ function clientOf(cfg: LlmProviderConfig, apiKey: string): OpenAI {
     apiKey,
     baseURL: cfg.baseUrl,
     timeout: cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    maxRetries: 0,
+    // 缺省 2 次（同 openai-chat）：波动链路下兼容网关的间歇失败是常态
+    maxRetries: cfg.maxRetries ?? 2,
   });
 }
 
@@ -99,6 +114,13 @@ export const openaiResponsesAdapter: LlmAdapter = {
       const res = await client.responses.create(params, {
         signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
       });
+      // 兼容网关链路波动时回 200 + 空 body（SDK 静默 resolve undefined）——见 openai-chat 同款守卫
+      if (res === undefined || res === null) {
+        throw err('LLM_PROVIDER_ERROR', {
+          message: `provider "${cfg.name}" [guard:oir] returned an empty response body (transient gateway behavior) — retry`,
+          detail: { provider: cfg.name, model: input.model, kind: 'empty-body' },
+        });
+      }
       const text =
         typeof res.output_text === 'string' && res.output_text.length > 0
           ? res.output_text

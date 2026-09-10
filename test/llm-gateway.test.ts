@@ -105,6 +105,9 @@ function provider(overrides: Partial<LlmProviderConfig> = {}): LlmProviderConfig
     apiKeySecretRef: 'secret://llm/mock',
     models: ['model-under-test'],
     timeoutMs: 5_000,
+    // 本文件断言的是网关层（HA 回退）的精确尝试语义——传输层重试必须关闭，
+    // 否则 SDK 缺省 2 次重试会打乱「上游恰被调用 N 次」的计数断言。
+    maxRetries: 0,
     ...overrides,
   };
 }

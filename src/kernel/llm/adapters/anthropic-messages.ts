@@ -34,8 +34,22 @@ const DEFAULT_MAX_TOKENS = 4096;
 function wrapProviderError(e: unknown): never {
   throw err('LLM_PROVIDER_ERROR', {
     message: e instanceof Error ? e.message : String(e),
+    // 提供方侧失败是排障高频点：带 errorKind 与内层 cause 链摘要进 detail
+    //（REST 面已鉴权；堆栈只进日志面——HarnessError.cause 由 logSink 序列化）
+    detail: {
+      errorKind: e instanceof Error ? e.name : typeof e,
+      causeChain: causeChainOf(e),
+    },
     cause: e,
   });
+}
+
+/** 提取 cause 链摘要（最多 3 层，每层 type+message；排障 SDK/undici 包装错误） */
+function causeChainOf(e: unknown, depth = 0): string[] {
+  if (depth >= 3 || e === null || e === undefined || typeof e !== 'object') return [];
+  const err = e as { name?: string; message?: string; cause?: unknown };
+  const line = `${err.name ?? 'unknown'}: ${err.message ?? ''}`;
+  return [line, ...causeChainOf(err.cause, depth + 1)];
 }
 
 function clientOf(cfg: LlmProviderConfig, apiKey: string): Anthropic {
@@ -43,7 +57,8 @@ function clientOf(cfg: LlmProviderConfig, apiKey: string): Anthropic {
     apiKey,
     baseURL: cfg.baseUrl,
     timeout: cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    maxRetries: 0,
+    // 缺省 2 次（同 openai-chat）：波动链路下兼容网关的间歇失败是常态
+    maxRetries: cfg.maxRetries ?? 2,
   });
 }
 
@@ -110,6 +125,13 @@ export const anthropicMessagesAdapter: LlmAdapter = {
       const res = await client.messages.create(params, {
         signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
       });
+      // 空响应守卫（同 openai-chat）：链路波动时网关可能回空 body，SDK 静默 resolve undefined
+      if (res === undefined || res === null || !Array.isArray(res.content)) {
+        throw err('LLM_PROVIDER_ERROR', {
+          message: `provider "${cfg.name}" [guard:am] returned an empty response body (transient gateway behavior) — retry`,
+          detail: { provider: cfg.name, model: input.model, kind: 'empty-body' },
+        });
+      }
       const text = res.content
         .filter((b): b is Anthropic.TextBlock => b.type === 'text')
         .map((b) => b.text)

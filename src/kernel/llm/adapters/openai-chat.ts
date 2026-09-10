@@ -31,17 +31,39 @@ import {
 function wrapProviderError(e: unknown): never {
   throw err('LLM_PROVIDER_ERROR', {
     message: e instanceof Error ? e.message : String(e),
+    // 提供方侧失败是排障高频点：带 errorKind 与内层 cause 链摘要进 detail
+    //（REST 面已鉴权；堆栈只进日志面——HarnessError.cause 由 logSink 序列化）
+    detail: {
+      errorKind: e instanceof Error ? e.name : typeof e,
+      causeChain: causeChainOf(e),
+      ...(e instanceof Error && e.stack !== undefined ? { stack: e.stack.split('\n').slice(0, 8) } : {}),
+    },
     cause: e,
   });
 }
 
+/** 提取 cause 链摘要（最多 3 层，每层 type+message；排障 SDK/undici 包装错误） */
+function causeChainOf(e: unknown, depth = 0): string[] {
+  if (depth >= 3 || e === null || e === undefined || typeof e !== 'object') return [];
+  const err = e as { name?: string; message?: string; cause?: unknown };
+  const line = `${err.name ?? 'unknown'}: ${err.message ?? ''}`;
+  return [line, ...causeChainOf(err.cause, depth + 1)];
+}
+
+/** 最近一次响应的头部快照（empty-body 诊断用；SDK 消化 response 后守卫处已拿不到） */
+
 function clientOf(cfg: LlmProviderConfig, apiKey: string): OpenAI {
-  return new OpenAI({
+  const client = new OpenAI({
     apiKey,
     baseURL: cfg.baseUrl,
     timeout: cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    maxRetries: 0,
+    // 缺省 2 次（SDK 缺省）：兼容网关链路波动（间歇空 body/连接重置）是常态而非异常；
+    // 每次重试带指数退避，配置面可经 timeoutMs/paramAllowlist 同层的 retry 覆盖（未开放时取缺省）。
+    maxRetries: cfg.maxRetries ?? 2,
+    // debug 排障：SDK 自带请求/响应日志（默认 console，stderr 进 dev 日志；非 debug 不输出）
+    ...(process.env.HARNESS_LOG_LEVEL === 'debug' ? { logLevel: 'debug' as const } : {}),
   });
+  return client;
 }
 
 function toOpenAiMessages(messages: LlmMessage[]): OpenAI.Chat.ChatCompletionMessageParam[] {
@@ -89,6 +111,21 @@ export const openaiChatAdapter: LlmAdapter = {
       const res = await client.chat.completions.create(params, {
         signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
       });
+      // 兼容网关在链路波动时会回 200 + JSON content-type + 空 body（SDK 对此静默
+      // resolve undefined，见 openai/internal/parse.mjs 的 content-length:0/空正文
+      // 分支）——收敛为明确可重试的 provider 错误，而非裸 TypeError。
+      if (res === undefined || res === null) {
+        throw err('LLM_PROVIDER_ERROR', {
+          message: `provider "${cfg.name}" returned an empty response body (transient gateway behavior) — retry`,
+          detail: { provider: cfg.name, model: input.model, kind: 'empty-body' },
+        });
+      }
+      if (!Array.isArray(res.choices) || res.choices.length === 0) {
+        throw err('LLM_PROVIDER_ERROR', {
+          message: `provider "${cfg.name}" returned no choices`,
+          detail: { provider: cfg.name, model: input.model, kind: 'empty-choices' },
+        });
+      }
       const usage = res.usage
         ? { inputTokens: res.usage.prompt_tokens, outputTokens: res.usage.completion_tokens }
         : undefined;

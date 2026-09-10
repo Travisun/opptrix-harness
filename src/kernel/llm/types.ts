@@ -53,6 +53,8 @@ export interface LlmProviderConfig {
   paramAllowlist?: string[];
   /** 请求超时（毫秒），缺省 120_000 */
   timeoutMs?: number;
+  /** SDK 传输层重试次数（缺省 2；波动链路/兼容网关建议 ≥1，0 = 关闭） */
+  maxRetries?: number;
 }
 
 export interface LlmUsage {

@@ -10,6 +10,7 @@
  */
 import { CONTAINER_KEYS, Kernel } from './kernel/Kernel.js';
 import { loadDotenv } from './kernel/config/index.js';
+import { installNetworkDispatcher } from './kernel/net/dispatcher.js';
 
 /** 仅限 logger 未就绪期的兜底输出（见文件头注释的唯一例外说明） */
 function fallbackError(message: string, e: unknown): void {
@@ -18,6 +19,8 @@ function fallbackError(message: string, e: unknown): void {
 
 async function main(): Promise<void> {
   await loadDotenv();
+  // 出站网络修复必须在任何 fetch 之前（LLM/下载/桥接都会出站）：双栈回退 + 代理 env
+  installNetworkDispatcher();
 
   let kernel: Kernel;
   try {

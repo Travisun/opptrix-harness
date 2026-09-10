@@ -146,7 +146,10 @@ const providerConfigSchema = z
     apiKeySecretRef: z.string().min(1).max(128).optional(),
     models: z.array(z.string().min(1)).min(1).max(256),
     paramAllowlist: z.array(z.string().min(1)).max(64).optional(),
-    timeoutMs: z.number().int().min(1).max(600_000).optional(),
+    // 单位毫秒（防呆下限 1000：LLM 调用不存在 <1s 的合理超时，600 这类「想设 600 秒」的
+    // 毫秒/秒混填会在请求发出瞬间超时，表现为 502 Request was aborted）
+    timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+    maxRetries: z.number().int().min(0).max(8).optional(),
   })
   .refine((p) => p.apiKey !== undefined || p.apiKeySecretRef !== undefined, {
     error: 'each provider requires either apiKey (plaintext, auto-stored to secrets) or apiKeySecretRef',
