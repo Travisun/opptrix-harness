@@ -338,6 +338,48 @@ const m016Subagents: Migration = {
   },
 };
 
+/**
+ * 017 — flow_endpoints / flow_events：传入 Webhook（FlowTrigger）端点与事件流水。
+ *
+ * - flow_endpoints：外部系统回调入口（slug 唯一、url-safe）；secret_ref 指向 secrets 层的
+ *   HMAC 密钥（`flow.<id>.secret`，明文永不落本表）；flow_config 为 TEXT JSON
+ *   （notify 型 = { notification: {title, body?, level?, data?} }，llm 型 = { model? }）；
+ * - flow_events：入站事件审计（只存 payload 的 SHA-256 摘要，不落原始 payload 全文），
+ *   result 为 TEXT JSON（llm 输出 / 通知 id / log 标记）；endpoint_id+created_at 联合索引。
+ */
+const m017Flow: Migration = {
+  name: '017_flow',
+  up: async (knex: Knex): Promise<void> => {
+    await knex.schema.createTable('flow_endpoints', (t) => {
+      t.text('id').primary();
+      t.text('name').notNullable();
+      t.text('slug').notNullable().unique(); // url-safe，全局唯一（name slugify + 随机后缀）
+      t.text('secret_ref'); // secrets 层引用（flow.<id>.secret）；空 = 跳过签名校验
+      t.integer('enabled').notNullable().defaultTo(1); // 0/1
+      t.text('flow_type').notNullable().defaultTo('log'); // log | notify | llm
+      t.text('flow_config'); // JSON 字符串（按 flow_type 结构化）
+      t.text('llm_prompt'); // llm 型提示词（可空；notify/log 型为空）
+      t.integer('created_at').notNullable(); // UTC epoch ms
+      t.integer('updated_at').notNullable(); // UTC epoch ms
+    });
+    await knex.schema.createTable('flow_events', (t) => {
+      t.text('id').primary();
+      t.text('endpoint_id').notNullable(); // 逻辑外键 → flow_endpoints.id（级联删由 manager 负责）
+      t.text('status').notNullable().defaultTo('received'); // received | processed | failed
+      t.text('payload_digest').notNullable(); // SHA-256 hex（原始 payload 摘要，非全文）
+      t.text('source_ip'); // 来源 IP（可空）
+      t.text('error'); // 失败原因（failed 时）
+      t.text('result'); // JSON 字符串（llm 输出 / 通知 id / log 标记）
+      t.integer('created_at').notNullable(); // UTC epoch ms
+      t.index(['endpoint_id', 'created_at'], 'flow_events_endpoint_id_created_at_index');
+    });
+  },
+  down: async (knex: Knex): Promise<void> => {
+    await knex.schema.dropTableIfExists('flow_events');
+    await knex.schema.dropTableIfExists('flow_endpoints');
+  },
+};
+
 /** 内核全部迁移（按版本号升序执行；回滚时逆序）。 */
 export const KERNEL_MIGRATIONS: Migration[] = [
   m001Settings,
@@ -356,4 +398,5 @@ export const KERNEL_MIGRATIONS: Migration[] = [
   m014Deliveries,
   m015ExtensionsTrust,
   m016Subagents,
+  m017Flow,
 ];

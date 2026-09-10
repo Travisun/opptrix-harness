@@ -27,10 +27,13 @@ const KERNEL_TABLES = [
   'tasks',
   'deliveries',
   'subagents',
+  'flow_endpoints',
+  'flow_events',
 ] as const;
 
 /** 期望的迁移名（顺序敏感）。015_extensions_trust：第三方扩展信任确认列（ext-trust 工作包追加）；
- *  016_subagents：子代理表（subagents 工作包追加）。 */
+ *  016_subagents：子代理表（subagents 工作包追加）；
+ *  017_flow：传入 Webhook 端点与事件表（flows 工作包追加）。 */
 const EXPECTED_MIGRATION_NAMES = [
   '001_settings',
   '002_secrets',
@@ -48,6 +51,7 @@ const EXPECTED_MIGRATION_NAMES = [
   '014_deliveries',
   '015_extensions_trust',
   '016_subagents',
+  '017_flow',
 ] as const;
 
 type RawRow = Record<string, unknown>;
@@ -139,7 +143,7 @@ describe('KERNEL_MIGRATIONS 清单', () => {
 });
 
 describe('up：全部迁移执行后', () => {
-  it('15 张内核表全部创建', async () => {
+  it('17 张内核表全部创建', async () => {
     expect(await userTables(db)).toEqual([...KERNEL_TABLES].sort());
   });
 

@@ -54,6 +54,7 @@ export const ERR_CODES = {
   EXT_DB_QUOTA: { domain: 'EXT', seq: 10, status: 507, message: 'extension database quota exceeded', retryable: false },
   EXT_API_INCOMPATIBLE: { domain: 'EXT', seq: 11, status: 409, message: 'extension api version incompatible with kernel', retryable: false },
   EXT_TRUST_REQUIRED: { domain: 'EXT', seq: 12, status: 403, message: 'third-party extension requires manual trust confirmation', retryable: false },
+  FLOW_DISABLED: { domain: 'EXT', seq: 13, status: 403, message: 'flow endpoint is disabled', retryable: false },
   // ---- DB 4xxx ----
   DB_MIGRATION_FAILED: { domain: 'DB', seq: 1, status: 500, message: 'database migration failed', retryable: false },
   DB_STATEMENT_FORBIDDEN: { domain: 'DB', seq: 2, status: 400, message: 'sql statement forbidden (ATTACH/DETACH/load_extension/multi-statement)', retryable: false },

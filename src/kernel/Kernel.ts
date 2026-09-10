@@ -133,6 +133,8 @@ export const CONTAINER_KEYS = {
   asrManager: 'asr.manager',
   /** FileExtractService（文件内容提取；REST /api/v1/extract* 与扩展桥 extract.* 共用） */
   fileExtract: 'fileextract.service',
+  /** FlowManager（传入 Webhook / FlowTrigger；REST /api/v1/flows* 与公开入站 /hooks/flow/:slug 共用） */
+  flows: 'flows.manager',
   /** skills/mcp/plugins 三桥 handler 并表（createKernelHandlers 的 extraBridges 懒解析源） */
   extBridges: 'ext.bridges',
   // ---- 扩展子系统（阶段 9 总装配登记，见 #runBoot 的扩展接线段）----

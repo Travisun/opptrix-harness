@@ -31,6 +31,8 @@
  * - AgentSessionManager ← AgentSessionStore(db) + gateway(chat/getProviders 绑定) + settings +
  *   systemRuntime(currentSystemRuntime 懒解析) + publish(sseHub)——会话子系统
  *   （'agents.sessionManager'；REST /api/v1/agents/sessions*）
+ * - FlowManager ← FlowEndpointStore(db) + secrets + gateway/notifications 调用期懒解析 +
+ *   publish(sseHub)（'flows.manager'；REST /api/v1/flows/endpoints* + 公开入站 /hooks/flow/:slug）
  * - 三桥（skills.* / mcp.* / plugins.*）+ 三能力桥（memory.* / asr.* / extract.*）并表
  *   登记容器 'ext.bridges'，由 Kernel 经 createKernelHandlers({ extraBridges }) 懒合入
  *   worker→kernel 分发表；权限由桥工厂自查（'skills' / 'mcp:client' / 'plugins' /
@@ -50,6 +52,7 @@ import { registerAgentRoutes } from '../../api/agents.js';
 import { registerChatRoutes } from '../../api/chat.js';
 import { registerExtractRoutes } from '../../api/extract.js';
 import { registerFileRoutes } from '../../api/files.js';
+import { registerFlowRoutes } from '../../api/flows.js';
 import { registerLlmRoutes } from '../../api/llm.js';
 import { registerMemoryRoutes } from '../../api/memory.js';
 import { registerMcpRoutes } from '../../api/mcp.js';
@@ -81,6 +84,8 @@ import { CONTAINER_KEYS, type Kernel } from '../Kernel.js';
 import { FACADE_CONTAINER_KEYS } from '../Facades.js';
 import { err } from '../errors/index.js';
 import { FileService, createLocalDriver } from '../files/index.js';
+import { FlowManager } from '../flow/index.js';
+import type { FlowLlmGatewayLike, FlowNotifierLike } from '../flow/types.js';
 import type { EventBus } from '../events/bus.js';
 import type { HookManager } from '../hooks/manager.js';
 import { EVENT_NS } from '../hooks/points.js';
@@ -266,6 +271,45 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     },
   });
   kernel.container.instance(CONTAINER_KEYS.notify, notifyManager);
+
+  // -------------------------------------------------------------------------
+  // flow — 传入 Webhook / FlowTrigger（公开入站 /hooks/flow/:slug → log/notify/llm 分派）。
+  // gateway / notifications 走**调用期懒解析**（装配时序无关——此刻部分容器键虽已登记，
+  // 但保持与子代理 agentToolsRuntime 同款懒门面，测试亦可在 boot 后替换容器实现注入
+  // mock）；SSE 广播复用与通知同一 publish 绑定（topic `flow:{endpointId}`）。
+  // -------------------------------------------------------------------------
+  const flowGateway: () => FlowLlmGatewayLike | undefined = () => {
+    if (!kernel.container.has(CONTAINER_KEYS.llm)) return undefined;
+    const gw = kernel.container.resolve<LlmGateway>(CONTAINER_KEYS.llm);
+    return {
+      chat: async (input) =>
+        (await gw.chat({ ...(input as LlmChatInput), stream: false })) as LlmChatResult,
+      getProviders: () => gw.getProviders(),
+    };
+  };
+  const flowNotifier: () => FlowNotifierLike | undefined = () => {
+    if (!kernel.container.has(CONTAINER_KEYS.notify)) return undefined;
+    const nm = kernel.container.resolve<NotificationManager>(CONTAINER_KEYS.notify);
+    return {
+      send: (input) =>
+        nm.send({
+          title: input.title,
+          ...(input.body !== undefined ? { body: input.body } : {}),
+          // level 交通知中心 zod 复核（非法值 → VALIDATION_FAILED → 事件标 failed）
+          ...(input.level !== undefined ? { level: input.level as ChannelLevel } : {}),
+          ...(input.data !== undefined ? { data: input.data } : {}),
+        }),
+    };
+  };
+  const flowManager = new FlowManager({
+    db,
+    secrets,
+    logger,
+    gateway: flowGateway,
+    notifications: flowNotifier,
+    publish,
+  });
+  kernel.container.instance(CONTAINER_KEYS.flows, flowManager);
 
   // -------------------------------------------------------------------------
   // chat — 聊天服务 + 桥分发器
@@ -949,6 +993,9 @@ export function createCoreServices(kernel: Kernel): CoreServices {
       registerChatRoutes(app, { checker, service: chatService, connectors: platformConnectors });
       registerTaskRoutes(app, { checker, manager: taskManager });
       registerSubagentRoutes(app, { checker, manager: subagentManager });
+      // FlowTrigger 管理 API（/api/v1/flows/endpoints*，admin）+ 公开入站回调
+      // （POST /hooks/flow/:slug，路由模块内部以兄弟封装上下文注册 Buffer 解析器）
+      registerFlowRoutes(app, { checker, manager: flowManager });
       // Agent 会话 API（/api/v1/agents/sessions*）：与子代理面独立的会话 REST
       registerAgentRoutes(app, { checker, sessionManager: agentSessionManager });
       // LLM 网关 REST（/api/v1/llm/*）：providers 管理的持久化即 settings 读写；
