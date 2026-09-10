@@ -1,0 +1,10 @@
+{
+  "id": "browser",
+  "api": 1,
+  "version": "1.0.0",
+  "main": "index.js",
+  "builtin": true,
+  "permissions": ["http", "browser"],
+  "displayName": "浏览器自动化",
+  "routes": true
+}
