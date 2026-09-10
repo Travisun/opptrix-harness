@@ -491,3 +491,70 @@ export const pluginsApi = {
   refresh: (): Promise<{ plugins: InstalledPluginWire[] }> =>
     api.post<{ plugins: InstalledPluginWire[] }>('/api/v1/plugins/refresh'),
 };
+
+// ---------------------------------------------------------------------------
+// Agent 会话工作区（/chat 工作区文件面板消费；路径相对当前会话解析到根会话工作区，
+// 子会话天然继承根会话工作区）。端点均走 Bearer 头认证；iframe/img/a[download] 直链
+// 场景（fileUrl）token 走 ?token= 查询通道（内核 extractToken 契约）。
+// ---------------------------------------------------------------------------
+
+/** GET /api/v1/agents/sessions/:id/workspace 条目 */
+export interface WorkspaceEntry {
+  name: string;
+  /** 相对工作区根的路径（目录懒加载/文件操作的 path 主键） */
+  path: string;
+  type: 'file' | 'dir';
+  size: number;
+  /** 修改时间（epoch ms） */
+  mtime: number;
+}
+
+/** GET /api/v1/agents/sessions/:id/workspace 响应 */
+export interface WorkspaceListResult {
+  entries: WorkspaceEntry[];
+}
+
+/** 会话工作区端点基路径（目录列表与 file 读写都在其下） */
+function workspaceBase(sessionId: string): string {
+  return `/api/v1/agents/sessions/${encodeURIComponent(sessionId)}/workspace`;
+}
+
+/**
+ * workspaceApi — 会话工作区文件面：
+ *
+ * - list：目录列表（recursive=false 逐层懒加载；path 为目录相对路径，根目录传空串）；
+ * - fileUrl：原始字节直链（img src / iframe src / a[download] 用；自动追加 ?token=）；
+ * - read：原始文本读取（文本预览用；Bearer 头认证，二进制请用 fileUrl 直链）；
+ * - write：写入/覆盖文件（content 为 base64；前端上传入口 ≤8MB 校验在页面侧）；
+ * - remove：删除文件（?path= 定位）。
+ */
+export const workspaceApi = {
+  /** GET {base}?path=&recursive= — 目录列表（{ entries }） */
+  list: (sessionId: string, path = '', recursive = false): Promise<WorkspaceListResult> =>
+    api.get<WorkspaceListResult>(
+      `${workspaceBase(sessionId)}?path=${encodeURIComponent(path)}&recursive=${recursive ? 'true' : 'false'}`,
+    ),
+  /** GET {base}/file?path= — 原始字节直链（token 不足时省略 &token= 段） */
+  fileUrl: (sessionId: string, path: string): string => {
+    const token = getToken();
+    const query = `path=${encodeURIComponent(path)}`;
+    return token === ''
+      ? `${workspaceBase(sessionId)}/file?${query}`
+      : `${workspaceBase(sessionId)}/file?${query}&token=${encodeURIComponent(token)}`;
+  },
+  /** GET {base}/file?path= — 原始文本（!ok 抛 ApiError 形状） */
+  read: async (sessionId: string, path: string): Promise<string> => {
+    const headers: Record<string, string> = {};
+    const token = getToken();
+    if (token !== '') headers['authorization'] = `Bearer ${token}`;
+    const res = await fetch(`${workspaceBase(sessionId)}/file?path=${encodeURIComponent(path)}`, { headers });
+    if (!res.ok) throw await toApiError(res);
+    return res.text();
+  },
+  /** PUT {base}/file — 写入/覆盖（body { path, content(base64) }） */
+  write: (sessionId: string, path: string, content: string): Promise<unknown> =>
+    api.put<unknown>(`${workspaceBase(sessionId)}/file`, { path, content }),
+  /** DELETE {base}/file?path= — 删除文件 */
+  remove: (sessionId: string, path: string): Promise<unknown> =>
+    api.delete<unknown>(`${workspaceBase(sessionId)}/file?path=${encodeURIComponent(path)}`),
+};
