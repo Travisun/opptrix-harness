@@ -47,6 +47,8 @@ export interface SubagentRecord {
   createdAt: number | null;
   startedAt: number | null;
   finishedAt: number | null;
+  /** 发起本子代理的 agent 会话 id（null = 非会话发起，如 /mcp 主会话委派）；工作区归属沿此贯通到根会话 */
+  originSessionId: string | null;
 }
 
 /** SubagentManagerDeps.store 的 update() 允许的补丁字段（store 负责映射 snake_case 列） */
@@ -117,4 +119,10 @@ export interface SubagentSpawnInput {
   model?: string;
   toolNames?: string[];
   maxIterations?: number;
+  /**
+   * 发起本子代理的 agent 会话 id（可选；落 store 的 origin_session_id 列）。
+   * 由会话链路的调用方传入（系统 MCP 工具层 subagent_spawn 负责 Mapping），
+   * 工作区归属解析（WorkspaceService.resolve 的 subagents 分支）沿它回到根会话。
+   */
+  originSessionId?: string;
 }

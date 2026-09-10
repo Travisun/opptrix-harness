@@ -36,6 +36,10 @@ export interface AgentSessionRecord {
   updated_at: number;
   /** 最近一条消息时间（null = 尚无消息；列表按其降序） */
   last_message_at: number | null;
+  /** 属主用户 id（null = system 会话；所有权判定与工作区目录布局用，REST 层从 checker identity 注入） */
+  userId: string | null;
+  /** 父会话 id（null = 一级/根会话；子会话不建工作区目录，沿本链解析到根会话的工作区） */
+  parentId: string | null;
 }
 
 /** 消息角色：user / assistant / system（tool 结果以 system 角色落库） */
@@ -81,6 +85,13 @@ export interface AgentSessionPatch {
   status?: AgentSessionStatus;
 }
 
+/** 列出会话的过滤条件 */
+export interface AgentSessionListFilter {
+  status?: AgentSessionStatus;
+  /** 按属主过滤（undefined = 不过滤；注意 system 会话 userId 为 null，不命中任何具体 userId） */
+  userId?: string;
+}
+
 /** agent_sessions 表原始行（snake_case） */
 interface SessionRow {
   id: string;
@@ -91,6 +102,8 @@ interface SessionRow {
   created_at: number;
   updated_at: number;
   last_message_at: number | null;
+  user_id: string | null;
+  parent_id: string | null;
 }
 
 /** agent_messages 表原始行（snake_case） */
@@ -124,6 +137,8 @@ function sessionRowToRecord(row: SessionRow): AgentSessionRecord {
     created_at: row.created_at,
     updated_at: row.updated_at,
     last_message_at: row.last_message_at,
+    userId: row.user_id ?? null,
+    parentId: row.parent_id ?? null,
   };
 }
 
@@ -186,6 +201,8 @@ export class AgentSessionStore {
       created_at: rec.created_at,
       updated_at: rec.updated_at,
       last_message_at: rec.last_message_at,
+      user_id: rec.userId ?? null,
+      parent_id: rec.parentId ?? null,
     });
   }
 
@@ -200,10 +217,11 @@ export class AgentSessionStore {
    * 列出会话：按 last_message_at 降序（无消息的会话 NULL 在 SQLite DESC 排序中天然靠后），
    * 次序键 created_at 降序、id 升序保证同毫秒稳定排序。
    */
-  async listSessions(filter?: { status?: AgentSessionStatus }): Promise<AgentSessionRecord[]> {
+  async listSessions(filter?: AgentSessionListFilter): Promise<AgentSessionRecord[]> {
     await this.ensureTables();
     let query = this.db(AGENT_SESSIONS_TABLE).select('*');
     if (filter?.status !== undefined) query = query.where('status', filter.status);
+    if (filter?.userId !== undefined) query = query.where('user_id', filter.userId);
     const rows = (await query
       .orderBy('last_message_at', 'desc')
       .orderBy('created_at', 'desc')
@@ -300,7 +318,7 @@ export class AgentSessionStore {
     return rows.reverse().map(messageRowToRecord);
   }
 
-  /** 实际建表（幂等；agent_sessions + agent_messages） */
+  /** 实际建表（幂等；agent_sessions + agent_messages）+ 旧库加列（ALTER 守卫） */
   private async createTables(): Promise<void> {
     if (!(await this.db.schema.hasTable(AGENT_SESSIONS_TABLE))) {
       await this.db.schema.createTable(AGENT_SESSIONS_TABLE, (t) => {
@@ -312,9 +330,14 @@ export class AgentSessionStore {
         t.integer('created_at').notNullable(); // UTC epoch ms
         t.integer('updated_at').notNullable(); // UTC epoch ms
         t.integer('last_message_at'); // UTC epoch ms；null = 尚无消息
+        t.text('user_id'); // 属主用户 id；null = system 会话（所有权 + 工作区布局用）
+        t.text('parent_id'); // 父会话 id；null = 一级/根会话（子会话工作区沿链继承）
         t.index(['status'], 'agent_sessions_status_index');
         t.index(['last_message_at'], 'agent_sessions_last_message_at_index');
+        t.index(['user_id'], 'agent_sessions_user_id_index');
       });
+    } else {
+      await this.#addSessionColumnsIfMissing();
     }
     if (!(await this.db.schema.hasTable(AGENT_MESSAGES_TABLE))) {
       await this.db.schema.createTable(AGENT_MESSAGES_TABLE, (t) => {
@@ -326,6 +349,19 @@ export class AgentSessionStore {
         t.text('usage'); // JSON 字符串（token 用量）
         t.integer('created_at').notNullable(); // UTC epoch ms
         t.index(['session_id'], 'agent_messages_session_id_index');
+      });
+    }
+  }
+
+  /**
+   * 旧库加列（ALTER 守卫模式）：早期版本建的 agent_sessions 无 user_id/parent_id 列，
+   * 逐列做存在性检查后 ALTER TABLE ADD COLUMN；新库 DDL 已含新列，检查即跳过（幂等）。
+   */
+  async #addSessionColumnsIfMissing(): Promise<void> {
+    for (const column of ['user_id', 'parent_id'] as const) {
+      if (await this.db.schema.hasColumn(AGENT_SESSIONS_TABLE, column)) continue;
+      await this.db.schema.alterTable(AGENT_SESSIONS_TABLE, (t) => {
+        t.text(column); // 旧会话一律 null：user_id=null 视作 system 会话、parent_id=null 视作根会话
       });
     }
   }

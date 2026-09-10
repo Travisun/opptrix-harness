@@ -22,6 +22,7 @@ import type { Logger } from 'pino';
 
 import { err } from '../errors/index.js';
 import type { LlmChatInput, LlmChatResult, LlmProviderConfig, LlmStreamEvent } from '../llm/index.js';
+import type { WorkspaceResolveResult, WorkspaceService } from '../workspace/index.js';
 import {
   createSessionRunner,
   type SessionRunner,
@@ -34,6 +35,7 @@ import {
   type AgentMessageRole,
   type AgentMessageToolCall,
   type AgentMessageUsage,
+  type AgentSessionListFilter,
   type AgentSessionPatch,
   type AgentSessionRecord,
   type AgentSessionStatus,
@@ -50,6 +52,7 @@ export type {
   AgentMessageRole,
   AgentMessageToolCall,
   AgentMessageUsage,
+  AgentSessionListFilter,
   AgentSessionPatch,
   AgentSessionRecord,
   AgentSessionStatus,
@@ -108,6 +111,11 @@ export interface AgentSessionManagerDeps {
   systemRuntime?: () => SystemToolRuntimeLike | undefined;
   /** SSE 广播门面（缺省 = 不推送） */
   publish?: AgentSessionPublisher;
+  /**
+   * 会话工作区服务取值器（缺省 = resolveWorkspace 抛 INTERNAL；core-services 装配传
+   * workspaceService 惰性门面——装配时序上工作区与会话子系统同段构造，getter 规避互指）。
+   */
+  workspace?: () => WorkspaceService;
   /** 循环迭代上限缺省值（透传 runAgentLoop；缺省 16） */
   maxIterations?: number;
   /** 迭代间让出（透传 runAgentLoop；测试可注入空实现加速） */
@@ -161,10 +169,33 @@ export class AgentSessionManager {
   // 会话 CRUD
   // ---------------------------------------------------------------------------
 
-  /** 创建会话（title 缺省 '新对话'；model/systemPrompt 缺省 null = 运行期解析/runner 缺省） */
+  /**
+   * 创建会话（title 缺省 '新对话'；model/systemPrompt 缺省 null = 运行期解析/runner 缺省）。
+   *
+   * - userId：属主落库（null = system 会话；REST 层从 checker identity 注入，不收请求体）；
+   * - parentId：父会话存在性软校验（不存在 → EXT_NOT_FOUND 404 形状），通过后落库——
+   *   子会话不建工作区目录，经 parent 链解析到根会话的工作区。
+   */
   async createSession(
-    input: { title?: string; model?: string; systemPrompt?: string } = {},
+    input: {
+      title?: string;
+      model?: string;
+      systemPrompt?: string;
+      userId?: string | null;
+      parentId?: string;
+    } = {},
   ): Promise<AgentSessionRecord> {
+    let parentId: string | null = null;
+    if (input.parentId !== undefined) {
+      const parent = await this.#deps.store.getSession(input.parentId);
+      if (parent === null) {
+        throw err('EXT_NOT_FOUND', {
+          message: `parent agent session "${input.parentId}" not found`,
+          detail: { parentId: input.parentId },
+        });
+      }
+      parentId = parent.id;
+    }
     const now = Date.now();
     const record: AgentSessionRecord = {
       id: randomUUID(),
@@ -175,13 +206,15 @@ export class AgentSessionManager {
       created_at: now,
       updated_at: now,
       last_message_at: null,
+      userId: input.userId ?? null,
+      parentId,
     };
     await this.#deps.store.createSession(record);
     return record;
   }
 
-  /** 列出会话（按最后消息时间降序；filter.status 可选过滤） */
-  listSessions(filter?: { status?: AgentSessionStatus }): Promise<AgentSessionRecord[]> {
+  /** 列出会话（按最后消息时间降序；filter.status / filter.userId 可选过滤） */
+  listSessions(filter?: AgentSessionListFilter): Promise<AgentSessionRecord[]> {
     return this.#deps.store.listSessions(filter);
   }
 
@@ -198,6 +231,56 @@ export class AgentSessionManager {
   /** 删除会话（级联删除全部消息）；返回是否确有删除 */
   async deleteSession(id: string): Promise<boolean> {
     return this.#deps.store.deleteSession(id);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 所有权与工作区
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 会话访问权断言（REST 会话级端点的统一闸；不存在 → EXT_NOT_FOUND 404，越权 → FORBIDDEN 403）。
+   *
+   * 所有权矩阵：
+   * - role root / admin → 全通；
+   * - session.userId === identity.userId → 放行（本人的会话）；
+   * - session.userId 为 null（system 会话）→ 仅 root/admin；
+   * - 其余（他人会话 / 无身份）→ FORBIDDEN。
+   *
+   * @returns 命中的会话记录（调用方可免二次查询）
+   */
+  async assertAccess(
+    sessionId: string,
+    identity?: { userId?: string; role?: string },
+  ): Promise<AgentSessionRecord> {
+    const session = await this.#assertSession(sessionId);
+    const privileged = identity?.role === 'root' || identity?.role === 'admin';
+    if (privileged) return session;
+    if (session.userId !== null && identity?.userId !== undefined && session.userId === identity.userId) {
+      return session;
+    }
+    throw err('FORBIDDEN', {
+      message: `access to agent session "${sessionId}" is forbidden (owner: ${session.userId ?? 'system'})`,
+      detail: { sessionId, ownerUserId: session.userId },
+    });
+  }
+
+  /**
+   * 解析 scopeId（会话 id 或 subagent id）→ 根会话工作区（委托 WorkspaceService；
+   * 子会话/子代理沿 parent 链继承根会话的工作区，目录只在根会话名下）。
+   *
+   * @throws VALIDATION_FAILED scopeId 非法 / 链成环或超深
+   * @throws EXT_NOT_FOUND scopeId 未命中（404 形状）
+   * @throws INTERNAL 装配未注入工作区服务
+   */
+  async resolveWorkspace(scopeId: string): Promise<WorkspaceResolveResult> {
+    const workspace = this.#deps.workspace;
+    if (workspace === undefined) {
+      throw err('INTERNAL', {
+        message: 'workspace service is not wired into AgentSessionManager (deps.workspace missing)',
+        detail: { scopeId },
+      });
+    }
+    return workspace().resolve(scopeId);
   }
 
   // ---------------------------------------------------------------------------

@@ -139,6 +139,8 @@ export const CONTAINER_KEYS = {
   browserEngine: 'browser.engine',
   /** FlowManager（传入 Webhook / FlowTrigger；REST /api/v1/flows* 与公开入站 /hooks/flow/:slug 共用） */
   flows: 'flows.manager',
+  /** WorkspaceService（会话工作区内核；REST /api/v1/agents/sessions/:id/workspace* 与会话子系统共用） */
+  workspace: 'workspace.service',
   /** skills/mcp/plugins 三桥 handler 并表（createKernelHandlers 的 extraBridges 懒解析源） */
   extBridges: 'ext.bridges',
   // ---- 扩展子系统（阶段 9 总装配登记，见 #runBoot 的扩展接线段）----

@@ -43,6 +43,7 @@ interface SubagentRow {
   created_at: number | null;
   started_at: number | null;
   finished_at: number | null;
+  origin_session_id: string | null;
 }
 
 /** JSON 文本 → 反序列化值；text 为空返回 null；脏数据（非法 JSON）容错置 null，不抛错 */
@@ -76,6 +77,7 @@ function rowToRecord(row: SubagentRow): SubagentRecord {
     createdAt: row.created_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
+    originSessionId: row.origin_session_id ?? null,
   };
 }
 
@@ -92,8 +94,8 @@ export class SubagentStore implements SubagentStoreLike {
   constructor(private readonly db: Knex) {}
 
   /**
-   * 惰性幂等建表（结构同构于内核迁移 016_subagents，含同名索引）。
-   * 表已存在时直接跳过，不校验亦不修改既有结构。
+   * 惰性幂等建表（结构同构于内核迁移 016_subagents，含同名索引 + 本包追加列）。
+   * 表已存在时补跑旧库加列守卫（origin_session_id），不校验其余既有结构。
    *
    * @throws HarnessError（DB_ERROR）建表失败
    */
@@ -126,6 +128,7 @@ export class SubagentStore implements SubagentStoreLike {
         created_at: rec.createdAt,
         started_at: rec.startedAt,
         finished_at: rec.finishedAt,
+        origin_session_id: rec.originSessionId ?? null,
       });
     } catch (e) {
       throw err('DB_ERROR', {
@@ -181,9 +184,18 @@ export class SubagentStore implements SubagentStoreLike {
     await this.db(SUBAGENTS_TABLE).where('id', id).update(cols);
   }
 
-  /** 实际建表（幂等；结构同构于内核迁移 016_subagents） */
+  /** 实际建表（幂等；结构同构于内核迁移 016_subagents + origin_session_id 追加列） */
   private async createTable(): Promise<void> {
-    if (await this.db.schema.hasTable(SUBAGENTS_TABLE)) return;
+    if (await this.db.schema.hasTable(SUBAGENTS_TABLE)) {
+      // 旧库加列（ALTER 守卫）：迁移 016 或早期版本建的表无 origin_session_id 列——
+      // 逐列存在性检查后补齐；新库 DDL 已含该列，检查即跳过（幂等）
+      if (!(await this.db.schema.hasColumn(SUBAGENTS_TABLE, 'origin_session_id'))) {
+        await this.db.schema.alterTable(SUBAGENTS_TABLE, (t) => {
+          t.text('origin_session_id'); // 发起会话 id；null = 非会话发起（如 /mcp 主会话委派）
+        });
+      }
+      return;
+    }
     await this.db.schema.createTable(SUBAGENTS_TABLE, (t) => {
       t.text('id').primary();
       t.text('parent_id').notNullable(); // 'main' = 主会话；否则为父 subagent id
@@ -201,6 +213,7 @@ export class SubagentStore implements SubagentStoreLike {
       t.integer('created_at'); // UTC epoch ms
       t.integer('started_at'); // UTC epoch ms
       t.integer('finished_at'); // UTC epoch ms
+      t.text('origin_session_id'); // 发起会话 id（会话链路 spawn 时落库；工作区归属解析用）
       t.index(['parent_id'], 'subagents_parent_id_index');
       t.index(['status'], 'subagents_status_index');
     });

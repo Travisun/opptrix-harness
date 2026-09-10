@@ -326,6 +326,8 @@ export class SubagentManager {
       createdAt: now,
       startedAt: atCapacity ? null : now,
       finishedAt: null,
+      // 发起会话贯通（会话链路调用方传入；工具包经 spawn(input & {originSessionId?}) 对接）
+      originSessionId: input.originSessionId ?? null,
     };
     await this.#deps.store.create(record);
     if (atCapacity) {

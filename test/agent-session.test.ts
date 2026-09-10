@@ -691,6 +691,8 @@ describe('存储容错', () => {
           if (fail) throw new Error('boom');
           return true;
         },
+        // 旧库加列守卫（user_id/parent_id）的列存在性检查：桩返回 true = 新列已就绪
+        hasColumn: async () => true,
       },
     } as unknown as Knex;
     const failing = new AgentSessionStore(broken);

@@ -115,6 +115,7 @@ import type { ExtractResult, ExtractTaskArgs, ExtractTaskPool } from '../fileext
 import { CodingEngine, createCodingBridge } from '../coding/index.js';
 import { createAsrBridge, AsrManager } from '../asr/index.js';
 import { BrowserEngine, createBrowserBridge } from '../browser/index.js';
+import { WorkspaceService } from '../workspace/index.js';
 import type { SandboxManager } from '../sandbox/manager.js';
 import { createSkillsBridge, deleteSkill, SkillRegistry, writeSkill } from '../skills/index.js';
 import { TaskManager, TaskStore, TaskWorkerPool } from '../tasks/index.js';
@@ -871,6 +872,17 @@ export function createCoreServices(kernel: Kernel): CoreServices {
   // 会话/消息持久化在 SQLite，生成中的 AbortController 为进程内存态。
   // -------------------------------------------------------------------------
   const agentSessionStore = new AgentSessionStore(db);
+  // -------------------------------------------------------------------------
+  // workspace —— 会话工作区内核（每根会话一个目录；子会话/子代理沿 parent 链继承）。
+  // stores 经 getter 惰性取（两个 store 都是惰性建表，boot 后才可用），装配顺序无关。
+  // -------------------------------------------------------------------------
+  const workspaceService = new WorkspaceService({
+    dataDir: config.dataDir,
+    logger,
+    sessions: () => agentSessionStore,
+    subagents: () => subagentStore,
+  });
+  kernel.container.instance(CONTAINER_KEYS.workspace, workspaceService);
   const agentSessionManager = new AgentSessionManager({
     store: agentSessionStore,
     gateway: {
@@ -883,6 +895,8 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     // 与上方子代理 agentToolsRuntime 同款懒解析——调用期必然已 attach
     systemRuntime: currentSystemRuntime,
     publish,
+    // 工作区惰性门面（resolveWorkspace 委托；目录操作 REST 面直接用 workspaceService）
+    workspace: () => workspaceService,
   });
   // 键名隔离守卫：'agents.sessionManager'（会话运行时）刻意不在 SUBAGENT_MANAGER_CONTAINER_KEYS
   // （subagent_* 工具的委派运行时解析候选）之内——两个面不得混装。
@@ -1032,7 +1046,8 @@ export function createCoreServices(kernel: Kernel): CoreServices {
       // （POST /hooks/flow/:slug，路由模块内部以兄弟封装上下文注册 Buffer 解析器）
       registerFlowRoutes(app, { checker, manager: flowManager });
       // Agent 会话 API（/api/v1/agents/sessions*）：与子代理面独立的会话 REST
-      registerAgentRoutes(app, { checker, sessionManager: agentSessionManager });
+      // （含会话工作区面 /workspace*——所有权断言走 manager，目录操作走 workspaceService）
+      registerAgentRoutes(app, { checker, sessionManager: agentSessionManager, workspace: workspaceService });
       // LLM 网关 REST（/api/v1/llm/*）：providers 管理的持久化即 settings 读写；
       // secrets 注入使 PUT 支持 apiKey 明文 → 自动转存（键 'llm.<name>'）
       registerLlmRoutes(app, {
