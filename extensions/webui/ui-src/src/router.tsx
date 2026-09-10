@@ -4,6 +4,7 @@ import { BoxesIcon, Loader2Icon } from 'lucide-react';
 
 import { AppShell } from '@/components/layout/AppShell';
 import { getOnboardingStatus, getToken } from '@/lib/api';
+import AgentChatPage from '@/pages/AgentChat';
 import ApiKeysPage from '@/pages/ApiKeys';
 import CronPage from '@/pages/Cron';
 import DashboardPage from '@/pages/Dashboard';
@@ -116,6 +117,11 @@ export function AppRoutes(): ReactNode {
           <Route path="/login" element={<LoginPage />} />
           <Route path="/onboarding" element={<OnboardingPage />} />
           <Route element={<RequireAuth />}>
+            {/*
+              /chat — 全屏对话界面（AgentChat 自带独立 Layout：左侧会话列表 + 右侧对话区），
+              刻意不经 AppShell 包裹（无 Sidebar/Topbar）。
+            */}
+            <Route path="/chat" element={<AgentChatPage />} />
             <Route element={<AppShell />}>
               <Route index path="/" element={<DashboardPage />} />
               <Route path="/extensions" element={<ExtensionsPage />} />

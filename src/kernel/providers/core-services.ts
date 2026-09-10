@@ -28,6 +28,9 @@
  * - MemoryManager ← MemoryStore(db) + createMemoryExtractor({ gateway })；AsrManager ←
  *   modelDir(<dataDir>/models/asr)；FileExtractService ← files / db / 任务池适配器
  *   （TaskManager.dispatch('file-extract') → 线程池，完成态经事件总线回流）
+ * - AgentSessionManager ← AgentSessionStore(db) + gateway(chat/getProviders 绑定) + settings +
+ *   systemRuntime(currentSystemRuntime 懒解析) + publish(sseHub)——会话子系统
+ *   （'agents.sessionManager'；REST /api/v1/agents/sessions*）
  * - 三桥（skills.* / mcp.* / plugins.*）+ 三能力桥（memory.* / asr.* / extract.*）并表
  *   登记容器 'ext.bridges'，由 Kernel 经 createKernelHandlers({ extraBridges }) 懒合入
  *   worker→kernel 分发表；权限由桥工厂自查（'skills' / 'mcp:client' / 'plugins' /
@@ -43,6 +46,7 @@ import type { Knex } from 'knex';
 import type { Logger } from 'pino';
 
 import { registerAsrRoutes } from '../../api/asr.js';
+import { registerAgentRoutes } from '../../api/agents.js';
 import { registerChatRoutes } from '../../api/chat.js';
 import { registerExtractRoutes } from '../../api/extract.js';
 import { registerFileRoutes } from '../../api/files.js';
@@ -52,6 +56,9 @@ import { registerMcpRoutes } from '../../api/mcp.js';
 import { registerNotificationRoutes } from '../../api/notifications.js';
 import { createChannelConfigStore } from '../notification/channel-configs.js';
 import { runAgentLoop, type AgentLoopToolRuntime } from '../agents/runner.js';
+import { AgentSessionManager } from '../agents/session.js';
+import { AgentSessionStore } from '../agents/session-store.js';
+import { SUBAGENT_MANAGER_CONTAINER_KEYS } from '../mcp/system-tools.js';
 import { SubagentManager } from '../agents/manager.js';
 import { SubagentStore } from '../agents/store.js';
 import { currentSystemRuntime, type SystemToolRuntime } from '../mcp/system-server.js';
@@ -793,6 +800,35 @@ export function createCoreServices(kernel: Kernel): CoreServices {
   kernel.container.instance(CONTAINER_KEYS.pluginsRegistry, pluginsRegistry);
 
   // -------------------------------------------------------------------------
+  // agents.session —— 会话子系统（类 Codex 全屏 Chat：会话/消息持久化 + sendMessage
+  // 驱动 Agent 循环 + SSE `agent:{sessionId}` 实时推送）。
+  // 生命周期：core.start()/stop() 无额外动作——表由 store 惰性建（首次使用时），
+  // 会话/消息持久化在 SQLite，生成中的 AbortController 为进程内存态。
+  // -------------------------------------------------------------------------
+  const agentSessionStore = new AgentSessionStore(db);
+  const agentSessionManager = new AgentSessionManager({
+    store: agentSessionStore,
+    gateway: {
+      chat: (input) => gateway.chat({ ...(input as LlmChatInput), stream: false }) as Promise<LlmChatResult>,
+      getProviders: () => gateway.getProviders(),
+    },
+    settings,
+    logger,
+    // 系统工具运行时由 Kernel 在 /mcp 接线时创建并 attach（共享槽）；装配早于该时点，
+    // 与上方子代理 agentToolsRuntime 同款懒解析——调用期必然已 attach
+    systemRuntime: currentSystemRuntime,
+    publish,
+  });
+  // 键名隔离守卫：'agents.sessionManager'（会话运行时）刻意不在 SUBAGENT_MANAGER_CONTAINER_KEYS
+  // （subagent_* 工具的委派运行时解析候选）之内——两个面不得混装。
+  if ((SUBAGENT_MANAGER_CONTAINER_KEYS as readonly string[]).includes('agents.sessionManager')) {
+    throw err('INTERNAL', {
+      message: 'container key collision: "agents.sessionManager" must not be a subagent manager key',
+    });
+  }
+  kernel.container.instance('agents.sessionManager', agentSessionManager);
+
+  // -------------------------------------------------------------------------
   // skills / mcp / plugins 扩展桥并表（容器 'ext.bridges'）。
   // 权限决策：**矩阵不加、桥工厂自查**——skills 读面（list/get/refresh）与 plugins.list
   // 由下方 gatedBridge 以 'skills' / 'plugins' 收口；mcp 三 topic 由 createMcpBridge
@@ -913,6 +949,8 @@ export function createCoreServices(kernel: Kernel): CoreServices {
       registerChatRoutes(app, { checker, service: chatService, connectors: platformConnectors });
       registerTaskRoutes(app, { checker, manager: taskManager });
       registerSubagentRoutes(app, { checker, manager: subagentManager });
+      // Agent 会话 API（/api/v1/agents/sessions*）：与子代理面独立的会话 REST
+      registerAgentRoutes(app, { checker, sessionManager: agentSessionManager });
       // LLM 网关 REST（/api/v1/llm/*）：providers 管理的持久化即 settings 读写；
       // secrets 注入使 PUT 支持 apiKey 明文 → 自动转存（键 'llm.<name>'）
       registerLlmRoutes(app, {

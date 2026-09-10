@@ -22,6 +22,9 @@ export const SSE_EVENT_NAMES = [
   'chat.message.created',
   'chat.message.updated',
   'task.progress',
+  // Agent 会话子系统（/chat 全屏对话页；topic `agent:{sessionId}`）
+  'message.created',
+  'generation.cancelled',
   'replay-gap',
 ] as const;
 
