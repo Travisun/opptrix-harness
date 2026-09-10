@@ -7,58 +7,70 @@ import {
   RefreshCwIcon,
   SearchIcon,
   ShieldCheckIcon,
+  SquarePenIcon,
+  Trash2Icon,
   TriangleAlertIcon,
 } from 'lucide-react';
 
+import { Pagination } from '@/components/pagination';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Switch } from '@/components/ui/switch';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { toast } from '@/components/ui/toast';
-import { api } from '@/lib/api';
+import { skillsApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { EmptyState, errText, isApiError, isAdminRole, useMe } from '@/pages/_shared';
 import { BatchImportDialog } from '@/pages/Skills/BatchImportDialog';
-import { CreateSkillDialog } from '@/pages/Skills/CreateSkillDialog';
+import { CreateSkillPanel } from '@/pages/Skills/CreateSkillPanel';
 import { DeleteSkillDialog } from '@/pages/Skills/DeleteSkillDialog';
 import { EditSkillDialog } from '@/pages/Skills/EditSkillDialog';
-import { SkillCard } from '@/pages/Skills/SkillCard';
 import { SkillDetailSheet } from '@/pages/Skills/SkillDetailSheet';
 import { buildSkillDrafts, type SkillDraft } from '@/pages/Skills/dragdrop';
 import { EXTRACT_ENDPOINT_UNAVAILABLE, readDroppedFiles } from '@/pages/Skills/batchImport';
 import {
   SKILL_SOURCE_META,
   SKILL_SOURCE_OPTIONS,
+  SourceBadge,
   type SkillEntryView,
-  type SkillsRefreshReportView,
   type SkillSourceView,
 } from '@/pages/Skills/shared';
 
 /**
- * Skills — 技能库管理。
+ * Skills — 技能库管理（Tabs 布局：「技能列表」+「新建技能」）。
  *
- * - GET  /api/v1/skills        列表（一次性返回，数据量小 → 前端过滤，不含正文）；
- * - GET  /api/v1/skills/:id    详情（含正文 body；点卡片经 Sheet 惰性拉取）；
- * - POST /api/v1/skills        新建技能（admin/root；「新建技能」弹窗，写数据卷后
- *                              内核自动 refresh → 成功后重载列表）；
- * - GET+DELETE+POST            编辑技能（admin/root；仅数据卷来源——卡片「编辑」
- *                              入口 + 弹窗按表单重建；builtin/extension 来源隐藏）；
- * - DELETE /api/v1/skills/:id  删除技能（admin/root；仅数据卷来源，卡片行操作 +
- *                              confirm 弹窗；builtin/extension 来源隐藏删除）；
+ * REST 契约（src/api/skills.ts，只读依赖）：
+ * - GET  /api/v1/skills        列表（一次性返回，数据量小 → 前端过滤 + 客户端分页，不含正文）；
+ * - GET  /api/v1/skills/:id    详情（含正文 body；详情抽屉经 Sheet 惰性拉取）；
+ * - POST /api/v1/skills        新建技能（admin/root；「新建技能」Tab 表单面板，写数据卷后
+ *                              内核自动 refresh → 成功后重载列表并切回列表 Tab）；
+ * - DELETE /api/v1/skills/:id  删除技能（admin/root；仅数据卷 `source === 'data'` 可删——
+ *                              builtin 只读、extension 驻留内存，行操作按来源隐藏）；
  * - POST /api/v1/skills/refresh 重扫技能库（admin/root；403 → 隐藏按钮并提示）。
  *
- * 拖拽批量创建（admin/root）：页面级拖拽区（dragover 高亮）接收 .md/.markdown/
- * .txt/.pdf 等多文件 → batchImport 读取/提取文本（二进制走 POST /api/v1/extract，
- * 未接线则降级提示）→ dragdrop 纯函数构建待创建清单（frontmatter 识别 / 文件名
- * + 首段 / id 去重）→ BatchImportDialog 二次确认 → 逐文件创建 + 进度 + 汇总。
+ * 列表表格列：技能（name + id）/ 描述 / 来源（内置|数据卷|扩展徽标）/ 启用 Switch /
+ * 附属文件数 / 行操作（详情 · 编辑 · 删除）。启用状态是 SKILL.md frontmatter 的
+ * `enabled` 事实（注册表为纯读模型，REST 无启停写面）→ Switch 以禁用态如实呈现。
  *
- * 工具条：新建技能（admin）+ 刷新（重扫 + 重载列表）+ 来源 Select（全部/内置/
- * 数据卷/扩展）+ 标签 Select（从数据聚合）+ 搜索框（前端过滤 name/description）。
- * 顶部计数与 refresh 的 bySource 同源（对同一份 entries 聚合）。
+ * 拖拽批量创建（admin/root）：页面级拖拽区接收 .md/.markdown/.txt/.pdf 等多文件 →
+ * batchImport 读取/提取文本 → dragdrop 构建待创建清单 → BatchImportDialog 二次确认。
  */
 
 /** Select「全部」哨兵值（Radix Select 不允许空串 value） */
 const ALL = 'all';
+
+/** 列表客户端分页基数（与其他管理页统一每页 20 条） */
+const SKILLS_PAGE_SIZE = 20;
 
 export default function SkillsPage(): React.ReactNode {
   const [skills, setSkills] = useState<SkillEntryView[] | null>(null);
@@ -68,15 +80,17 @@ export default function SkillsPage(): React.ReactNode {
   const [rescanning, setRescanning] = useState(false);
   /** 服务端 403（无 admin/root 角色）→ 隐藏刷新按钮并提示 */
   const [forbidden, setForbidden] = useState(false);
+  /** Tabs：list = 技能列表 / create = 新建技能 */
+  const [tab, setTab] = useState<'list' | 'create'>('list');
 
   /** 过滤器（列表一次拉全，前端过滤） */
   const [sourceFilter, setSourceFilter] = useState<SkillSourceView | typeof ALL>(ALL);
   const [tagFilter, setTagFilter] = useState<string>(ALL);
   const [search, setSearch] = useState('');
+  /** 客户端分页页码 */
+  const [page, setPage] = useState(1);
   /** 详情抽屉目标（列表条目即时呈现元信息，正文由 Sheet 内部拉取） */
   const [detailTarget, setDetailTarget] = useState<SkillEntryView | null>(null);
-  /** 「新建技能」弹窗开关（admin） */
-  const [createOpen, setCreateOpen] = useState(false);
   /** 删除确认弹窗目标（null = 关闭；仅数据卷来源可删） */
   const [deleteTarget, setDeleteTarget] = useState<SkillEntryView | null>(null);
   /** 编辑弹窗目标（null = 关闭；仅数据卷来源可编辑，builtin/extension 隐藏入口） */
@@ -95,8 +109,7 @@ export default function SkillsPage(): React.ReactNode {
   const load = useCallback(async (): Promise<void> => {
     setError(null);
     try {
-      const res = await api.get<SkillEntryView[]>('/api/v1/skills');
-      setSkills(res);
+      setSkills(await skillsApi.list());
     } catch (e) {
       setError(errText(e));
     } finally {
@@ -112,7 +125,7 @@ export default function SkillsPage(): React.ReactNode {
   const handleRescan = useCallback(async (): Promise<void> => {
     setRescanning(true);
     try {
-      const report = await api.post<SkillsRefreshReportView>('/api/v1/skills/refresh');
+      const report = await skillsApi.refresh();
       toast.success(
         '重扫完成',
         `共 ${report.total} 个技能（内置 ${report.bySource.builtin} · 数据卷 ${report.bySource.data} · 扩展 ${report.bySource.extension}）`,
@@ -217,6 +230,15 @@ export default function SkillsPage(): React.ReactNode {
     });
   }, [skills, sourceFilter, tagFilter, search]);
 
+  // 客户端分页切片（page 超界由 safePage 收敛；过滤条件变化时回到第一页）
+  const filteredTotal = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(filteredTotal / SKILLS_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  useEffect(() => {
+    setPage(1);
+  }, [sourceFilter, tagFilter, search]);
+  const pagedSkills = filtered.slice((safePage - 1) * SKILLS_PAGE_SIZE, safePage * SKILLS_PAGE_SIZE);
+
   const filtersActive = sourceFilter !== ALL || tagFilter !== ALL || search.trim() !== '';
 
   const clearFilters = useCallback((): void => {
@@ -224,6 +246,12 @@ export default function SkillsPage(): React.ReactNode {
     setTagFilter(ALL);
     setSearch('');
   }, []);
+
+  /** 创建成功：重载列表并切回列表 Tab */
+  const handleCreated = useCallback(async (): Promise<void> => {
+    await load();
+    setTab('list');
+  }, [load]);
 
   return (
     <div
@@ -252,14 +280,14 @@ export default function SkillsPage(): React.ReactNode {
         <div className="flex flex-col gap-1">
           <h2 className="text-lg font-semibold tracking-tight">Skills 技能</h2>
           <p className="text-muted-foreground text-sm">
-            Agent Skills 技能库：提示词包的发现、查看与刷新。支持把{' '}
+            Agent Skills 技能库：提示词包的查看、新建与删除。支持把{' '}
             <code className="bg-muted rounded px-1 py-0.5 font-mono text-xs">.md / .txt / .pdf</code>{' '}
             等文件直接拖入页面批量创建技能。
           </p>
         </div>
         <div className="flex items-center gap-2">
           {canManage && (
-            <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <Button size="sm" onClick={() => setTab('create')}>
               <PlusIcon aria-hidden />
               新建技能
             </Button>
@@ -286,147 +314,246 @@ export default function SkillsPage(): React.ReactNode {
         </div>
       </div>
 
-      {/* 工具条：来源 / 标签过滤 + 搜索 */}
-      <div className="flex flex-wrap items-center gap-2">
-        <Select value={sourceFilter} onValueChange={(v) => setSourceFilter(v as SkillSourceView | typeof ALL)}>
-          <SelectTrigger size="sm" className="w-32" aria-label="按来源过滤">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL}>全部来源</SelectItem>
-            {SKILL_SOURCE_OPTIONS.map((s) => (
-              <SelectItem key={s} value={s}>
-                {SKILL_SOURCE_META[s].label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select value={tagFilter} onValueChange={setTagFilter}>
-          <SelectTrigger size="sm" className="w-36" aria-label="按标签过滤">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL}>全部标签</SelectItem>
-            {allTags.map((t) => (
-              <SelectItem key={t} value={t}>
-                {t}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <div className="relative ml-auto w-full sm:w-64">
-          <SearchIcon
-            className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2"
-            aria-hidden
-          />
-          <Input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="搜索名称或描述…"
-            className="pl-8"
-            aria-label="搜索技能"
-          />
-        </div>
-      </div>
+      <Tabs
+        value={tab}
+        onValueChange={(v) => setTab(v === 'create' ? 'create' : 'list')}
+        className="gap-4"
+      >
+        <TabsList>
+          <TabsTrigger value="list">
+            技能列表
+            {skills !== null && skills.length > 0 && <BadgeCount count={skills.length} />}
+          </TabsTrigger>
+          <TabsTrigger value="create">
+            <SquarePenIcon aria-hidden />
+            新建技能
+          </TabsTrigger>
+        </TabsList>
 
-      {/* 计数行（与 refresh 的 bySource 同口径） */}
-      <p className="text-muted-foreground text-sm">
-        共 <span className="text-foreground font-medium tabular-nums">{counts.builtin + counts.data + counts.extension}</span>{' '}
-        个技能
-        <span className="mx-1.5">·</span>内置 <span className="tabular-nums">{counts.builtin}</span>
-        <span className="mx-1.5">·</span>数据卷 <span className="tabular-nums">{counts.data}</span>
-        <span className="mx-1.5">·</span>扩展 <span className="tabular-nums">{counts.extension}</span>
-        {filtersActive && (
-          <>
-            <span className="mx-1.5">·</span>
-            匹配 <span className="text-foreground font-medium tabular-nums">{filtered.length}</span> 个
-          </>
-        )}
-      </p>
-
-      {/* 加载骨架 */}
-      {loading && (
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {Array.from({ length: 6 }, (_, i) => (
-            <Skeleton key={i} className="h-40 rounded-xl" />
-          ))}
-        </div>
-      )}
-
-      {/* 错误态 */}
-      {!loading && error !== null && (
-        <EmptyState icon={TriangleAlertIcon} title="技能列表加载失败" description={error}>
-          <Button size="sm" onClick={() => void load()}>
-            <RefreshCwIcon aria-hidden />
-            重试
-          </Button>
-        </EmptyState>
-      )}
-
-      {/* 空态：引导放置 SKILL.md 目录后重扫 */}
-      {!loading && error === null && (skills?.length ?? 0) === 0 && (
-        <EmptyState
-          icon={PackageOpenIcon}
-          title="暂无技能"
-          description={
-            <>
-              将 SKILL.md 目录放置于{' '}
-              <code className="bg-muted rounded px-1 py-0.5 font-mono text-xs">&lt;dataDir&gt;/skills/&lt;id&gt;/</code> 或
-              仓库 <code className="bg-muted rounded px-1 py-0.5 font-mono text-xs">skills/</code> 目录，点击「刷新」重扫。
-            </>
-          }
-        >
-          {!rescanBlocked && (
-            <Button size="sm" onClick={() => void handleRescan()} disabled={rescanning}>
-              <RefreshCwIcon className={cn(rescanning && 'animate-spin')} aria-hidden />
-              {rescanning ? '重扫中…' : '刷新'}
-            </Button>
-          )}
-        </EmptyState>
-      )}
-
-      {/* 过滤无匹配 */}
-      {!loading && error === null && (skills?.length ?? 0) > 0 && filtered.length === 0 && (
-        <EmptyState icon={SearchIcon} title="没有匹配的技能" description="调整来源、标签或搜索关键词后再试。">
-          <Button size="sm" variant="outline" onClick={clearFilters}>
-            清除过滤
-          </Button>
-        </EmptyState>
-      )}
-
-      {/* 技能卡片网格（数据卷来源 + admin 追加悬浮「编辑」入口，与行内「删除」一致化） */}
-      {!loading && error === null && filtered.length > 0 && (
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {filtered.map((skill) => (
-            <div key={skill.id} className="relative">
-              <SkillCard
-                skill={skill}
-                onOpen={() => setDetailTarget(skill)}
-                // 行操作「删除」：仅数据卷来源 + admin（builtin 只读、extension 驻留内存，均不可删）
-                onDelete={canManage && skill.source === 'data' ? () => setDeleteTarget(skill) : undefined}
+        {/* ------------------------------------------------ 技能列表 Tab */}
+        <TabsContent value="list" className="flex flex-col gap-4">
+          {/* 工具条：来源 / 标签过滤 + 搜索 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={sourceFilter} onValueChange={(v) => setSourceFilter(v as SkillSourceView | typeof ALL)}>
+              <SelectTrigger size="sm" className="w-32" aria-label="按来源过滤">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL}>全部来源</SelectItem>
+                {SKILL_SOURCE_OPTIONS.map((s) => (
+                  <SelectItem key={s} value={s}>
+                    {SKILL_SOURCE_META[s].label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={tagFilter} onValueChange={setTagFilter}>
+              <SelectTrigger size="sm" className="w-36" aria-label="按标签过滤">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL}>全部标签</SelectItem>
+                {allTags.map((t) => (
+                  <SelectItem key={t} value={t}>
+                    {t}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <div className="relative ml-auto w-full sm:w-64">
+              <SearchIcon
+                className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2"
+                aria-hidden
               />
-              {canManage && skill.source === 'data' && (
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={`编辑技能 ${skill.name}`}
-                  title="编辑该技能（数据卷目录）"
-                  className="text-muted-foreground hover:text-foreground absolute right-4 bottom-3"
-                  onClick={() => setEditTarget(skill)}
-                >
-                  <PencilIcon aria-hidden />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="搜索名称或描述…"
+                className="pl-8"
+                aria-label="搜索技能"
+              />
+            </div>
+          </div>
+
+          {/* 计数行（与 refresh 的 bySource 同口径） */}
+          <p className="text-muted-foreground text-sm">
+            共 <span className="text-foreground font-medium tabular-nums">{counts.builtin + counts.data + counts.extension}</span>{' '}
+            个技能
+            <span className="mx-1.5">·</span>内置 <span className="tabular-nums">{counts.builtin}</span>
+            <span className="mx-1.5">·</span>数据卷 <span className="tabular-nums">{counts.data}</span>
+            <span className="mx-1.5">·</span>扩展 <span className="tabular-nums">{counts.extension}</span>
+            {filtersActive && (
+              <>
+                <span className="mx-1.5">·</span>
+                匹配 <span className="text-foreground font-medium tabular-nums">{filteredTotal}</span> 个
+              </>
+            )}
+          </p>
+
+          {/* 加载骨架 */}
+          {loading && (
+            <div className="flex flex-col gap-3">
+              {Array.from({ length: 5 }, (_, i) => (
+                <Skeleton key={i} className="h-14 rounded-lg" />
+              ))}
+            </div>
+          )}
+
+          {/* 错误态 */}
+          {!loading && error !== null && (
+            <EmptyState icon={TriangleAlertIcon} title="技能列表加载失败" description={error}>
+              <Button size="sm" onClick={() => void load()}>
+                <RefreshCwIcon aria-hidden />
+                重试
+              </Button>
+            </EmptyState>
+          )}
+
+          {/* 空态：引导放置 SKILL.md 目录后重扫 */}
+          {!loading && error === null && (skills?.length ?? 0) === 0 && (
+            <EmptyState
+              icon={PackageOpenIcon}
+              title="暂无技能"
+              description={
+                <>
+                  将 SKILL.md 目录放置于{' '}
+                  <code className="bg-muted rounded px-1 py-0.5 font-mono text-xs">&lt;dataDir&gt;/skills/&lt;id&gt;/</code>{' '}
+                  或仓库 <code className="bg-muted rounded px-1 py-0.5 font-mono text-xs">skills/</code> 目录，点击「刷新」重扫；
+                  也可切到「新建技能」Tab 或直接把文件拖入本页。
+                </>
+              }
+            >
+              {!rescanBlocked && (
+                <Button size="sm" onClick={() => void handleRescan()} disabled={rescanning}>
+                  <RefreshCwIcon className={cn(rescanning && 'animate-spin')} aria-hidden />
+                  {rescanning ? '重扫中…' : '刷新'}
                 </Button>
               )}
-            </div>
-          ))}
-        </div>
-      )}
+            </EmptyState>
+          )}
 
-      {/* 详情抽屉 */}
+          {/* 过滤无匹配 */}
+          {!loading && error === null && (skills?.length ?? 0) > 0 && filteredTotal === 0 && (
+            <EmptyState icon={SearchIcon} title="没有匹配的技能" description="调整来源、标签或搜索关键词后再试。">
+              <Button size="sm" variant="outline" onClick={clearFilters}>
+                清除过滤
+              </Button>
+            </EmptyState>
+          )}
+
+          {/* 技能列表表格（客户端分页） */}
+          {!loading && error === null && filteredTotal > 0 && (
+            <>
+              <div className="overflow-x-auto rounded-lg border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-56">技能</TableHead>
+                      <TableHead>描述</TableHead>
+                      <TableHead className="w-20">来源</TableHead>
+                      <TableHead className="w-16">启用</TableHead>
+                      <TableHead className="w-20 text-right">附属文件</TableHead>
+                      <TableHead className="w-32 text-right">操作</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {pagedSkills.map((skill) => (
+                      <TableRow key={skill.id}>
+                        <TableCell className="max-w-[220px]">
+                          <div className="flex flex-col gap-0.5">
+                            <span className="truncate font-medium" title={skill.name}>
+                              {skill.name}
+                            </span>
+                            <span className="text-muted-foreground truncate font-mono text-xs" title={skill.id}>
+                              {skill.id}
+                            </span>
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-muted-foreground max-w-[320px]">
+                          <span className="line-clamp-2 text-xs leading-relaxed" title={skill.description}>
+                            {skill.description}
+                          </span>
+                        </TableCell>
+                        <TableCell>
+                          <SourceBadge source={skill.source} />
+                        </TableCell>
+                        <TableCell>
+                          {/* frontmatter enabled 事实（注册表纯读模型，REST 无启停写面）→ 禁用态如实呈现 */}
+                          <Switch
+                            checked={skill.enabled}
+                            disabled
+                            aria-label={skill.enabled ? `已启用 ${skill.name}` : `已停用 ${skill.name}`}
+                            title="启用状态由 SKILL.md frontmatter 的 enabled 声明（只读事实）"
+                          />
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-xs tabular-nums">{skill.files.length}</TableCell>
+                        <TableCell>
+                          <div className="flex justify-end gap-1.5">
+                            <Button
+                              variant="outline"
+                              size="icon-sm"
+                              title="查看详情"
+                              aria-label={`查看技能 ${skill.name} 详情`}
+                              onClick={() => setDetailTarget(skill)}
+                            >
+                              <SearchIcon aria-hidden />
+                            </Button>
+                            {canManage && skill.source === 'data' && (
+                              <>
+                                <Button
+                                  variant="outline"
+                                  size="icon-sm"
+                                  title="编辑该技能（数据卷目录）"
+                                  aria-label={`编辑技能 ${skill.name}`}
+                                  onClick={() => setEditTarget(skill)}
+                                >
+                                  <PencilIcon aria-hidden />
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="icon-sm"
+                                  title="删除该技能"
+                                  aria-label={`删除技能 ${skill.name}`}
+                                  className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                                  onClick={() => setDeleteTarget(skill)}
+                                >
+                                  <Trash2Icon aria-hidden />
+                                </Button>
+                              </>
+                            )}
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+              <Pagination
+                page={safePage}
+                pageSize={SKILLS_PAGE_SIZE}
+                total={filteredTotal}
+                onPageChange={setPage}
+              />
+            </>
+          )}
+        </TabsContent>
+
+        {/* ------------------------------------------------ 新建技能 Tab */}
+        <TabsContent value="create" className="flex flex-col gap-3">
+          {canManage ? (
+            <CreateSkillPanel onCreated={() => void handleCreated()} />
+          ) : (
+            <EmptyState
+              icon={ShieldCheckIcon}
+              title="需要 admin / root 角色"
+              description="创建技能会写入数据卷目录（skills write requires role admin or root）。请使用管理员账号登录后再试。"
+            />
+          )}
+        </TabsContent>
+      </Tabs>
+
+      {/* 详情抽屉（正文经 GET /api/v1/skills/:id 惰性拉取） */}
       <SkillDetailSheet skill={detailTarget} onOpenChange={(open) => !open && setDetailTarget(null)} />
-
-      {/* 新建技能（admin；POST 成功后内核已 refresh → 直接重载列表） */}
-      <CreateSkillDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={() => void load()} />
 
       {/* 删除确认（admin；仅数据卷来源；DELETE 成功后内核已 refresh → 重载列表） */}
       <DeleteSkillDialog target={deleteTarget} onClose={() => setDeleteTarget(null)} onDeleted={() => void load()} />
@@ -445,5 +572,14 @@ export default function SkillsPage(): React.ReactNode {
         onCreated={() => void load()}
       />
     </div>
+  );
+}
+
+/** TabsTrigger 内的计数徽标（次行渲染，避免行内 JSX 噪声） */
+function BadgeCount({ count }: { count: number }): React.ReactNode {
+  return (
+    <span className="bg-muted text-muted-foreground ml-1.5 rounded-full px-1.5 text-[11px] leading-4 tabular-nums">
+      {count}
+    </span>
   );
 }

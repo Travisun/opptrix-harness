@@ -1,46 +1,67 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  EyeIcon,
   PackageOpenIcon,
   PackagePlusIcon,
   RefreshCwIcon,
+  Trash2Icon,
   TriangleAlertIcon,
 } from 'lucide-react';
 
+import { Pagination } from '@/components/pagination';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 import { toast } from '@/components/ui/toast';
-import { api } from '@/lib/api';
+import { pluginsApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { EmptyState, errText } from '@/pages/_shared';
-import { InstallDialog } from '@/pages/Plugins/InstallDialog';
-import { PluginCard } from '@/pages/Plugins/PluginCard';
 import { PluginDetailDrawer } from '@/pages/Plugins/DetailDrawer';
+import { InstallDialog } from '@/pages/Plugins/InstallDialog';
 import { UninstallDialog } from '@/pages/Plugins/UninstallDialog';
-import { SecurityNotice } from '@/pages/Plugins/shared';
+import { ContributionChips, SecurityNotice, formatInstalledAt } from '@/pages/Plugins/shared';
 import type { InstalledPlugin } from '@/pages/Plugins/shared';
 
 /**
- * Plugins — 插件包管理（/plugins）。
+ * Plugins — 插件包管理（/plugins，表格布局）。
  *
  * 与内核 REST（src/api/plugins.ts，全部 admin/root）对齐：
- * - GET  /api/v1/plugins          已安装插件列表（registry.list()）；
+ * - GET  /api/v1/plugins          已安装插件列表（registry.list()）→ 表格
+ *                                 （插件 / 版本 / 贡献摘要 badges / 安装时间 / 操作）；
  * - POST /api/v1/plugins/install  安装 zip（InstallDialog；multipart field 'file' ≤64MB，
  *                                 `?overwrite=1` 覆盖）→ 201 后内核已自动 refresh 聚合注入，
- *                                 此处重拉列表即可；
+ *                                 此处重拉列表即可；安装中反馈（按钮脉冲 + 「安装中…」），
+ *                                 成功 toast / 失败内联 errText；
  * - POST /api/v1/plugins/refresh  重新扫描聚合（内核升级 / 手工放包后）→ { plugins }；
- * - GET  /api/v1/plugins/:id      详情（DetailDrawer）；
+ * - GET  /api/v1/plugins/:id      详情（DetailDrawer：贡献明细四段 + 注册的技能 / MCP
+ *                                 服务器清单——插件贡献即其「权限声明」面，REST 不暴露
+ *                                 独立启停端点，卸载即唯一生命周期写操作）；
  * - DELETE /api/v1/plugins/:id    卸载（UninstallDialog；`?force=1` 摘贡献后删目录，
  *                                 贡献在用未 force → 403 HARNESS-1007）。
  *
  * 插件包格式（plugin.json + skills/ + mcp 声明 + scripts/）：脚本仅在执行沙箱容器内
  * 运行（非宿主）；MCP stdio 服务器进程在本机运行——见页面底部安全提示。
  */
+
+/** 插件列表客户端分页基数（与其他管理页统一每页 20 条） */
+const PLUGINS_PAGE_SIZE = 20;
+
 export default function PluginsPage(): React.ReactNode {
   const [plugins, setPlugins] = useState<InstalledPlugin[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   /** POST /refresh 忙态 */
   const [refreshing, setRefreshing] = useState(false);
+  /** 列表分页页码 */
+  const [page, setPage] = useState(1);
   /** 安装弹窗 */
   const [installOpen, setInstallOpen] = useState(false);
   /** 详情抽屉目标 */
@@ -51,7 +72,7 @@ export default function PluginsPage(): React.ReactNode {
   const load = useCallback(async (): Promise<void> => {
     setError(null);
     try {
-      setPlugins(await api.get<InstalledPlugin[]>('/api/v1/plugins'));
+      setPlugins(await pluginsApi.list());
     } catch (e) {
       setError(errText(e));
     } finally {
@@ -67,7 +88,7 @@ export default function PluginsPage(): React.ReactNode {
   const handleRefresh = useCallback(async (): Promise<void> => {
     setRefreshing(true);
     try {
-      const res = await api.post<{ plugins: InstalledPlugin[] }>('/api/v1/plugins/refresh');
+      const res = await pluginsApi.refresh();
       setPlugins(res.plugins);
       toast.success('聚合完成', `共 ${res.plugins.length} 个插件`);
     } catch (e) {
@@ -76,6 +97,12 @@ export default function PluginsPage(): React.ReactNode {
       setRefreshing(false);
     }
   }, []);
+
+  // 客户端分页切片（page 超界收敛）
+  const total = (plugins ?? []).length;
+  const totalPages = Math.max(1, Math.ceil(total / PLUGINS_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pagedPlugins = (plugins ?? []).slice((safePage - 1) * PLUGINS_PAGE_SIZE, safePage * PLUGINS_PAGE_SIZE);
 
   const handleInstalled = useCallback(async (): Promise<void> => {
     setInstallOpen(false);
@@ -92,7 +119,7 @@ export default function PluginsPage(): React.ReactNode {
       {/* 页头 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
-          <h2 className="text-lg font-semibold tracking-tight">LLM 插件</h2>
+          <h2 className="text-lg font-semibold tracking-tight">插件管理</h2>
           <p className="text-muted-foreground text-sm">声明式 LLM 插件的安装、聚合刷新、贡献明细查看与卸载。</p>
         </div>
         <div className="flex items-center gap-2">
@@ -109,9 +136,9 @@ export default function PluginsPage(): React.ReactNode {
 
       {/* 加载骨架 */}
       {loading && (
-        <div className="grid gap-3 md:grid-cols-2">
-          {Array.from({ length: 2 }, (_, i) => (
-            <Skeleton key={i} className="h-44 rounded-lg" />
+        <div className="flex flex-col gap-3">
+          {Array.from({ length: 3 }, (_, i) => (
+            <Skeleton key={i} className="h-14 rounded-lg" />
           ))}
         </div>
       )}
@@ -127,7 +154,7 @@ export default function PluginsPage(): React.ReactNode {
       )}
 
       {/* 空态：插件包格式说明 + 上传入口 */}
-      {!loading && error === null && (plugins ?? []).length === 0 && (
+      {!loading && error === null && total === 0 && (
         <EmptyState
           icon={PackageOpenIcon}
           title="暂无已安装插件"
@@ -150,27 +177,88 @@ export default function PluginsPage(): React.ReactNode {
         </EmptyState>
       )}
 
-      {/* 插件卡片列表（<md 单列，≥md 双列） */}
-      {!loading && error === null && (plugins ?? []).length > 0 && (
-        <div className="grid gap-3 md:grid-cols-2">
-          {(plugins ?? []).map((plugin) => (
-            <PluginCard
-              key={plugin.id}
-              plugin={plugin}
-              onDetail={() => setDetailTarget(plugin)}
-              onUninstall={() => setUninstallTarget(plugin)}
-            />
-          ))}
-        </div>
+      {/* 已装插件表格（客户端分页） */}
+      {!loading && error === null && total > 0 && (
+        <>
+          <div className="overflow-x-auto rounded-lg border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-56">插件</TableHead>
+                  <TableHead className="w-24">版本</TableHead>
+                  <TableHead>贡献摘要</TableHead>
+                  <TableHead className="w-40">安装时间</TableHead>
+                  <TableHead className="w-24 text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {pagedPlugins.map((plugin) => (
+                  <TableRow key={plugin.id}>
+                    <TableCell className="max-w-[220px]">
+                      <div className="flex flex-col gap-0.5">
+                        <span className="truncate font-medium" title={plugin.name}>
+                          {plugin.name}
+                        </span>
+                        {plugin.description !== '' && (
+                          <span className="text-muted-foreground line-clamp-1 text-xs" title={plugin.description}>
+                            {plugin.description}
+                          </span>
+                        )}
+                        <span className="text-muted-foreground truncate font-mono text-xs" title={plugin.id}>
+                          {plugin.id}
+                        </span>
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="outline" className="font-mono text-[11px]">
+                        v{plugin.version}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <ContributionChips plugin={plugin} />
+                    </TableCell>
+                    <TableCell className="text-muted-foreground text-xs tabular-nums">
+                      {formatInstalledAt(plugin.installedAt)}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex justify-end gap-1.5">
+                        <Button
+                          variant="outline"
+                          size="icon-sm"
+                          title="查看详情（贡献明细）"
+                          aria-label={`查看插件 ${plugin.name} 详情`}
+                          onClick={() => setDetailTarget(plugin)}
+                        >
+                          <EyeIcon aria-hidden />
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="icon-sm"
+                          title="卸载"
+                          aria-label={`卸载插件 ${plugin.name}`}
+                          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                          onClick={() => setUninstallTarget(plugin)}
+                        >
+                          <Trash2Icon aria-hidden />
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          <Pagination page={safePage} pageSize={PLUGINS_PAGE_SIZE} total={total} onPageChange={setPage} />
+        </>
       )}
 
       {/* 安全提示区 */}
       <SecurityNotice />
 
-      {/* 安装弹窗（201 后父级重拉列表；内核在 install 内已完成聚合注入） */}
+      {/* 安装弹窗（zip 上传；安装中反馈 / 成功 toast / 失败内联 errText；201 后父级重拉列表） */}
       <InstallDialog open={installOpen} onOpenChange={setInstallOpen} onInstalled={() => void handleInstalled()} />
 
-      {/* 详情抽屉（贡献明细四段） */}
+      {/* 详情抽屉（贡献明细四段：摘要 / 技能 / MCP / 提示词与脚本） */}
       <PluginDetailDrawer plugin={detailTarget} onClose={() => setDetailTarget(null)} />
 
       {/* 卸载确认弹窗（?force=1 贡献闸引导） */}

@@ -8,8 +8,8 @@ import {
   Trash2Icon,
 } from 'lucide-react';
 
+import { Pagination } from '@/components/pagination';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
 import {
   Dialog,
   DialogContent,
@@ -29,12 +29,13 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { toast } from '@/components/ui/toast';
-import { api } from '@/lib/api';
+import { mcpApi } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { EmptyState, errText } from '@/pages/_shared';
 import { ServerCreateDialog } from '@/pages/Mcp/ServerCreateDialog';
 import { ServerDetail } from '@/pages/Mcp/ServerDetail';
 import { ServerEditDialog } from '@/pages/Mcp/ServerEditDialog';
+import { SystemServerCard } from '@/pages/Mcp/SystemServerCard';
 import {
   StateBadge,
   TransportBadge,
@@ -44,20 +45,29 @@ import {
 } from '@/pages/Mcp/shared';
 
 /**
- * Mcp — MCP 服务器管理。
+ * Mcp — MCP 管理（双区块：客户端连接 + 系统服务端）。
  *
+ * 区块一「MCP 客户端连接」（本系统作为客户端接入外部 MCP server），
+ * REST 契约（src/api/mcp.ts，全部 admin/root）：
  * - GET    /api/v1/mcp/servers             服务器列表（配置+运行态）；
- * - POST   /api/v1/mcp/servers             添加（只落盘不连接 → 提示显式「连接」）；
+ * - POST   /api/v1/mcp/servers             添加（只落盘不连接 → 提示显式「测试连接」）；
  * - PATCH  /api/v1/mcp/servers/:id         启停（enabled Switch；false 即断连）/ 名称 / headers；
  * - DELETE /api/v1/mcp/servers/:id         删除（confirm，先摘配置再断连）；
- * - POST   /api/v1/mcp/servers/:id/connect 手动（重）连接（失败 500 带原因 → toast）；
+ * - POST   /api/v1/mcp/servers/:id/connect 测试连接 / 手动（重）连接（失败 500 带原因 → toast）；
  * - 「全部连接」：REST 无 refreshAll 端点，此处对 enabled 列表逐个 connect（批量语义）；
  * - 工具/资源/提示目录与调用在 ServerDetail（GET /tools?serverId=、POST /tools/call、
- *   GET /:id/resources、GET /:id/prompts）。
+ *   GET /:id/resources、GET /:id/prompts），点行选中展开。
+ *
+ * 区块二「系统 MCP 服务端」（SystemServerCard）：/mcp 网关只读状态卡（端点/协议/鉴权/
+ * 工具目录，JSON-RPC tools/list 探测，见 SystemServerCard）。
  *
  * 状态机（内核）：never → connect → connected | error；enabled=false 恒为 disabled。
  * 错误形状 {code,message,detail}：404 HARNESS-3004 / 504 HARNESS-2001 / 500 HARNESS-9003。
  */
+
+/** 客户端连接列表客户端分页基数（与其他管理页统一每页 20 条） */
+const MCP_PAGE_SIZE = 20;
+
 export default function McpPage(): React.ReactNode {
   const [servers, setServers] = useState<McpServerSummary[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -67,6 +77,8 @@ export default function McpPage(): React.ReactNode {
   const [busy, setBusy] = useState<Record<string, string>>({});
   /** 批量连接（refreshAll 语义）进行中 */
   const [connectingAll, setConnectingAll] = useState(false);
+  /** 客户端列表分页页码 */
+  const [page, setPage] = useState(1);
   /** 详情区选中的 server id */
   const [selectedId, setSelectedId] = useState<string | null>(null);
   /** 目录重载信号（连接成功后 bump） */
@@ -82,8 +94,7 @@ export default function McpPage(): React.ReactNode {
     setRefreshing(true);
     setError(null);
     try {
-      const res = await api.get<McpServerSummary[]>('/api/v1/mcp/servers');
-      setServers(res);
+      setServers(await mcpApi.listServers());
     } catch (e) {
       setError(errText(e));
     } finally {
@@ -102,6 +113,12 @@ export default function McpPage(): React.ReactNode {
   }, [servers]);
 
   const enabledCount = useMemo(() => (servers ?? []).filter((s) => s.enabled).length, [servers]);
+
+  // 客户端分页切片（page 超界收敛）
+  const total = sorted.length;
+  const totalPages = Math.max(1, Math.ceil(total / MCP_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pagedServers = sorted.slice((safePage - 1) * MCP_PAGE_SIZE, safePage * MCP_PAGE_SIZE);
 
   /** 选中目标解析（列表刷新后目标可能已被删除） */
   const selected = useMemo(
@@ -131,7 +148,7 @@ export default function McpPage(): React.ReactNode {
     (server: McpServerSummary, enabled: boolean): Promise<void> =>
       withBusy(server.id, 'toggle', async () => {
         try {
-          await api.patch(`/api/v1/mcp/servers/${encodeURIComponent(server.id)}`, { enabled }, { silent: true });
+          await mcpApi.patchServer(server.id, { enabled });
           toast.success(enabled ? '已启用' : '已停用', enabled ? server.name : `${server.name}（既有连接已断开）`);
           await load();
         } catch (e) {
@@ -141,20 +158,17 @@ export default function McpPage(): React.ReactNode {
     [withBusy, load],
   );
 
-  /** 手动（重）连接：成功后刷新列表并触发目录重载；失败也刷新（回显 error 态与原因） */
+  /** 测试连接 / 手动（重）连接：POST :id/connect 返回 state+toolCount；失败 500 带原因 → toast；
+   * 成败均刷新列表（回显最新状态），成功后触发详情目录重载 */
   const connect = useCallback(
     (server: McpServerSummary): Promise<void> =>
       withBusy(server.id, 'connect', async () => {
         try {
-          const status = await api.post<{ state: string; toolCount: number }>(
-            `/api/v1/mcp/servers/${encodeURIComponent(server.id)}/connect`,
-            undefined,
-            { silent: true },
-          );
-          toast.success('已连接', `${server.name} · 缓存工具 ${status.toolCount} 个`);
+          const status = await mcpApi.connectServer(server.id);
+          toast.success('连接成功', `${server.name} · 状态 ${status.state} · 缓存工具 ${status.toolCount} 个`);
           setDetailTick((n) => n + 1);
         } catch (e) {
-          toastApiError(e, '连接失败');
+          toastApiError(e, '测试连接失败');
         } finally {
           await load();
         }
@@ -175,7 +189,7 @@ export default function McpPage(): React.ReactNode {
     try {
       for (const target of targets) {
         try {
-          await api.post(`/api/v1/mcp/servers/${encodeURIComponent(target.id)}/connect`, undefined, { silent: true });
+          await mcpApi.connectServer(target.id);
           ok += 1;
         } catch (e) {
           const message = errText(e);
@@ -202,7 +216,7 @@ export default function McpPage(): React.ReactNode {
     if (target === null) return Promise.resolve();
     return withBusy(target.id, 'delete', async () => {
       try {
-        await api.delete(`/api/v1/mcp/servers/${encodeURIComponent(target.id)}`, { silent: true });
+        await mcpApi.removeServer(target.id);
         toast.success('已删除', target.name);
         setDeleteTarget(null);
         if (selectedId === target.id) setSelectedId(null);
@@ -235,9 +249,9 @@ export default function McpPage(): React.ReactNode {
       {/* 页头 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
-          <h2 className="text-lg font-semibold tracking-tight">MCP 服务器</h2>
+          <h2 className="text-lg font-semibold tracking-tight">MCP 管理</h2>
           <p className="text-muted-foreground text-sm">
-            外部 MCP Server 接入与工具目录。保存仅落盘配置（不自动连接），需显式「连接」建立会话。
+            客户端连接外部 MCP Server 与系统服务端状态。保存仅落盘配置（不自动连接），需显式「测试连接」建立会话。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -256,198 +270,162 @@ export default function McpPage(): React.ReactNode {
         </div>
       </div>
 
-      {/* 加载骨架 */}
-      {loading && <Skeleton className="h-72 rounded-lg" />}
+      {/* ------------------------------------------------ 区块一：MCP 客户端连接 */}
+      <section className="flex flex-col gap-3">
+        <div className="flex flex-col gap-0.5">
+          <h3 className="text-sm font-semibold tracking-tight">MCP 客户端连接</h3>
+          <p className="text-muted-foreground text-xs">
+            本系统作为 MCP 客户端（Host）接入的外部 MCP Server：stdio 子进程或 streamable-http / sse 远端。
+          </p>
+        </div>
 
-      {/* 错误态 */}
-      {!loading && error !== null && (
-        <EmptyState icon={NetworkIcon} title="服务器列表加载失败" description={error}>
-          <Button size="sm" onClick={() => void load()}>
-            <RefreshCwIcon aria-hidden />
-            重试
-          </Button>
-        </EmptyState>
-      )}
+        {/* 加载骨架 */}
+        {loading && <Skeleton className="h-72 rounded-lg" />}
 
-      {/* 空态 */}
-      {!loading && error === null && sorted.length === 0 && (
-        <EmptyState
-          icon={NetworkIcon}
-          title="暂无 MCP 服务器"
-          description="添加一个外部 MCP Server（stdio 子进程或 streamable-http/sse 远端）。保存仅写入配置，创建后请点击「连接」。"
-        >
-          <Button size="sm" onClick={() => setCreateOpen(true)}>
-            <PlusIcon aria-hidden />
-            添加服务器
-          </Button>
-        </EmptyState>
-      )}
+        {/* 错误态 */}
+        {!loading && error !== null && (
+          <EmptyState icon={NetworkIcon} title="服务器列表加载失败" description={error}>
+            <Button size="sm" onClick={() => void load()}>
+              <RefreshCwIcon aria-hidden />
+              重试
+            </Button>
+          </EmptyState>
+        )}
 
-      {/* 服务器列表（桌面表格 + 移动卡片） */}
-      {!loading && error === null && sorted.length > 0 && (
-        <>
-          <div className="hidden overflow-x-auto rounded-lg border md:block">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>名称</TableHead>
-                  <TableHead className="w-40">传输</TableHead>
-                  <TableHead className="w-16">启用</TableHead>
-                  <TableHead className="w-32">状态</TableHead>
-                  <TableHead className="w-16 text-right">工具</TableHead>
-                  <TableHead className="w-36 text-right">操作</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {sorted.map((server) => (
-                  <TableRow
-                    key={server.id}
-                    data-state={selectedId === server.id ? 'selected' : undefined}
-                    className="cursor-pointer"
-                    onClick={() => setSelectedId(server.id)}
-                  >
-                    <TableCell className="max-w-[260px]">
-                      <div className="flex flex-col gap-0.5">
-                        <span className="truncate font-medium" title={server.name}>
-                          {server.name}
-                        </span>
-                        <span className="text-muted-foreground truncate font-mono text-xs" title={`${server.id} · ${serverTarget(server)}`}>
-                          {server.id} · {serverTarget(server)}
-                        </span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <TransportBadge transport={server.transport} />
-                    </TableCell>
-                    <TableCell>
-                      <Switch
-                        checked={server.enabled}
-                        disabled={rowBusy(server.id)}
-                        onCheckedChange={(checked) => void toggleEnabled(server, checked)}
-                        onClick={(e) => e.stopPropagation()}
-                        aria-label={server.enabled ? `停用 ${server.name}` : `启用 ${server.name}`}
-                      />
-                    </TableCell>
-                    <TableCell>
-                      <StateBadge server={server} />
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs tabular-nums">{server.toolCount}</TableCell>
-                    <TableCell>
-                      <div className="flex justify-end gap-1.5">
-                        <Button
-                          variant="outline"
-                          size="icon-sm"
-                          title={server.state === 'connected' ? '重连' : '连接'}
-                          disabled={rowBusy(server.id) || !server.enabled}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void connect(server);
-                          }}
-                        >
-                          <PlugZapIcon className={cn(busy[server.id] === 'connect' && 'animate-pulse')} aria-hidden />
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="icon-sm"
-                          title="编辑"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setEditTarget(server);
-                          }}
-                        >
-                          <PencilIcon aria-hidden />
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="icon-sm"
-                          title="删除"
-                          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                          disabled={rowBusy(server.id)}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setDeleteTarget(server);
-                          }}
-                        >
-                          <Trash2Icon aria-hidden />
-                        </Button>
-                      </div>
-                    </TableCell>
+        {/* 空态 */}
+        {!loading && error === null && total === 0 && (
+          <EmptyState
+            icon={NetworkIcon}
+            title="暂无 MCP 服务器"
+            description="添加一个外部 MCP Server（stdio 子进程或 streamable-http/sse 远端）。保存仅写入配置，创建后请点击「测试连接」。"
+          >
+            <Button size="sm" onClick={() => setCreateOpen(true)}>
+              <PlusIcon aria-hidden />
+              添加服务器
+            </Button>
+          </EmptyState>
+        )}
+
+        {/* 服务器表格（客户端分页；点行展开工具/资源/提示目录） */}
+        {!loading && error === null && total > 0 && (
+          <>
+            <div className="overflow-x-auto rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>名称</TableHead>
+                    <TableHead className="w-40">传输</TableHead>
+                    <TableHead className="w-16">启用</TableHead>
+                    <TableHead className="w-32">状态</TableHead>
+                    <TableHead className="w-16 text-right">工具</TableHead>
+                    <TableHead className="w-36 text-right">操作</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-
-          {/* 移动卡片列表（<md） */}
-          <div className="flex flex-col gap-3 md:hidden">
-            {sorted.map((server) => (
-              <Card key={server.id} className="gap-3 py-4">
-                <CardContent className="flex flex-col gap-3 px-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <button
-                      type="button"
-                      className="flex min-w-0 flex-col items-start gap-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                </TableHeader>
+                <TableBody>
+                  {pagedServers.map((server) => (
+                    <TableRow
+                      key={server.id}
+                      data-state={selectedId === server.id ? 'selected' : undefined}
+                      className="cursor-pointer"
                       onClick={() => setSelectedId(server.id)}
-                      aria-label={`查看 ${server.name} 详情`}
                     >
-                      <span className="flex flex-wrap items-center gap-2">
-                        <span className="truncate text-sm font-semibold">{server.name}</span>
+                      <TableCell className="max-w-[260px]">
+                        <div className="flex flex-col gap-0.5">
+                          <span className="truncate font-medium" title={server.name}>
+                            {server.name}
+                          </span>
+                          <span className="text-muted-foreground truncate font-mono text-xs" title={`${server.id} · ${serverTarget(server)}`}>
+                            {server.id} · {serverTarget(server)}
+                          </span>
+                        </div>
+                      </TableCell>
+                      <TableCell>
                         <TransportBadge transport={server.transport} />
+                      </TableCell>
+                      <TableCell>
+                        <Switch
+                          checked={server.enabled}
+                          disabled={rowBusy(server.id)}
+                          onCheckedChange={(checked) => void toggleEnabled(server, checked)}
+                          onClick={(e) => e.stopPropagation()}
+                          aria-label={server.enabled ? `停用 ${server.name}` : `启用 ${server.name}`}
+                        />
+                      </TableCell>
+                      <TableCell>
                         <StateBadge server={server} />
-                      </span>
-                      <span className="text-muted-foreground truncate font-mono text-xs">
-                        {server.id} · {serverTarget(server)}
-                      </span>
-                    </button>
-                    <Switch
-                      checked={server.enabled}
-                      disabled={rowBusy(server.id)}
-                      onCheckedChange={(checked) => void toggleEnabled(server, checked)}
-                      aria-label={server.enabled ? `停用 ${server.name}` : `启用 ${server.name}`}
-                    />
-                  </div>
-                  <div className="text-muted-foreground text-xs">工具：{server.toolCount} 个（连接期缓存）</div>
-                  <div className="flex flex-wrap gap-2 border-t pt-3">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={rowBusy(server.id) || !server.enabled}
-                      onClick={() => void connect(server)}
-                    >
-                      <PlugZapIcon className={cn(busy[server.id] === 'connect' && 'animate-pulse')} aria-hidden />
-                      {server.state === 'connected' ? '重连' : '连接'}
-                    </Button>
-                    <Button variant="outline" size="sm" onClick={() => setEditTarget(server)}>
-                      <PencilIcon aria-hidden />
-                      编辑
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                      disabled={rowBusy(server.id)}
-                      onClick={() => setDeleteTarget(server)}
-                    >
-                      <Trash2Icon aria-hidden />
-                      删除
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        </>
-      )}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">{server.toolCount}</TableCell>
+                      <TableCell>
+                        <div className="flex justify-end gap-1.5">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={rowBusy(server.id) || !server.enabled}
+                            title={server.state === 'connected' ? '重连（连通性测试）' : '测试连接'}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void connect(server);
+                            }}
+                          >
+                            <PlugZapIcon className={cn(busy[server.id] === 'connect' && 'animate-pulse')} aria-hidden />
+                            {server.state === 'connected' ? '重连' : '测试'}
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="icon-sm"
+                            title="编辑"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setEditTarget(server);
+                            }}
+                          >
+                            <PencilIcon aria-hidden />
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="icon-sm"
+                            title="删除"
+                            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                            disabled={rowBusy(server.id)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setDeleteTarget(server);
+                            }}
+                          >
+                            <Trash2Icon aria-hidden />
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            <Pagination page={safePage} pageSize={MCP_PAGE_SIZE} total={total} onPageChange={setPage} />
+          </>
+        )}
 
-      {/* 选中服务器 → 详情区（工具/资源/提示 Tabs） */}
-      {selected !== null && (
-        <ServerDetail
-          server={selected}
-          busyAction={busy[selected.id]}
-          refreshTick={detailTick}
-          onConnect={() => void connect(selected)}
-        />
-      )}
+        {/* 选中服务器 → 详情区（工具/资源/提示 Tabs） */}
+        {selected !== null && (
+          <ServerDetail
+            server={selected}
+            busyAction={busy[selected.id]}
+            refreshTick={detailTick}
+            onConnect={() => void connect(selected)}
+          />
+        )}
+      </section>
+
+      {/* ------------------------------------------------ 区块二：系统 MCP 服务端 */}
+      <section className="flex flex-col gap-3">
+        <div className="flex flex-col gap-0.5">
+          <h3 className="text-sm font-semibold tracking-tight">系统 MCP 服务端</h3>
+          <p className="text-muted-foreground text-xs">
+            本系统同时作为 MCP 服务端对外暴露系统操作工具（只读状态；启停由内核装配决定）。
+          </p>
+        </div>
+        <SystemServerCard />
+      </section>
 
       {/* 添加服务器（POST 只落盘，创建后提示显式连接） */}
       <ServerCreateDialog
