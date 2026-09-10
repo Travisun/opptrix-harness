@@ -73,3 +73,23 @@ export type {
   SessionRunnerInput,
   SystemToolRuntimeLike,
 } from './session-runner.js';
+export {
+  EMPTY_REPLY_HINT,
+  estimateTokens,
+  formatArgsPreview,
+  formatResultPreview,
+  formatToolLabel,
+  TOOL_STEP_ARGS_PREVIEW_MAX,
+  TOOL_STEP_RESULT_PREVIEW_MAX,
+  completeToolStep,
+  createToolStep,
+  isToolResultError,
+  toolErrorOf,
+} from './chat-progress.js';
+export type {
+  AgentLoopDeltaChunk,
+  ChatProgressCallback,
+  ChatProgressEvent,
+  ChatToolStep,
+  ChatToolStepStatus,
+} from './chat-progress.js';

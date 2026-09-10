@@ -68,6 +68,11 @@ export interface AgentMessageRecord {
   toolCalls?: AgentMessageToolCall[];
   /** token 用量（仅落最终 assistant 回复） */
   usage?: AgentMessageUsage;
+  /**
+   * 思考链分段（JSON 数组落库；每轮一段，按轮次序）。仅存在思考链的最终 assistant
+   * 回复携带；旧库自动 ALTER 加列，旧行/损坏 JSON 读取为缺省（不出现该键）。
+   */
+  reasoningSegments?: string[];
   created_at: number;
 }
 
@@ -77,6 +82,7 @@ export interface AgentMessageInput {
   content: string;
   toolCalls?: AgentMessageToolCall[];
   usage?: AgentMessageUsage;
+  reasoningSegments?: string[];
 }
 
 /** updateSession 允许的补丁字段 */
@@ -114,6 +120,7 @@ interface MessageRow {
   content: string;
   tool_calls: string | null;
   usage: string | null;
+  reasoning_segments: string | null;
   created_at: number;
 }
 
@@ -145,6 +152,11 @@ function sessionRowToRecord(row: SessionRow): AgentSessionRecord {
 function messageRowToRecord(row: MessageRow): AgentMessageRecord {
   const toolCalls = parseJson(row.tool_calls);
   const usage = parseJson(row.usage);
+  // 思考分段：数组且含字符串项才带出（脏 JSON / 非字符串项容错后为空则省略该键）
+  const rawSegments = parseJson(row.reasoning_segments);
+  const reasoningSegments = Array.isArray(rawSegments)
+    ? rawSegments.filter((s): s is string => typeof s === 'string')
+    : [];
   return {
     id: row.id,
     session_id: row.session_id,
@@ -156,6 +168,7 @@ function messageRowToRecord(row: MessageRow): AgentMessageRecord {
     ...(usage !== null && typeof usage === 'object' && !Array.isArray(usage)
       ? { usage: usage as AgentMessageUsage }
       : {}),
+    ...(reasoningSegments.length > 0 ? { reasoningSegments } : {}),
     created_at: row.created_at,
   };
 }
@@ -268,6 +281,9 @@ export class AgentSessionStore {
       content: input.content,
       ...(input.toolCalls !== undefined && input.toolCalls.length > 0 ? { toolCalls: input.toolCalls } : {}),
       ...(input.usage !== undefined ? { usage: input.usage } : {}),
+      ...(input.reasoningSegments !== undefined && input.reasoningSegments.length > 0
+        ? { reasoningSegments: input.reasoningSegments }
+        : {}),
       created_at: ts,
     };
     await this.db(AGENT_MESSAGES_TABLE).insert({
@@ -277,6 +293,7 @@ export class AgentSessionStore {
       content: record.content,
       tool_calls: record.toolCalls === undefined ? null : JSON.stringify(record.toolCalls),
       usage: record.usage === undefined ? null : JSON.stringify(record.usage),
+      reasoning_segments: record.reasoningSegments === undefined ? null : JSON.stringify(record.reasoningSegments),
       created_at: record.created_at,
     });
     await this.db(AGENT_SESSIONS_TABLE).where('id', sessionId).update({
@@ -347,10 +364,25 @@ export class AgentSessionStore {
         t.text('content').notNullable();
         t.text('tool_calls'); // JSON 字符串（工具调用数组）
         t.text('usage'); // JSON 字符串（token 用量）
+        t.text('reasoning_segments'); // JSON 字符串（思考链分段数组；null = 无思考链）
         t.integer('created_at').notNullable(); // UTC epoch ms
         t.index(['session_id'], 'agent_messages_session_id_index');
       });
+    } else {
+      await this.#addMessageColumnsIfMissing();
     }
+  }
+
+  /**
+   * 旧库加列（ALTER 守卫模式，与会话表同款）：早期版本建的 agent_messages 无
+   * reasoning_segments 列，存在性检查后 ALTER TABLE ADD COLUMN；新库 DDL 已含该列，
+   * 检查即跳过（幂等）。
+   */
+  async #addMessageColumnsIfMissing(): Promise<void> {
+    if (await this.db.schema.hasColumn(AGENT_MESSAGES_TABLE, 'reasoning_segments')) return;
+    await this.db.schema.alterTable(AGENT_MESSAGES_TABLE, (t) => {
+      t.text('reasoning_segments'); // 旧消息一律 null = 无思考链
+    });
   }
 
   /**

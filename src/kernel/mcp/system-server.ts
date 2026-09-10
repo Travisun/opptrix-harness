@@ -20,6 +20,8 @@
  *   结果恒为 CallToolResult(isError 缺省)；协议级错误（未知工具/参数不符 schema）由
  *   SDK 产生 JSON-RPC error（-32602 等），本层不重复映射。
  */
+import { sharedSkillActivationSession } from '../agents/skill-session.js';
+import { createSkillActivationTools } from './system-tools.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { FastifyReply, FastifyRequest } from 'fastify';
@@ -71,6 +73,8 @@ function buildSystemToolCatalog(kernel: Kernel): SystemTool[] {
         : undefined,
     })),
     createWorkspaceTools(),
+    // 技能激活登记表：进程内单例（会话级 Map）；registry 读取在工具执行内部按容器键懒解析
+    createSkillActivationTools(() => ({ activation: sharedSkillActivationSession() })),
   );
 }
 

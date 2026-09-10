@@ -6,7 +6,9 @@
  * - 非流式：`choices[0].message.tool_calls`（type:function）→ `LlmChatResult.toolCalls`
  *   结构化提取（id/name/argsJson）；流式仍以 `tool_call_delta` 增量透传。
  * - 流式：`stream_options:{ include_usage: true }` 保证最后一个 chunk 携带 usage；
- *   工具调用增量以 `tool_call_delta` 透传（index 取自 chunk 内声明）。
+ *   工具调用增量以 `tool_call_delta` 透传（index 取自 chunk 内声明）；
+ *   思考链增量解析 `delta.reasoning_content`（兼容 reasoningContent）→ `reasoning_delta` 事件；
+ *   非流式同步提取 `message.reasoning_content` → `LlmChatResult.reasoning`。
  * - 超时：client `timeout` + 每请求 `AbortSignal.timeout(timeoutMs)` 双保险。
  * - 错误：SDK 异常统一包装 `LLM_PROVIDER_ERROR`；不做隐藏重试（策略归上层）。
  */
@@ -51,6 +53,18 @@ function causeChainOf(e: unknown, depth = 0): string[] {
 }
 
 /** 最近一次响应的头部快照（empty-body 诊断用；SDK 消化 response 后守卫处已拿不到） */
+
+/**
+ * delta/message 上的思考链字段读取：`reasoning_content` 优先（DeepSeek 等约定），
+ * 兼容 camelCase `reasoningContent`；非字符串/空串收敛为 undefined。
+ */
+function reasoningContentOf(raw: unknown): string | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const rec = raw as { reasoning_content?: unknown; reasoningContent?: unknown };
+  if (typeof rec.reasoning_content === 'string' && rec.reasoning_content !== '') return rec.reasoning_content;
+  if (typeof rec.reasoningContent === 'string' && rec.reasoningContent !== '') return rec.reasoningContent;
+  return undefined;
+}
 
 function clientOf(cfg: LlmProviderConfig, apiKey: string): OpenAI {
   const client = new OpenAI({
@@ -133,10 +147,13 @@ export const openaiChatAdapter: LlmAdapter = {
       const toolCalls: LlmResultToolCall[] = (res.choices[0]?.message.tool_calls ?? [])
         .filter((tc): tc is OpenAI.Chat.ChatCompletionMessageFunctionToolCall => tc.type === 'function')
         .map((tc) => ({ id: tc.id, name: tc.function.name, argsJson: tc.function.arguments }));
+      // 思考链全文（推理模型经 message.reasoning_content 回传；空 = 无思考链，不出现该键）
+      const reasoning = reasoningContentOf(res.choices[0]?.message);
       return {
         text: res.choices[0]?.message.content ?? '',
         usage,
         raw: res,
+        ...(reasoning !== undefined ? { reasoning } : {}),
         ...(toolCalls.length > 0 ? { toolCalls } : {}),
       };
     } catch (e) {
@@ -159,6 +176,11 @@ export const openaiChatAdapter: LlmAdapter = {
       let usage: LlmChatResult['usage'] | undefined;
       for await (const chunk of stream) {
         const delta = chunk.choices[0]?.delta;
+        // 思考链增量（reasoning_content 优先，兼容 camelCase reasoningContent）
+        const reasoningText = reasoningContentOf(delta);
+        if (reasoningText !== undefined) {
+          yield { type: 'reasoning_delta', text: reasoningText };
+        }
         if (typeof delta?.content === 'string' && delta.content.length > 0) {
           yield { type: 'delta', text: delta.content };
         }

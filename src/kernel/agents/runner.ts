@@ -8,45 +8,73 @@
  *
  * 循环语义：
  * - 起始消息 = system（input.systemPrompt 或缺省中文系统提示）+ user(input.prompt)；
- * - 每轮 `gateway.chat({ model, messages, tools: 白名单 schemas })`（非流式）：
+ * - 每轮 `gateway.chat({ model, messages, tools: 白名单 schemas })`：
+ *   - **未传 input.onDelta** → 非流式（现状）；
+ *   - **传入 input.onDelta** → 以 stream:true 调用并消费流事件（delta/reasoning_delta/
+ *     tool_call_delta/done）：文本按估算 token 80ms 节流、思考链每 120 字回调一次
+ *     onDelta（回调抛错只 warn 不中断）；tool_call_delta 按 index 聚合为结构化调用；
  *   - `result.toolCalls` 非空 → 逐个 `tools.execute(name, JSON.parse(argsJson), ctx)`，
  *     以 `role:'tool'` 富形状消息回填结果文本（JSON 序列化）；**执行异常包装为
  *     `{ isError: true, error }` 结果继续循环**——工具失败是信息，不是终止；
  *   - 文本非空且无工具调用 → 该文本即 finalText，循环结束；
- *   - 空文本且无工具调用 → 继续下一轮（迭代上限兜底，防空转收束）。
+ *   - 空文本且无工具调用 → 继续下一轮（迭代上限兜底，防空转收束）；
+ *     **但本轮有思考链（reasoning）时判为「思考占满输出」→ 空回复守卫收束**
+ *     （finalText = EMPTY_REPLY_HINT，避免无效轮询）。
+ * - 思考链分段：每轮（工具轮 + 终轮 + 收尾轮）的 reasoning_content 累积为一段，
+ *   全部轮次收集进 `result.reasoningSegments`（无思考链时不出现该键）。
  * - 终止兜底（两种同款「无工具收尾」）：迭代耗尽（模型每轮都在要工具）或
  *   **token 预算**超限（全部轮次 usage 累计 input+output > maxTokens）→
  *   追加一条系统收尾 user 消息、不带 tools 再对话一次，以其文本为 finalText。
  * - `input.signal` aborted → 抛 AbortError（name === 'AbortError'）；
- *   检查点：每轮 chat 前、每个工具执行前、收尾前。
+ *   检查点：每轮 chat 前、流消费期间逐事件、每个工具执行前、收尾前。
  * - `iterations` = gateway.chat 调用次数（含收尾那次）；`toolCalls` =
  *   tools.execute 实际调用次数（参数 JSON 解析失败未执行的不计）。
  */
 import type { Logger } from 'pino';
+import { applyContextBudget } from './context-budget.js';
+import { assembleSystemPrompt } from './skill-catalog.js';
 
-import type { LlmChatInput, LlmChatResult, LlmMessage, LlmResultToolCall, LlmToolCall } from '../llm/index.js';
+import { EMPTY_REPLY_HINT, type AgentLoopDeltaChunk } from './chat-progress.js';
+import type { LlmChatInput, LlmChatResult, LlmMessage, LlmResultToolCall, LlmStreamEvent, LlmToolCall } from '../llm/index.js';
 
 // ---------------------------------------------------------------------------
 // 依赖与输入/输出契约
 // ---------------------------------------------------------------------------
+
+/** 工具执行上下文（审计归因 + 可选的工具步骤进度回调，由会话层桥接消费） */
+export interface AgentLoopToolCtx {
+  /** 发起方代理 id（审计/嵌套归因） */
+  agentId: string;
+  /** 嵌套深度（0 = 顶层委派） */
+  depth: number;
+  /** 工具步骤回调（可选；会话层用于 tool_start/tool_done 进度，runner 原样透传） */
+  onToolStep?: (step: unknown) => void;
+}
 
 /** 工具目录最小结构视图（listSchemas 下发模型；execute 执行调用） */
 export interface AgentLoopToolRuntime {
   /** 可用工具 schema（name/description/inputSchema 三元组，原样下发 provider tools 参数） */
   listSchemas(): Array<{ name: string; description: string; inputSchema: unknown }>;
   /** 执行单个工具调用；**允许抛错**——异常由循环包装为 isError 工具结果，不终止循环 */
-  execute(name: string, args: unknown, ctx: { agentId: string; depth: number }): Promise<unknown>;
+  execute(name: string, args: unknown, ctx: AgentLoopToolCtx): Promise<unknown>;
 }
 
 /** runAgentLoop 依赖集合（gateway 为内核 LlmGateway.chat 天然满足的最小结构视图） */
 export interface AgentLoopDeps {
-  /** LLM 网关（非流式 chat） */
-  gateway: { chat(input: LlmChatInput): Promise<LlmChatResult> };
+  /**
+   * LLM 网关。未流式调用返回 Promise 结果；stream:true 调用返回流事件迭代器
+   * （LlmGateway.chat 天然满足；测试可按调用形状注入其中一种或双态替身）。
+   */
+  gateway: { chat(input: LlmChatInput): Promise<LlmChatResult | AsyncGenerator<LlmStreamEvent>> };
   /** 工具运行时（目录 + 执行） */
   tools: AgentLoopToolRuntime;
   logger: Logger;
   /** 每轮迭代次数上限缺省值（input.maxIterations 未给时生效），缺省 16 */
   maxIterations?: number;
+  /** 技能短目录段（skill-catalog.buildSkillCatalog；缺省/空 = 不注入目录） */
+  skillCatalog?: () => string;
+  /** 会话级已激活技能正文段（skill-catalog.buildActivatedSkillsPrompt；入参 agentId=会话 id；缺省/空 = 不注入） */
+  activatedSkills?: (agentId: string) => string;
   /**
    * 迭代间协作让出钩子（工具轮结束后 await sleep(0) 再进入下一轮）；
    * 缺省 setTimeout 实现，测试可注入空实现加速。
@@ -77,11 +105,23 @@ export interface AgentLoopInput {
   maxTokens?: number;
   /** 中断信号：aborted 时循环尽快抛 AbortError */
   signal?: AbortSignal;
+  /**
+   * 流式增量回调（可选）。传入时每轮 gateway.chat 以 stream:true 调用并消费流事件：
+   * 文本增量按估算 token 80ms 节流合并回调、思考链增量每累积 120 字回调一次
+   * （片段为「距上次回调的合并增量」；流结束时 flush 残余片段）。
+   * 回调抛错只记 warn，不影响循环。
+   */
+  onDelta?: (chunk: AgentLoopDeltaChunk) => void;
+  /**
+   * 工具步骤回调（可选；透传给 tools.execute 的 ctx，供会话层发 tool_start/tool_done）。
+   * 步骤形状由会话层定义（ChatToolStep），runner 保持零领域语义故此处为 unknown。
+   */
+  onToolStep?: (step: unknown) => void;
 }
 
 /** runAgentLoop 结果 */
 export interface AgentLoopResult {
-  /** 最终报告文本（自然收束或强制收尾的 chat 文本；收尾失败为 ''） */
+  /** 最终报告文本（自然收束或强制收尾的 chat 文本；收尾失败为 ''；空回复守卫时为用户提示文案） */
   finalText: string;
   /** gateway.chat 调用次数（含强制收尾那次） */
   iterations: number;
@@ -91,6 +131,11 @@ export interface AgentLoopResult {
   usage: { inputTokens: number; outputTokens: number };
   /** 完整消息轨迹（父代理可读的子代理工作内容；仅内存态，持久化由 manager 负责） */
   messages: unknown[];
+  /**
+   * 各轮思考链分段（每轮一段，按轮次序；**仅在存在思考链时出现**——省略该键以保持
+   * 无思考链场景的结果形状与既有消费方/测试兼容）。
+   */
+  reasoningSegments?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +147,157 @@ export const DEFAULT_AGENT_MAX_ITERATIONS = 16;
 
 /** token 用量预算缺省值（input+output 累计） */
 export const DEFAULT_AGENT_MAX_TOKENS = 200_000;
+
+/** 文本增量回调节流窗口（毫秒；窗口内合并为一次回调，流结束 flush 残余） */
+export const TEXT_DELTA_THROTTLE_MS = 80;
+
+/** 思考链增量回调粒度（每累积约 120 字回调一次；流结束 flush 残余） */
+export const REASONING_DELTA_CHUNK_CHARS = 120;
+
+/** 估算 token 数（chars/4 向上取整；仅用于进度节流/展示，非计费口径） */
+export function estimateLoopTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/** 流消费期 tool_call_delta 的聚合行（id 覆盖、name/arguments 按 index 拼接） */
+interface PendingToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/** tool_call_delta payload 的最小结构视图（openai-chat 透传的 provider 增量形状） */
+interface ToolCallDeltaPayload {
+  id?: unknown;
+  function?: { name?: unknown; arguments?: unknown };
+}
+
+/**
+ * 消费一轮流式事件并聚合为非流式等价结果：
+ * - delta → 累积正文，80ms/估算 token 节流回调（回调片段 = 合并增量）；
+ * - reasoning_delta → 累积思考链，每 120 字回调一次（片段 = 合并增量）；
+ * - tool_call_delta → 按 index 聚合（id 覆盖、name/arguments 拼接）；
+ * - done → 捕获 usage；error → 以 Error 抛出（消息原样）；
+ * - 流结束 flush 思考链与正文残余片段（先 reasoning 后 text，与产生顺序一致）。
+ * 每个事件前检查中断信号；onDelta 回调抛错只 warn，不中断消费。
+ */
+async function consumeStream(
+  stream: AsyncGenerator<LlmStreamEvent>,
+  opts: {
+    onDelta?: (chunk: AgentLoopDeltaChunk) => void;
+    logger: Logger;
+    throwIfAborted: () => void;
+  },
+): Promise<LlmChatResult> {
+  const { onDelta, logger, throwIfAborted } = opts;
+
+  let text = '';
+  let reasoning = '';
+  let usage: LlmChatResult['usage'] | undefined;
+
+  let pendingText = '';
+  let pendingReasoning = '';
+  let lastEmitAt = 0;
+
+  const safeOnDelta = (chunk: AgentLoopDeltaChunk): void => {
+    if (onDelta === undefined) return;
+    try {
+      onDelta(chunk);
+    } catch (e) {
+      logger.warn({ err: e }, 'agent loop: onDelta callback failed (ignored)');
+    }
+  };
+
+  const flushText = (): void => {
+    if (pendingText === '') return;
+    const chunk = pendingText;
+    pendingText = '';
+    safeOnDelta({ text: chunk });
+  };
+
+  const flushReasoning = (): void => {
+    if (pendingReasoning === '') return;
+    const chunk = pendingReasoning;
+    pendingReasoning = '';
+    safeOnDelta({ reasoning: chunk });
+  };
+
+  const toolCallsByIndex = new Map<number, PendingToolCall>();
+
+  for await (const event of stream) {
+    throwIfAborted();
+    if (event.type === 'delta') {
+      if (onDelta !== undefined) {
+        const prevTokens = estimateLoopTokens(text);
+        text += event.text;
+        pendingText += event.text;
+        // 估算 token 有变化才可能回调；80ms 节流窗口内合并为一次（流结束 flush 残余）
+        if (estimateLoopTokens(text) !== prevTokens) {
+          const now = Date.now();
+          if (lastEmitAt === 0 || now - lastEmitAt >= TEXT_DELTA_THROTTLE_MS) {
+            lastEmitAt = now;
+            flushText();
+          }
+        }
+      } else {
+        text += event.text;
+      }
+      continue;
+    }
+    if (event.type === 'reasoning_delta') {
+      if (onDelta !== undefined) {
+        const prevTotal = reasoning.length;
+        reasoning += event.text;
+        pendingReasoning += event.text;
+        // 首段立即回调；其后每跨过一个 120 字粒度边界回调一次
+        if (prevTotal === 0 || Math.floor(reasoning.length / REASONING_DELTA_CHUNK_CHARS) > Math.floor(prevTotal / REASONING_DELTA_CHUNK_CHARS)) {
+          flushReasoning();
+        }
+      } else {
+        reasoning += event.text;
+      }
+      continue;
+    }
+    if (event.type === 'tool_call_delta') {
+      const payload = (event.payload ?? {}) as ToolCallDeltaPayload;
+      const index = typeof event.index === 'number' ? event.index : 0;
+      let current = toolCallsByIndex.get(index);
+      if (current === undefined) {
+        current = { id: '', name: '', arguments: '' };
+        toolCallsByIndex.set(index, current);
+      }
+      if (typeof payload.id === 'string' && payload.id !== '') current.id = payload.id;
+      if (typeof payload.function?.name === 'string') current.name += payload.function.name;
+      if (typeof payload.function?.arguments === 'string') current.arguments += payload.function.arguments;
+      continue;
+    }
+    if (event.type === 'done') {
+      usage = event.usage;
+      continue;
+    }
+    // error 事件：流内不可恢复失败，原样上抛（for-await 自动关闭生成器）
+    throw new Error(event.message);
+  }
+
+  // 流结束：flush 残余片段（先思考链后正文，与产生顺序一致）
+  if (onDelta !== undefined) {
+    flushReasoning();
+    flushText();
+  }
+
+  const aggregated = [...toolCallsByIndex.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, tc]) => tc)
+    .filter((tc) => tc.id !== '' || tc.name !== '')
+    .map((tc) => ({ id: tc.id, name: tc.name, argsJson: tc.arguments }));
+
+  return {
+    text,
+    ...(reasoning !== '' ? { reasoning } : {}),
+    ...(usage !== undefined ? { usage } : {}),
+    ...(aggregated.length > 0 ? { toolCalls: aggregated } : {}),
+  };
+}
 
 /** 缺省中文系统提示：列出可用工具名，约定完成即出最终报告 */
 export function defaultAgentSystemPrompt(toolNames: string[]): string {
@@ -145,6 +341,11 @@ function toMessageToolCalls(requested: LlmResultToolCall[]): LlmToolCall[] {
   return requested.map((tc) => ({ id: tc.id, name: tc.name, arguments: tc.argsJson }));
 }
 
+/** 网关返回值形状判定：AsyncGenerator（流）还是 Promise 结果（非流式） */
+function isStreamResult(out: LlmChatResult | AsyncGenerator<LlmStreamEvent>): out is AsyncGenerator<LlmStreamEvent> {
+  return typeof (out as AsyncGenerator<LlmStreamEvent>)[Symbol.asyncIterator] === 'function';
+}
+
 // ---------------------------------------------------------------------------
 // 循环主体
 // ---------------------------------------------------------------------------
@@ -166,8 +367,13 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
   const toolNames = schemas.map((s) => s.name);
 
   // ---- 起始消息：system + user ----
+  // 技能两层注入：短目录 + 会话级已激活正文（skill-catalog 纯函数；注册表/激活表经 deps 可选注入，
+  // 未注入 = 无目录无激活，保持既有语义）
+  const baseSystem = input.systemPrompt ?? defaultAgentSystemPrompt(toolNames);
+  const catalog = deps.skillCatalog ? deps.skillCatalog() : '';
+  const activated = deps.activatedSkills ? deps.activatedSkills(input.agentId) : '';
   const messages: LlmMessage[] = [
-    { role: 'system', content: input.systemPrompt ?? defaultAgentSystemPrompt(toolNames) },
+    { role: 'system', content: assembleSystemPrompt(baseSystem, catalog, activated) },
     { role: 'user', content: input.prompt },
   ];
 
@@ -175,35 +381,63 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
   let executedToolCalls = 0;
   let inputTokens = 0;
   let outputTokens = 0;
+  const reasoningSegments: string[] = [];
+  const onDelta = input.onDelta;
+  const onToolStep = input.onToolStep;
 
   const throwIfAborted = (): void => {
     if (signal?.aborted === true) throw abortError();
   };
 
-  /** 单次对话 + 计数/用量累计/迭代日志（useTools=false 用于无工具收尾） */
-  const chatOnce = async (useTools: boolean): Promise<LlmChatResult> => {
-    throwIfAborted();
-    const result = await deps.gateway.chat({
-      // 未指定 model：原样透传 undefined，沿用网关既有路由/回退语义（不可路由 → LLM_MODEL_NOT_FOUND）
-      model: input.model as string,
-      messages,
-      ...(useTools && schemas.length > 0 ? { tools: schemas } : {}),
-    });
+  /** 轮结果记账：迭代/用量累计 + 有思考链则收一段 */
+  const accountRound = (result: LlmChatResult): LlmChatResult => {
     iterations += 1;
     inputTokens += result.usage?.inputTokens ?? 0;
     outputTokens += result.usage?.outputTokens ?? 0;
+    if (typeof result.reasoning === 'string' && result.reasoning.trim() !== '') {
+      reasoningSegments.push(result.reasoning);
+    }
     deps.logger.debug(
       {
         agentId: input.agentId,
         depth: input.depth,
         iteration: iterations,
         hasToolCalls: (result.toolCalls?.length ?? 0) > 0,
+        hasReasoning: typeof result.reasoning === 'string' && result.reasoning !== '',
         usage: { inputTokens, outputTokens },
       messages,
       },
       'agent loop: iteration',
     );
     return result;
+  };
+
+  /** 单次对话 + 计数/用量累计/迭代日志（useTools=false 用于无工具收尾） */
+  const chatOnce = async (useTools: boolean): Promise<LlmChatResult> => {
+    throwIfAborted();
+    // 上下文预算：超限时对早期轮做 micro 压缩（keepRecent 恒保留；预算内零开销原样返回）
+    const budgetView = applyContextBudget(messages);
+    const payload: LlmChatInput = {
+      // 未指定 model：原样透传 undefined，沿用网关既有路由/回退语义（不可路由 → LLM_MODEL_NOT_FOUND）
+      model: input.model as string,
+      messages: budgetView.messages,
+      ...(useTools && schemas.length > 0 ? { tools: schemas } : {}),
+    };
+    if (onDelta === undefined) {
+      // 非流式（现状语义）；网关违约回了流生成器时兜底按流消费（无增量回调，纯聚合）
+      const out = await deps.gateway.chat(payload);
+      const result = isStreamResult(out)
+        ? await consumeStream(out, { logger: deps.logger, throwIfAborted })
+        : out;
+      return accountRound(result);
+    }
+    // 流式：onDelta 传入即走 stream:true，事件消费见 consumeStream（节流回调/聚合在其内）
+    const out = await deps.gateway.chat({ ...payload, stream: true });
+    const result = await consumeStream(
+      isStreamResult(out) ? out : (out as unknown as AsyncGenerator<LlmStreamEvent>),
+      { onDelta, logger: deps.logger, throwIfAborted },
+    );
+    return accountRound(result);
   };
 
   /** 工具调用执行 + assistant/tool 消息回填（异常包装 isError 继续；参数非法不执行直接 isError） */
@@ -216,16 +450,20 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
         toolCalls: toMessageToolCalls(requested),
       },
     });
-    for (const tc of requested) {
-      throwIfAborted();
-      let text: string;
-      let isError = false;
-      try {
-        const args: unknown = JSON.parse(tc.argsJson);
-        executedToolCalls += 1;
-        const out = await deps.tools.execute(tc.name, args, { agentId: input.agentId, depth: input.depth });
-        text = resultJson(out);
-      } catch (e) {
+      for (const tc of requested) {
+        throwIfAborted();
+        let text: string;
+        let isError = false;
+        try {
+          const args: unknown = JSON.parse(tc.argsJson);
+          executedToolCalls += 1;
+          const out = await deps.tools.execute(tc.name, args, {
+            agentId: input.agentId,
+            depth: input.depth,
+            ...(onToolStep !== undefined ? { onToolStep } : {}),
+          });
+          text = resultJson(out);
+        } catch (e) {
         // 工具失败是信息不是终止：isError 结果回填，循环继续
         isError = true;
         text = JSON.stringify({ isError: true, error: messageOf(e) });
@@ -268,6 +506,12 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
       finalText = result.text;
       break;
     }
+    // 空回复守卫：空文本、无工具调用、但有思考链 → 思考占满本轮输出，提示后收束
+    //（避免对推理模型的无效轮询；无思考链时维持现状继续轮询）
+    if (typeof result.reasoning === 'string' && result.reasoning.trim() !== '') {
+      finalText = EMPTY_REPLY_HINT;
+      break;
+    }
     // 空文本且无工具调用：继续下一轮（迭代上限兜底防空转）
   }
   if (finalText === null) {
@@ -280,5 +524,6 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
     toolCalls: executedToolCalls,
     usage: { inputTokens, outputTokens },
     messages,
+    ...(reasoningSegments.length > 0 ? { reasoningSegments } : {}),
   };
 }

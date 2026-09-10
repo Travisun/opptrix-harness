@@ -7,6 +7,10 @@
  *   工具 schemas）→ createSessionRunner(runner.ts 的 runAgentLoop) 执行「对话 ↔ 工具」
  *   循环 → 工具调用轨迹 + 最终 assistant 回复落库 → SSE topic `agent:{sessionId}`
  *   实时推送（message.created / generation.cancelled）→ 返回最终 assistant 消息；
+ * - **流式进度**：sendMessage 可选 onProgress（ChatProgressEvent 协议，见 chat-progress.ts）——
+ *   传入时 runner 以 stream:true 调用网关，onDelta 节流片段映射为 thinking/reply 事件、
+ *   工具步骤桥映射为 tool_start/tool_done、终局发 done（含最终消息与思考分段）；
+ *   未传时维持非流式现状语义不变；
  * - 模型解析链：会话显式 model → settings 'agents.defaultModel' → 第一可用 provider
  *   的 models[0]（经 gateway.getProviders）；全链落空 → undefined 透传（沿用网关既有
  *   路由语义，不可路由时 LLM_MODEL_NOT_FOUND）；
@@ -16,6 +20,9 @@
  * 不做：模型路由/回退（gateway 既有语义）、工具实现（系统 MCP 工具目录）、
  * 会话标题的 LLM 自动生成（UI 侧以首条 user 消息前 30 字符自动改名）。
  */
+import type { SkillRegistryLike } from '../skills/types.js';
+import { buildActivatedSkillsPrompt, buildSkillCatalog } from './skill-catalog.js';
+import { sharedSkillActivationSession } from './skill-session.js';
 import { randomUUID } from 'node:crypto';
 
 import type { Logger } from 'pino';
@@ -23,6 +30,13 @@ import type { Logger } from 'pino';
 import { err } from '../errors/index.js';
 import type { LlmChatInput, LlmChatResult, LlmProviderConfig, LlmStreamEvent } from '../llm/index.js';
 import type { WorkspaceResolveResult, WorkspaceService } from '../workspace/index.js';
+import {
+  estimateTokens,
+  type AgentLoopDeltaChunk,
+  type ChatProgressCallback,
+  type ChatProgressEvent,
+  type ChatToolStep,
+} from './chat-progress.js';
 import {
   createSessionRunner,
   type SessionRunner,
@@ -59,6 +73,20 @@ export type {
 } from './session-store.js';
 export { createSessionRunner } from './session-runner.js';
 export type { SessionRunner, SessionRunnerDeps, SessionRunnerInput } from './session-runner.js';
+export {
+  EMPTY_REPLY_HINT,
+  estimateTokens,
+  formatArgsPreview,
+  formatResultPreview,
+  formatToolLabel,
+} from './chat-progress.js';
+export type {
+  AgentLoopDeltaChunk,
+  ChatProgressCallback,
+  ChatProgressEvent,
+  ChatToolStep,
+  ChatToolStepStatus,
+} from './chat-progress.js';
 
 /** 会话标题缺省值 */
 export const DEFAULT_SESSION_TITLE = '新对话';
@@ -107,6 +135,8 @@ export interface AgentSessionManagerDeps {
   settings: AgentSessionSettings;
   /** 内核 pino logger */
   logger: Logger;
+  /** 技能注册表 getter（缺省 = 不注入技能目录/激活正文注入；真实 SkillRegistry 天然满足） */
+  skillsRegistry?: () => (Pick<SkillRegistryLike, 'list'> & { get(id: string): Promise<{ entry: unknown; body: string } | null> }) | undefined;
   /** 系统工具运行时取值器（缺省 = 本次无工具；core-services 传 currentSystemRuntime） */
   systemRuntime?: () => SystemToolRuntimeLike | undefined;
   /** SSE 广播门面（缺省 = 不推送） */
@@ -159,6 +189,21 @@ export class AgentSessionManager {
     this.#runner = createSessionRunner({
       gateway: deps.gateway,
       ...(deps.systemRuntime !== undefined ? { systemRuntime: deps.systemRuntime } : {}),
+      ...(deps.skillsRegistry !== undefined
+        ? {
+            // 技能两层注入：短目录恒注入（空注册表=空段）；已激活正文按登记表逐个取正文
+            skillCatalog: () => {
+              const registry = deps.skillsRegistry?.();
+              return registry === undefined ? '' : buildSkillCatalog(registry);
+            },
+            activatedSkills: (agentId: string) => {
+              const registry = deps.skillsRegistry?.();
+              if (registry === undefined) return '';
+              // 正文在 skill_activate 时已缓存进登记表（快照制，同步可用）
+              return buildActivatedSkillsPrompt(sharedSkillActivationSession().snapshot(agentId));
+            },
+          }
+        : {}),
       logger: deps.logger,
       ...(deps.maxIterations !== undefined ? { maxIterations: deps.maxIterations } : {}),
       ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
@@ -315,6 +360,11 @@ export class AgentSessionManager {
   /**
    * 发送一条用户消息并驱动 LLM 回复（见模块头注释）。
    *
+   * @param onProgress 可选进度回调（Chat 流式协议，见 chat-progress.ts）：思考链增量
+   *   （thinking）/ 回复草稿增量（reply）/ 工具步骤（tool_start/tool_done）/ 终局
+   *   （done）。回调抛错由分发侧兜底 warn，不影响生成与落库。未传时行为与既有
+   *   非流式语义完全一致（网关不 stream，无进度分发）。
+   *
    * @returns 最终 assistant 消息记录（工具调用轨迹 + 最终文本均已落库）
    * @throws EXT_NOT_FOUND 会话不存在
    * @throws BAD_REQUEST 消息内容为空
@@ -322,7 +372,11 @@ export class AgentSessionManager {
    * @throws SERVICE_UNAVAILABLE 生成被 cancelGeneration 中断
    * @throws LLM_* 网关/路由失败（原样上抛）
    */
-  async sendMessage(sessionId: string, userMessage: string): Promise<AgentMessageRecord> {
+  async sendMessage(
+    sessionId: string,
+    userMessage: string,
+    onProgress?: ChatProgressCallback,
+  ): Promise<AgentMessageRecord> {
     // 生成互斥：check-and-set 同步完成（其间无 await），并发窗口不存在
     if (this.#generating.has(sessionId)) {
       throw err('TOO_MANY_CONCURRENT', {
@@ -339,6 +393,46 @@ export class AgentSessionManager {
         throw err('BAD_REQUEST', { message: 'message content is required', detail: { field: 'content' } });
       }
 
+      // 进度分发兜底：回调抛错只 warn，不中断生成/落库
+      const progress = this.#guardProgress(onProgress);
+      // onDelta → thinking/reply 事件适配：思考链增量按段计数（工具步骤开启新一段，
+      // 与 runner「每轮一段」的粒度一致）；reply 草稿为累积全文 + chars/4 估算 token
+      let segmentIndex = 0;
+      let segmentOpen = false;
+      let replyDraft = '';
+      const onDelta =
+        progress === undefined
+          ? undefined
+          : (chunk: AgentLoopDeltaChunk): void => {
+              if (typeof chunk.reasoning === 'string' && chunk.reasoning !== '') {
+                if (!segmentOpen) {
+                  segmentIndex += 1;
+                  segmentOpen = true;
+                }
+                progress({ type: 'thinking', round: segmentIndex, segmentIndex, content: chunk.reasoning });
+              }
+              if (typeof chunk.text === 'string' && chunk.text !== '') {
+                replyDraft += chunk.text;
+                progress({
+                  type: 'reply',
+                  content: replyDraft,
+                  estimatedTokens: estimateTokens(replyDraft),
+                  draft: true,
+                });
+              }
+            };
+      const onToolStep =
+        progress === undefined
+          ? undefined
+          : (step: ChatToolStep): void => {
+              if (step.status === 'running') {
+                segmentOpen = false; // 工具步骤 = 上一段思考收束（下一段属下一轮）
+                progress({ type: 'tool_start', step });
+                return;
+              }
+              progress({ type: 'tool_done', step });
+            };
+
       // 1. user 消息落库 + 实时推送
       const userMsg = await this.#deps.store.addMessage(sessionId, { role: 'user', content });
       this.#publishMessage(userMsg);
@@ -354,7 +448,7 @@ export class AgentSessionManager {
       // 3. 模型解析链：会话显式 → settings → 第一可用 provider models[0]
       const model = await this.#resolveModel(session);
 
-      // 4. Agent 循环（runner.ts 语义：工具调用执行/失败回填/收束）
+      // 4. Agent 循环（runner.ts 语义：工具调用执行/失败回填/收束；流式透传见上）
       const input: SessionRunnerInput = {
         agentId: sessionId,
         depth: 0,
@@ -362,19 +456,30 @@ export class AgentSessionManager {
         signal: controller.signal,
         ...(session.systemPrompt !== null ? { systemPrompt: session.systemPrompt } : {}),
         ...(model !== undefined ? { model } : {}),
+        ...(onDelta !== undefined ? { onDelta } : {}),
+        ...(onToolStep !== undefined ? { onToolStep } : {}),
       };
       const result = await this.#runner(input);
 
       // 5. 工具调用轨迹落库（assistant 工具调用轮 + tool 结果以 system 角色落库）
       await this.#persistTrajectory(sessionId, result.messages);
 
-      // 6. 最终 assistant 回复落库（含累计 usage）+ 实时推送
+      // 6. 最终 assistant 回复落库（含累计 usage 与思考分段）+ 实时推送 + done 事件
       const assistantMsg = await this.#deps.store.addMessage(sessionId, {
         role: 'assistant',
         content: result.finalText,
         usage: result.usage,
+        ...(result.reasoningSegments !== undefined && result.reasoningSegments.length > 0
+          ? { reasoningSegments: result.reasoningSegments }
+          : {}),
       });
       this.#publishMessage(assistantMsg);
+      progress?.({
+        type: 'done',
+        message: assistantMsg,
+        usage: result.usage,
+        reasoningSegments: result.reasoningSegments ?? [],
+      });
       return assistantMsg;
     } catch (e) {
       if (isAbortError(e)) {
@@ -409,6 +514,18 @@ export class AgentSessionManager {
   // ---------------------------------------------------------------------------
   // 内部
   // ---------------------------------------------------------------------------
+
+  /** 进度回调兜底包装：回调抛错只 warn（logger 未注入时静默），不影响生成分发 */
+  #guardProgress(onProgress: ChatProgressCallback | undefined): ChatProgressCallback | undefined {
+    if (onProgress === undefined) return undefined;
+    return (event: ChatProgressEvent): void => {
+      try {
+        onProgress(event);
+      } catch (e) {
+        this.#deps.logger.warn({ err: e, event: event.type }, 'agents: progress callback failed (ignored)');
+      }
+    };
+  }
 
   /** 会话存在性断言（不存在 → EXT_NOT_FOUND → 404 HARNESS-3004） */
   async #assertSession(sessionId: string): Promise<AgentSessionRecord> {

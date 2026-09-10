@@ -31,6 +31,7 @@ import type { Knex } from 'knex';
 import { z } from 'zod';
 
 import { HOST_METHODS } from '../../extension-host/protocol.js';
+import { MAX_ACTIVATED_SKILLS_PER_SESSION, sharedSkillActivationSession, type SkillActivationSession } from '../agents/skill-session.js';
 import { CONTAINER_KEYS, type Kernel, type UpdaterFacade } from '../Kernel.js';
 import { SUBAGENT_STATUSES, SUBAGENT_TERMINAL_STATUSES } from '../agents/types.js';
 import {
@@ -2057,6 +2058,90 @@ function createBuiltinSystemTools(): SystemTool[] {
             return fail('HARNESS-3004', `subagent "${agentId}" not found`, { agentId });
           }
           return ok({ agentId, transcript: record['transcript'] ?? [] });
+        }),
+    ),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// 技能激活工具（skill_ 域）——两层技能注入的激活面
+// ---------------------------------------------------------------------------
+
+/**
+ * skill_* 激活工具的依赖注入面（**直接注入模式**，与 createExtractTools 同款）：
+ * `activation` 缺省 = 进程内共享单例（sharedSkillActivationSession）——工具执行
+ * （LLM 调 skill_activate）与 system prompt 组装方（assembleSystemPrompt 的调用方）
+ * 必须读到同一份登记表；多实例/测试场景经此注入隔离实例。
+ * 技能注册表不走此面：与 skills_list 等一致，经容器键 CONTAINER_KEYS.skillsRegistry
+ * 懒解析（未登记 → INTERNAL，提示装配缺失）。
+ */
+export type SkillActivationToolsDeps = { activation?: SkillActivationSession };
+
+/**
+ * 构建技能激活工具目录（skill_activate / skill_list_activated）。
+ *
+ * 两层技能注入（见 src/kernel/agents/skill-catalog.ts 模块注释）：
+ * - 短目录（buildSkillCatalog）恒入 system prompt，模型据此发现技能；
+ * - 本工具面是**第二层的登记入口**：激活只登记名字（正文不随工具结果回传，防重复
+ *   膨胀上下文），组装方在 runner 组装 system prompt 时按登记表经
+ *   buildActivatedSkillsPrompt 注入消毒后的正文；
+ * - 会话语义：ctx.agentId 即会话 id（chat 会话或子代理 id，与 workspace_* 同款）；
+ *   缺失（外部 /mcp 直调等无会话场景）→ 收敛 no session context，不落登记。
+ */
+export function createSkillActivationTools(
+  getDeps?: () => SkillActivationToolsDeps | undefined,
+): SystemTool[] {
+  return [
+    defineTool(
+      'skill_activate',
+      '激活一个技能：把该技能的完整指引正文登记进当前会话（每会话最多 '
+        + `${MAX_ACTIVATED_SKILLS_PER_SESSION} 个，重复激活幂等）。激活后正文将在后续轮次的 `
+        + 'system prompt 中生效；本工具只返回确认与正文长度，不回传正文。',
+      { name: z.string().min(1).max(64).regex(SKILL_NAME_PATTERN, `name must match ${SKILL_NAME_PATTERN.source}`) },
+      (args, ctx) =>
+        guard(async () => {
+          const activation = getDeps?.()?.activation ?? sharedSkillActivationSession();
+          const sessionId = agentScopeIdOf(ctx);
+          if (sessionId === undefined) return noSessionContext();
+          const registry = required<{
+            get(id: string): Promise<{ entry: unknown; body: string } | null>;
+          }>(ctx, CONTAINER_KEYS.skillsRegistry);
+          const name = String(args['name']);
+          const found = await registry.get(name);
+          if (found === null) {
+            return fail('HARNESS-3004', `skill "${name}" not found (see skills_list for the catalog)`, {
+              id: name,
+            });
+          }
+          const outcome = activation.activate(sessionId, name);
+          if (outcome.ok) activation.cacheBody(sessionId, name, found.body);
+          if (!outcome.ok) {
+            return fail(
+              'VALIDATION',
+              `skill activation limit reached: at most ${MAX_ACTIVATED_SKILLS_PER_SESSION} skills may be active per session (already active: ${outcome.activated.join(', ')})`,
+              { activated: outcome.activated },
+            );
+          }
+          return ok({
+            name,
+            activated: outcome.activated,
+            total: outcome.activated.length,
+            contentLength: found.body.length,
+          });
+        }),
+    ),
+    defineTool(
+      'skill_list_activated',
+      '列出当前会话已激活的技能清单（激活登记见 skill_activate；不含正文）。',
+      {},
+      (_args, ctx) =>
+        guard(async () => {
+          void _args;
+          const activation = getDeps?.()?.activation ?? sharedSkillActivationSession();
+          const sessionId = agentScopeIdOf(ctx);
+          if (sessionId === undefined) return noSessionContext();
+          const names = activation.list(sessionId);
+          return ok({ names, total: names.length });
         }),
     ),
   ];

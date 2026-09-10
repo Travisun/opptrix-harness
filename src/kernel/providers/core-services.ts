@@ -59,7 +59,7 @@ import { registerMcpRoutes } from '../../api/mcp.js';
 import { registerNotificationRoutes } from '../../api/notifications.js';
 import { createChannelConfigStore } from '../notification/channel-configs.js';
 import { runAgentLoop, type AgentLoopToolRuntime } from '../agents/runner.js';
-import { AgentSessionManager } from '../agents/session.js';
+import { AgentSessionManager, type AgentSessionManagerDeps } from '../agents/session.js';
 import { AgentSessionStore } from '../agents/session-store.js';
 import { SUBAGENT_MANAGER_CONTAINER_KEYS } from '../mcp/system-tools.js';
 import { SubagentManager } from '../agents/manager.js';
@@ -885,8 +885,18 @@ export function createCoreServices(kernel: Kernel): CoreServices {
   kernel.container.instance(CONTAINER_KEYS.workspace, workspaceService);
   const agentSessionManager = new AgentSessionManager({
     store: agentSessionStore,
+    // 技能两层注入：目录 + 已激活正文（skills_registry 懒解析；缺容器 = 空段）
+    skillsRegistry: () => {
+      if (!kernel.container.has(CONTAINER_KEYS.skillsRegistry)) return undefined;
+      // 真实 SkillRegistry 天然满足 AgentSessionManager 的最小结构视图
+      return kernel.container.resolve('skills.registry') as NonNullable<
+        ReturnType<NonNullable<AgentSessionManagerDeps['skillsRegistry']>>
+      >;
+    },
     gateway: {
-      chat: (input) => gateway.chat({ ...(input as LlmChatInput), stream: false }) as Promise<LlmChatResult>,
+      // stream 透传：会话循环按 onDelta 是否传入选择流式（AsyncGenerator）/非流式
+      // （Promise 结果）——两者都是 LlmGateway.chat 的原生返回形状
+      chat: (input) => gateway.chat(input as LlmChatInput),
       getProviders: () => gateway.getProviders(),
     },
     settings,

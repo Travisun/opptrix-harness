@@ -12,6 +12,11 @@
  * - GET    /api/v1/agents/sessions/:id/messages   消息列表（?before=<消息id游标>&limit=，升序）
  * - POST   /api/v1/agents/sessions/:id/messages   发送用户消息 {content} → 驱动 LLM 回复
  *          （SSE topic `agent:{id}` 实时推送 message.created）→ 200 最终 assistant 消息
+ * - POST   /api/v1/agents/sessions/:id/messages/stream  发送用户消息（流式 SSE）{content}
+ *          → reply.hijack 裸写 text/event-stream：逐事件 `data: {ChatProgressEvent JSON}\n\n`
+ *          （thinking/reply/tool_start/tool_done/done；异常写 error 后 end）。
+ *          客户端断开联动 manager.cancelGeneration 取消生成。鉴权/校验先行（401/403/404/400
+ *          仍为 JSON 形状），hijack 后的错误以 error 事件下发。
  * - POST   /api/v1/agents/sessions/:id/cancel     取消进行中的生成 → 202 { ok, cancelled }
  *
  * 会话工作区（每根会话一个目录；子会话经 parent 链继承，全部先 assertAccess）：
@@ -38,6 +43,7 @@ import { z } from 'zod';
 
 import { extractToken } from '../kernel/auth/authProxy.js';
 import type { AgentSessionManager } from '../kernel/agents/session.js';
+import type { ChatProgressEvent } from '../kernel/agents/chat-progress.js';
 import { AGENT_SESSION_STATUSES } from '../kernel/agents/session-store.js';
 import { err, HarnessError } from '../kernel/errors/index.js';
 import { MAX_FILE_BYTES, type WorkspaceService } from '../kernel/workspace/index.js';
@@ -317,6 +323,68 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRoutesDeps)
       throw err('VALIDATION_FAILED', { detail: parsed.error.issues });
     }
     return deps.sessionManager.sendMessage(id, parsed.data.content);
+  });
+
+  // POST /api/v1/agents/sessions/:id/messages/stream — 流式发送（SSE 逐事件下发 Chat 进度）。
+  // 鉴权/校验先行（仍走 JSON 错误形状）；此后 reply.hijack 接管，进度逐帧
+  // `data: {JSON}\n\n` 写出，异常（取消/网关失败等）写 error 事件后收尾。
+  // 断开联动：响应流 close → cancelGeneration（AbortController.abort 的既有语义）；
+  // 正常结束时 close 亦触发，但生成已完成、cancel 为幂等 no-op。
+  app.post('/api/v1/agents/sessions/:id/messages/stream', bodyRouteOptions, async (request, reply) => {
+    const identity = await requireAuth(request);
+    const { id } = request.params as { id: string };
+    await deps.sessionManager.assertAccess(id, identity);
+    const parsed = sendMessageBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      throw err('VALIDATION_FAILED', { detail: parsed.error.issues });
+    }
+
+    reply.hijack();
+    const raw = reply.raw;
+    raw.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      'x-accel-buffering': 'no',
+    });
+    const writeFrame = (event: ChatProgressEvent): void => {
+      if (raw.writable && !raw.destroyed) raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+    // 客户端断开联动：挂在 reply.raw（ServerResponse）'close' 上——request.raw 的 'close'
+    // 在现代 Node 于请求体接收完成时即触发（会误杀刚起步的生成），响应流的 close 才对齐
+    // 「连接终止/响应收尾」。正常结束时 close 亦触发，但生成已完成，cancel 为幂等 no-op
+    // （复用 manager.cancelGeneration → AbortController.abort 的既有语义）。
+    const onClose = (): void => {
+      deps.sessionManager.cancelGeneration(id);
+    };
+    raw.on('close', onClose);
+
+    const finish = (): void => {
+      raw.off('close', onClose);
+      if (raw.writableEnded) return;
+      if (raw.writable && !raw.destroyed) {
+        raw.end();
+        return;
+      }
+      // 响应已不可写（客户端先一步断开）：显式销毁底层连接，避免半开连接
+      // 令 server.close()/优雅关停无限等待
+      raw.socket?.destroy();
+    };
+    try {
+      await deps.sessionManager.sendMessage(id, parsed.data.content, writeFrame);
+      finish();
+    } catch (e) {
+      // 已 hijack：无法改状态码 → error 事件收尾（客户端已断开时写入为 no-op）
+      writeFrame({
+        type: 'error',
+        message:
+          e instanceof HarnessError
+            ? e.message
+            : e instanceof Error && e.name === 'AbortError'
+              ? 'generation was cancelled'
+              : 'internal error',
+      });
+      finish();
+    }
   });
 
   // POST /api/v1/agents/sessions/:id/cancel — 取消进行中的生成（幂等；202 Accepted；他人 → 403）

@@ -7,7 +7,6 @@ import {
   ChevronDownIcon,
   EllipsisVerticalIcon,
   FileTextIcon,
-  Loader2Icon,
   MessageSquarePlusIcon,
   NetworkIcon,
   PaperclipIcon,
@@ -28,9 +27,25 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
+import { toast } from '@/components/ui/toast';
 import { api, getToken, workspaceApi } from '@/lib/api';
 import { connectSse, type SseEventData } from '@/lib/sse';
 import { cn } from '@/lib/utils';
+import {
+  applyChatStreamEvent,
+  createInitialChatStreamSnapshot,
+  createStreamGen,
+  formatTokenCount,
+  isAbortError,
+  streamSessionMessage,
+  usageTotalTokens,
+  type ChatStreamEvent,
+  type ChatStreamFinalMessage,
+  type ChatStreamSnapshot,
+} from '@/pages/AgentChat/chatStream';
+import { previewKindOfName, workspaceFileRefFromUrl } from '@/pages/AgentChat/filePreview';
+import MarkdownMessage from '@/pages/AgentChat/MarkdownMessage';
+import { ReasoningTimeline, ThinkingPanel } from '@/pages/AgentChat/ThinkingPanel';
 import { WorkspacePanel } from '@/pages/AgentChat/WorkspacePanel';
 import { formatBytes } from '@/pages/_shared';
 
@@ -47,7 +62,14 @@ import { formatBytes } from '@/pages/_shared';
  * - 工作区文件面板（WorkspacePanel）：右侧 320px 抽屉——文件树懒加载 / 上传（≤8MB）/
  *   预览（文本/图片/HTML iframe + ?token=）/ 下载 / 删除；
  * - REST：/api/v1/agents/sessions*（创建/列表/消息/发送；子会话创建带 parent_id）；
- *   SSE 订阅 `agent:{sessionId}` 实时追加（message.created），replay-gap 时整列表对账；
+ *   发送优先走流式端点 POST /agents/sessions/:id/messages/stream（fetch + getReader 消费 SSE：
+ *   thinking 思考分段 / tool_start|tool_done 工具步骤 / reply 累计草稿 / done 终态 → ThinkingPanel
+ *   实时渲染；streamGen 代数防串台；发送按钮变 Stop，abort 断开即服务端取消）；流式 404/网络
+ *   错误降级回退旧 POST messages；SSE 订阅 `agent:{sessionId}` 实时追加（message.created），
+ *   replay-gap 时整列表对账；
+ * - 助手消息渲染：MarkdownMessage（react-markdown + remark-gfm，无 raw HTML，sanitize 白名单）；
+ *   reasoningSegments → 「查看思考过程（N 段）」折叠时间线（ReasoningTimeline）；usage → 气泡旁
+ *   「≈ 1.2k tokens」标签；工作区文件引用 → 文件 chip + 预览（复用 WorkspacePanel 三态预览分类）；
  * - report_create 预览：新契约直开结果 url（workspace file 端点 + ?token=），
  *   旧契约（{ok,reportId} → /ext/html-report 预览路由）保留兜底；
  * - 新建对话自动标题：首条 user 消息前 30 字符（PATCH title）；
@@ -78,8 +100,10 @@ interface AgentMessage {
   session_id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
-  toolCalls?: Array<{ id: string; name: string; arguments: string }>;
+  toolCalls?: Array<{ id: string; name: string; label?: string; arguments: string }>;
   usage?: { inputTokens: number; outputTokens: number };
+  /** 思考分段（流式 done 回填 / REST 读取；assistant 消息专有，非空即渲染「查看思考过程」折叠条） */
+  reasoningSegments?: string[];
   created_at: number;
 }
 
@@ -94,6 +118,9 @@ const NEW_SESSION_TITLE = '新对话';
 
 /** 自动标题截取长度（首条 user 消息前 30 字符） */
 const AUTO_TITLE_MAX_CHARS = 30;
+
+/** 工作区文件 chip 文本预览截断长度（防超大日志撑爆 Dialog；与 WorkspacePanel 同款） */
+const WS_FILE_TEXT_PREVIEW_MAX_CHARS = 200_000;
 
 // ---------------------------------------------------------------------------
 // 会话树（按 parent_id 组树；子会话缩进 + 徽标；父会话可展开/收起）
@@ -146,6 +173,24 @@ function formatToolArgs(argsJson: string): string {
   } catch {
     return argsJson;
   }
+}
+
+/** 流式 done 的最终消息 → AgentMessage（正式入列消息流；补齐会话 id / 角色 / 时间戳缺省） */
+function toAgentMessage(final: ChatStreamFinalMessage, sessionId: string): AgentMessage {
+  const usage =
+    final.usage !== undefined && (final.usage.inputTokens !== undefined || final.usage.outputTokens !== undefined)
+      ? { inputTokens: final.usage.inputTokens ?? 0, outputTokens: final.usage.outputTokens ?? 0 }
+      : undefined;
+  return {
+    id: final.id,
+    session_id: final.session_id ?? sessionId,
+    role: 'assistant',
+    content: final.content,
+    toolCalls: final.toolCalls ?? [],
+    usage,
+    reasoningSegments: final.reasoningSegments,
+    created_at: final.created_at ?? Date.now(),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +394,7 @@ function renderToolResultNode(
   return null;
 }
 
-/** 单条消息气泡：user 右对齐 / assistant 左对齐（tool_calls 折叠 + 工具结果增强 + 报告预览入口）/ system 居中小字 */
+/** 单条消息气泡：user 右对齐 / assistant 左对齐（Markdown 渲染 + 思考过程折叠 + tool_calls 折叠 + 工具结果增强 + 报告预览入口）/ system 居中小字 */
 function MessageBubble({
   message,
   sessionId,
@@ -358,6 +403,7 @@ function MessageBubble({
   onPreviewReport,
   onPreviewFrame,
   onPreviewImage,
+  onPreviewFile,
 }: {
   message: AgentMessage;
   /** 活动会话 id（截图缩略图等 workspace file 端点直链需要；null = 未落库新对话） */
@@ -369,6 +415,8 @@ function MessageBubble({
   onPreviewReport?: (reportId: string) => void;
   onPreviewFrame: (url: string, title: string) => void;
   onPreviewImage: (url: string, title: string) => void;
+  /** 工作区文件 chip 预览入口（MarkdownMessage 内的文件引用点击） */
+  onPreviewFile?: (url: string, name: string) => void;
 }): React.ReactNode {
   if (message.role === 'system') {
     return (
@@ -381,6 +429,7 @@ function MessageBubble({
   }
   const isUser = message.role === 'user';
   const toolCalls = message.toolCalls ?? [];
+  const reasoningSegments = isUser ? [] : (message.reasoningSegments ?? []);
   // 受管工具调用的增强结果（按调用顺序配对 payload；无匹配则不渲染，走通用折叠兜底）
   const specialResults: React.ReactNode[] = [];
   if (!isUser && sessionId !== null) {
@@ -393,7 +442,7 @@ function MessageBubble({
     }
   }
   return (
-    <div className={cn('flex w-full', isUser ? 'justify-end' : 'justify-start')}>
+    <div className={cn('flex w-full items-end gap-1.5', isUser ? 'justify-end' : 'justify-start')}>
       <div
         className={cn(
           'max-w-[78%] rounded-lg px-3.5 py-2 text-sm shadow-sm',
@@ -401,17 +450,22 @@ function MessageBubble({
         )}
         data-role={message.role}
       >
-        {message.content !== '' && <div className="whitespace-pre-wrap break-words">{message.content}</div>}
+        {isUser ? (
+          message.content !== '' && <div className="whitespace-pre-wrap break-words">{message.content}</div>
+        ) : (
+          message.content !== '' && <MarkdownMessage content={message.content} onPreviewFile={onPreviewFile} />
+        )}
+        {!isUser && reasoningSegments.length > 0 && <ReasoningTimeline segments={reasoningSegments} />}
         {toolCalls.length > 0 && (
-          <details className={cn('mt-1.5', message.content !== '' && 'border-t pt-1.5')}>
+          <details className={cn('mt-1.5', (message.content !== '' || reasoningSegments.length > 0) && 'border-t pt-1.5')}>
             <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs opacity-80 select-none">
               <WrenchIcon className="size-3.5" aria-hidden />
               调用了 {toolCalls.length} 个工具
             </summary>
             <div className="mt-1.5 space-y-1.5">
               {toolCalls.map((tc) => (
-                <div key={tc.id} className="rounded bg-background/70 p-2 text-xs">
-                  <div className="font-medium">{tc.name}</div>
+                <div key={tc.id} className="bg-background/70 rounded p-2 text-xs">
+                  <div className="font-medium">{tc.label ?? tc.name}</div>
                   <pre className="text-muted-foreground mt-1 overflow-x-auto whitespace-pre-wrap">
                     {formatToolArgs(tc.arguments)}
                   </pre>
@@ -424,11 +478,6 @@ function MessageBubble({
         {specialResults.length > 0 && (
           <div className="mt-1.5 space-y-1.5 border-t pt-1.5" data-slot="tool-results">
             {specialResults}
-          </div>
-        )}
-        {message.usage !== undefined && (
-          <div className="text-muted-foreground mt-1 text-[11px] opacity-70">
-            tokens {message.usage.inputTokens} → {message.usage.outputTokens}
           </div>
         )}
         {/* 旧契约兜底：report_create {ok,reportId} 结果 → /ext/html-report 预览路由入口 */}
@@ -450,6 +499,16 @@ function MessageBubble({
           </div>
         )}
       </div>
+      {/* 气泡旁 token 标签（约 1.2k 格式；悬停见 input→output 明细） */}
+      {message.usage !== undefined && (
+        <span
+          className="text-muted-foreground shrink-0 pb-0.5 text-[10px] whitespace-nowrap"
+          data-slot="usage-tag"
+          title={`tokens ${message.usage.inputTokens} → ${message.usage.outputTokens}`}
+        >
+          ≈ {formatTokenCount(usageTotalTokens(message.usage))} tokens
+        </span>
+      )}
     </div>
   );
 }
@@ -471,11 +530,19 @@ export default function AgentChatPage(): React.ReactNode {
   const [framePreview, setFramePreview] = useState<{ title: string; url: string } | null>(null);
   /** 图片放大预览（截图缩略图点击） */
   const [imagePreview, setImagePreview] = useState<{ title: string; url: string } | null>(null);
+  /** 流式生成过程（思考分段/工具步骤/回复草稿；null = 无进行中的流式，ThinkingPanel 挂载条件） */
+  const [stream, setStream] = useState<ChatStreamSnapshot | null>(null);
+  /** 工作区文件文本预览（MarkdownMessage 文件 chip 的 text 类文件；content null = 正在读取） */
+  const [textPreview, setTextPreview] = useState<{ title: string; content: string | null } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   /** 活动会话 id 的 ref（SSE 回调与 send 闭包读取现值，避免陈旧闭包） */
   const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeId;
+  /** 流式代数守卫：发送/会话切换推进代数，旧代事件按过期丢弃（防串台） */
+  const streamGenRef = useRef(createStreamGen());
+  /** 进行中流式请求的 AbortController（Stop → abort → 断开即服务端取消） */
+  const abortRef = useRef<AbortController | null>(null);
 
   const activeSession = sessions.find((s) => s.id === activeId) ?? null;
   /** 子会话面包屑的父会话（parent_id 未落地/根会话/父已删 → null，不渲染面包屑） */
@@ -571,14 +638,16 @@ export default function AgentChatPage(): React.ReactNode {
     return () => stream.close();
   }, [activeId, reloadMessages]);
 
-  // 消息变化后滚动到底部
+  // 消息/流式过程变化后滚动到底部（ThinkingPanel 增高也跟随）
   useEffect(() => {
     const el = scrollRef.current;
     if (el !== null) el.scrollTop = el.scrollHeight;
-  }, [messages, sending]);
+  }, [messages, sending, stream]);
 
-  /** 打开既有会话（清空消息 → REST 拉取） */
+  /** 打开既有会话（清空消息 → REST 拉取；使旧会话在途流式事件过期，防串台） */
   const openSession = (id: string): void => {
+    streamGenRef.current.invalidate();
+    setStream(null);
     setActiveId(id);
     setMessages([]);
     void reloadMessages(id);
@@ -586,6 +655,8 @@ export default function AgentChatPage(): React.ReactNode {
 
   /** 新建对话：惰性创建——清空活动会话，首条消息发送时才落会话（自动标题随之生效；根会话无 parentId） */
   const startNewConversation = (): void => {
+    streamGenRef.current.invalidate();
+    setStream(null);
     setActiveId(null);
     setMessages([]);
   };
@@ -609,11 +680,60 @@ export default function AgentChatPage(): React.ReactNode {
     }
   };
 
-  /** 发送当前输入（无活动会话时先创建根会话；首个「新对话」以消息前 30 字符自动改名） */
+  /**
+   * 工作区文件 chip 预览（复用 WorkspacePanel 的三态预览分类 filePreview.ts）：
+   * image → 图片放大 Dialog 直链；html/未知二进制 → iframe Dialog 直链；text → 拉取文本 <pre> Dialog。
+   */
+  const openWorkspaceFilePreview = (url: string, name: string): void => {
+    const ref = workspaceFileRefFromUrl(url);
+    if (ref === null) {
+      setFramePreview({ title: name, url });
+      return;
+    }
+    const kind = previewKindOfName(ref.name);
+    if (kind === 'image') {
+      setImagePreview({ title: ref.path, url });
+      return;
+    }
+    if (kind !== 'text') {
+      setFramePreview({ title: ref.name, url });
+      return;
+    }
+    setTextPreview({ title: ref.path, content: null });
+    workspaceApi
+      .read(ref.sessionId, ref.path)
+      .then((text) =>
+        setTextPreview({
+          title: ref.path,
+          content: text.length > WS_FILE_TEXT_PREVIEW_MAX_CHARS
+            ? `${text.slice(0, WS_FILE_TEXT_PREVIEW_MAX_CHARS)}\n…（已截断）`
+            : text,
+        }),
+      )
+      .catch(() => {
+        setTextPreview(null);
+        toast.error('读取失败', ref.path);
+      });
+  };
+
+  /**
+   * 发送当前输入（流式优先 + 非流式降级）：
+   * 1. 无活动会话先创建根会话；首个「新对话」以消息前 30 字符自动改名；
+   * 2. 优先走流式端点 streamSessionMessage：过程事件（思考分段/工具步骤/回复草稿）经纯函数
+   *    reducer 折叠进 stream 状态（ThinkingPanel 展示），done 的 message 正式入列 + 刷新会话列表；
+   * 3. 降级：流式请求失败（404 端点未部署 / 网络错误，且未见任何流式事件）→ 回退旧 POST
+   *    messages；流中途断线（已收到事件）→ 不重发（避免重复生成），REST 整列表对账补齐；
+   * 4. Stop（abort）→ 断开即服务端取消：不降级重发，恢复输入便于改写。
+   */
   const send = async (): Promise<void> => {
     const text = input.trim();
     if (text === '' || sending) return;
     setSending(true);
+    setInput('');
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const gen = streamGenRef.current.begin();
+    setStream(createInitialChatStreamSnapshot());
     try {
       let sessionId = activeIdRef.current;
       if (sessionId === null) {
@@ -636,18 +756,60 @@ export default function AgentChatPage(): React.ReactNode {
           /* 自动标题失败不阻断发送 */
         }
       }
-      // SSE message.created 会先追加 user 消息；此处等最终 assistant 回复（幂等去重）
-      const assistant = await api.post<AgentMessage>(`/api/v1/agents/sessions/${sessionId}/messages`, {
-        content: text,
-      });
-      setMessages((prev) => (prev.some((m) => m.id === assistant.id) ? prev : [...prev, assistant]));
-      setInput('');
-      void refreshSessions();
+      const activeSessionId: string = sessionId;
+      let sawEvent = false;
+      const onEvent = (event: ChatStreamEvent): void => {
+        if (!streamGenRef.current.isCurrent(gen)) return; // 代数防串台：过期事件丢弃
+        sawEvent = true;
+        if (event.type === 'done') {
+          const final = toAgentMessage(event.message, activeSessionId);
+          setMessages((prev) => (prev.some((m) => m.id === final.id) ? prev : [...prev, final]));
+        }
+        setStream((prev) => applyChatStreamEvent(prev ?? createInitialChatStreamSnapshot(), event));
+      };
+      try {
+        await streamSessionMessage({
+          token: getToken(),
+          sessionId: activeSessionId,
+          content: text,
+          signal: controller.signal,
+          onEvent,
+        });
+        void refreshSessions();
+      } catch (streamErr) {
+        if (isAbortError(streamErr)) {
+          setInput(text); // 用户 Stop：断开即服务端取消，恢复输入便于改写重发
+        } else if (!sawEvent) {
+          try {
+            // 降级回退：端点未部署（404）/ 网络错误 → 旧非流式 POST messages（错误由 api 层 toast）
+            const assistant = await api.post<AgentMessage>(
+              `/api/v1/agents/sessions/${activeSessionId}/messages`,
+              { content: text },
+            );
+            setMessages((prev) => (prev.some((m) => m.id === assistant.id) ? prev : [...prev, assistant]));
+            void refreshSessions();
+          } catch {
+            setInput(text); // 降级也失败：恢复输入便于修改重发
+          }
+        } else {
+          // 流中途断线：已部分消费 → 不重发（避免重复生成），REST 整列表对账补齐
+          setInput(text);
+          await reloadMessages(activeSessionId);
+        }
+      }
     } catch {
-      /* 错误已由 api 层统一 toast；输入保留便于修改重发 */
+      setInput(text); // 会话创建等前置失败：恢复输入（错误已由 api 层统一 toast）
     } finally {
+      if (streamGenRef.current.isCurrent(gen)) setStream(null);
+      abortRef.current = null;
       setSending(false);
     }
+  };
+
+  /** 停止生成：流式在途 → abort()（断开即服务端取消）；降级 POST 在途 → cancel 端点兜底收束 */
+  const stop = (): void => {
+    abortRef.current?.abort();
+    void cancel();
   };
 
   /** 取消进行中的生成（composer 的停止按钮） */
@@ -880,15 +1042,12 @@ export default function AgentChatPage(): React.ReactNode {
                 onPreviewReport={(reportId) => setFramePreview({ title: '报告预览', url: previewUrl(reportId) })}
                 onPreviewFrame={(url, title) => setFramePreview({ title, url })}
                 onPreviewImage={(url, title) => setImagePreview({ title, url })}
+                onPreviewFile={openWorkspaceFilePreview}
               />
             ))
           )}
-          {sending && (
-            <div className="text-muted-foreground flex items-center gap-2 text-xs">
-              <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
-              助手正在思考…
-            </div>
-          )}
+          {/* 流式过程面板（思考分段 + 工具步骤 + 回复草稿预览；done/error 后由 send 清理） */}
+          {stream !== null && <ThinkingPanel snapshot={stream} />}
         </div>
 
         {/* Composer */}
@@ -944,7 +1103,13 @@ export default function AgentChatPage(): React.ReactNode {
               className="max-h-40 resize-none"
             />
             {sending ? (
-              <Button size="icon" variant="outline" aria-label="停止生成" onClick={() => void cancel()}>
+              <Button
+                size="icon"
+                variant="outline"
+                aria-label="停止生成"
+                title="停止生成（Stop）"
+                onClick={stop}
+              >
                 <SquareIcon aria-hidden />
               </Button>
             ) : (
@@ -987,7 +1152,7 @@ export default function AgentChatPage(): React.ReactNode {
         </DialogContent>
       </Dialog>
 
-      {/* ---- 图片放大预览（截图缩略图点击）---- */}
+      {/* ---- 图片放大预览（截图缩略图 / Markdown 文件 chip 的图片类引用）---- */}
       <Dialog open={imagePreview !== null} onOpenChange={(open) => (open ? undefined : setImagePreview(null))}>
         <DialogContent className="w-[min(760px,92vw)] p-3 sm:max-w-[min(760px,92vw)]">
           <DialogHeader className="sr-only">
@@ -1001,6 +1166,19 @@ export default function AgentChatPage(): React.ReactNode {
               className="bg-muted max-h-[75vh] w-full rounded-md object-contain"
             />
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* ---- 工作区文件文本预览（MarkdownMessage 文件 chip 的 text 类文件；与 WorkspacePanel 同款 <pre>）---- */}
+      <Dialog open={textPreview !== null} onOpenChange={(open) => (open ? undefined : setTextPreview(null))}>
+        <DialogContent className="flex max-h-[85vh] w-[min(880px,92vw)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[min(880px,92vw)]">
+          <DialogHeader className="min-w-0 border-b border-border px-4 py-3">
+            <DialogTitle className="truncate text-sm">📄 {textPreview?.title ?? '预览'}</DialogTitle>
+            <DialogDescription className="text-xs">工作区文件预览</DialogDescription>
+          </DialogHeader>
+          <pre className="text-muted-foreground max-h-[70vh] flex-1 overflow-auto p-4 font-mono text-xs leading-relaxed break-all whitespace-pre-wrap">
+            {textPreview?.content ?? '正在读取…'}
+          </pre>
         </DialogContent>
       </Dialog>
     </div>

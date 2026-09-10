@@ -26,6 +26,7 @@ import { toast } from '@/components/ui/toast';
 import { workspaceApi, type WorkspaceEntry } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { EmptyState, errText, formatBytes, formatDateTime } from '@/pages/_shared';
+import { previewKindOfName } from '@/pages/AgentChat/filePreview';
 
 /**
  * WorkspacePanel — 会话工作区文件抽屉（/chat 对话区顶栏「📁 文件」入口，右侧 320px 可收起）。
@@ -47,25 +48,13 @@ const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 /** 文本预览截断长度（防超大日志撑爆 Dialog） */
 const TEXT_PREVIEW_MAX_CHARS = 200_000;
 
-const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']);
-const HTML_EXTS = new Set(['html', 'htm']);
-const TEXT_EXTS = new Set([
-  'txt', 'md', 'markdown', 'json', 'csv', 'tsv', 'log', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
-  'css', 'scss', 'less', 'yml', 'yaml', 'xml', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'py', 'rb',
-  'go', 'rs', 'java', 'kt', 'c', 'h', 'cpp', 'hpp', 'cs', 'php', 'sql', 'toml', 'ini', 'cfg',
-  'conf', 'env', 'properties', 'graphql', 'proto', 'vue', 'svelte', 'dockerfile', 'makefile',
-]);
-
-/** 文件预览类型：image → <img> 直链；html → iframe 直链；text → 拉取文本；null = 仅下载/删除 */
+/** 文件预览类型：image → <img> 直链；html → iframe 直链；text → 拉取文本；null = 仅下载/删除
+ *（判定逻辑共享自 filePreview.previewKindOfName，MarkdownMessage 文件 chip 复用同一套分类） */
 type PreviewKind = 'image' | 'html' | 'text';
 
 function previewKind(entry: WorkspaceEntry): PreviewKind | null {
   if (entry.type !== 'file') return null;
-  const ext = (entry.name.split('.').pop() ?? '').toLowerCase();
-  if (IMAGE_EXTS.has(ext)) return 'image';
-  if (HTML_EXTS.has(ext)) return 'html';
-  // 无扩展名（Makefile/ LICENSE 等）按文本尝试；有扩展名但不在白名单 → 未知二进制
-  return entry.name.includes('.') ? (TEXT_EXTS.has(ext) ? 'text' : null) : 'text';
+  return previewKindOfName(entry.name);
 }
 
 export interface WorkspacePanelProps {

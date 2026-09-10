@@ -64,6 +64,11 @@ export interface LlmUsage {
 
 export type LlmStreamEvent =
   | { type: 'delta'; text: string }
+  /**
+   * 思考链增量（DeepSeek 等推理模型的 `reasoning_content`；openai-chat 适配器兼容
+   * camelCase `reasoningContent`）。仅推理模型/开启思考的请求产生，普通流不含此事件。
+   */
+  | { type: 'reasoning_delta'; text: string }
   | { type: 'tool_call_delta'; index: number; payload: unknown }
   | { type: 'done'; usage?: LlmUsage }
   | { type: 'error'; message: string };
@@ -71,6 +76,11 @@ export type LlmStreamEvent =
 export interface LlmChatResult {
   text: string;
   usage?: LlmUsage;
+  /**
+   * 本轮思考链全文（非流式自 `message.reasoning_content` 提取；流式路径由消费方聚合
+   * reasoning_delta 自行累积）。缺省 = 本轮无思考链。
+   */
+  reasoning?: string;
   /** provider 原始响应（透传给上层诊断用；禁止入日志） */
   raw?: unknown;
   /**
