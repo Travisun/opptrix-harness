@@ -7,6 +7,7 @@ import {
   KeyRound,
   LayoutDashboard,
   Bell,
+  MessageSquare,
   ScrollText,
   Settings,
   Users,
@@ -49,6 +50,15 @@ export const NAV_GROUPS: NavGroup[] = [
         title: '仪表盘',
         description: '系统运行状态、资源用量与关键指标的总览视图。',
         batch: 'W2',
+      },
+      {
+        // /chat 是 AppShell 外的全屏路由：侧栏此项仅作入口导航，目标页自带独立布局
+        path: '/chat',
+        label: '对话',
+        icon: MessageSquare,
+        title: 'AI 对话',
+        description: '全屏 AI 对话工作台：会话树、工作区文件与工具产物预览。',
+        batch: 'T1',
       },
     ],
   },
