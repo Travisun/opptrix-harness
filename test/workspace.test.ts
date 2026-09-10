@@ -514,7 +514,7 @@ describe('REST 所有权', () => {
       headers: authOf(TOK_USER1),
     });
     expect(own.statusCode).toBe(200);
-    expect(Array.isArray(own.json())).toBe(true);
+    expect(Array.isArray(own.json().entries)).toBe(true);
 
     const other = await app.inject({
       method: 'GET',
@@ -741,7 +741,7 @@ describe('REST 文件面', () => {
       headers: authOf(TOK_USER2),
     });
     expect(flat.statusCode).toBe(200);
-    expect((flat.json() as Array<Record<string, unknown>>).map((e) => e['name'])).toEqual(['nested']);
+    expect(((flat.json() as { entries: Array<Record<string, unknown>> }).entries).map((e) => e['name'])).toEqual(['nested']);
 
     const rec = await app.inject({
       method: 'GET',
@@ -749,7 +749,7 @@ describe('REST 文件面', () => {
       headers: authOf(TOK_USER2),
     });
     expect(rec.statusCode).toBe(200);
-    const rows = rec.json() as Array<{ path: string; type: string }>;
+    const rows = (rec.json() as { entries: Array<{ path: string; type: string }> }).entries;
     expect(rows.some((e) => e.path === 'w/nested/inner.txt')).toBe(true);
   });
 });
@@ -780,7 +780,7 @@ describe('继承语义与 spawn 贯通', () => {
       headers: authOf(TOK_USER1),
     });
     expect(list.statusCode).toBe(200);
-    expect((list.json() as Array<Record<string, unknown>>).map((e) => e['name'])).toEqual(['child.txt']);
+    expect(((list.json() as { entries: Array<Record<string, unknown>> }).entries).map((e) => e['name'])).toEqual(['child.txt']);
 
     // 孙会话读取同一文件（同根共享）
     const viaGrand = await app.inject({

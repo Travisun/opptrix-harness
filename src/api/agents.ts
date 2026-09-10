@@ -411,7 +411,10 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRoutesDeps)
     if (!parsed.success) {
       throw err('VALIDATION_FAILED', { detail: parsed.error.issues });
     }
-    return deps.workspace.list(id, parsed.data.path, parsed.data.recursive);
+    // 响应形状 { entries }：与前端 workspaceApi.list 的 WorkspaceListResult 契约一致，
+    // 且为后续分页/total 扩展留位（UI 面板按 data.entries 消费）
+    const entries = await deps.workspace.list(id, parsed.data.path, parsed.data.recursive);
+    return { entries };
   });
 
   // GET /api/v1/agents/sessions/:id/workspace/file?path= — 原始字节（UI iframe 预览用）
