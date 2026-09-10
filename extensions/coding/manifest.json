@@ -1,0 +1,9 @@
+{
+  "id": "coding",
+  "api": 1,
+  "version": "1.0.0",
+  "main": "index.js",
+  "builtin": true,
+  "permissions": ["http", "sandbox"],
+  "displayName": "代码执行"
+}
