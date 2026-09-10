@@ -340,15 +340,27 @@ export class BrowserEngine {
     return true;
   }
 
-  /** 截图落数据目录 → { path, file, url }（url 即扩展路由 GET /ext/browser/screenshots/:file） */
-  async screenshot(input: { fullPage?: boolean }): Promise<BrowserScreenshotResult> {
+  /**
+   * 截图落盘 → { path, file, url }。
+   * - 缺省（无 targetDir）：落 `<screenshotsDir>/<uuid>.png`（引擎自持数据目录），
+   *   path 为绝对路径，url 即扩展路由 GET /ext/browser/screenshots/:file（向后兼容）；
+   * - targetDir 覆写（MCP-First 工作区链路）：调用方（工具层）传入对话工作区的
+   *   screenshots/ 绝对路径，目录不存在即建；此时 path 改为**工作区相对路径**
+   *   `screenshots/<uuid>.png`，url 为空串（由工具层按 REST 预览端点拼装——引擎不做 URL 策略）。
+   */
+  async screenshot(input: { fullPage?: boolean; targetDir?: string }): Promise<BrowserScreenshotResult> {
     const file = `${randomUUID()}.png`;
-    const path = join(this.#screenshotsDir, file);
+    const targetDir =
+      typeof input.targetDir === 'string' && input.targetDir.trim() !== '' ? input.targetDir.trim() : undefined;
+    const absPath = join(targetDir ?? this.#screenshotsDir, file);
     await this.#enqueue(async (page) => {
-      mkdirSync(this.#screenshotsDir, { recursive: true });
-      await page.screenshot({ fullPage: input.fullPage === true, path, type: 'png' });
+      mkdirSync(dirname(absPath), { recursive: true });
+      await page.screenshot({ fullPage: input.fullPage === true, path: absPath, type: 'png' });
     });
-    return { path, file, url: `/ext/browser/screenshots/${file}` };
+    if (targetDir !== undefined) {
+      return { path: `screenshots/${file}`, file, url: '' };
+    }
+    return { path: absPath, file, url: `/ext/browser/screenshots/${file}` };
   }
 
   /** 读取截图文件（base64；uuid 形状校验防穿越）——扩展壳 screenshots 路由的取数通道 */

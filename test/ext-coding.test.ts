@@ -17,7 +17,7 @@
  *   extensions/coding 壳路由（vm 沙箱桩法，与 ext-samples 同款）
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -381,6 +381,45 @@ describe('CodingEngine 执行面', () => {
     expect(status.exitCode).toBe(0);
     expect(status.stdout).toContain('?? hello.txt');
   }, 20_000);
+
+  it('rootPath 覆写：物理目录换成工作区路径（HOME 钉覆写目录、internal 目录在工作区根下；缺省仍落 coding-workspaces）', async () => {
+    if (!hasNode) return; // skipIf 降级
+    const engine = makeEngine();
+    const wsRoot = join(dataDir, 'ws-root');
+    mkdirSync(wsRoot, { recursive: true });
+
+    // 会话产物写进覆写目录；HOME 钉在覆写目录（环境语义随物理目录走）
+    const r = await engine.runInSession('ovr', {
+      cmd: 'node',
+      args: ['-e', 'require("node:fs").writeFileSync("from-exec.txt", process.env.HOME ?? "")'],
+      rootPath: wsRoot,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(join(wsRoot, 'from-exec.txt'), 'utf8')).toBe(wsRoot);
+
+    // fs 面同一覆写坐标：coding_fs_* 读写的即工作区
+    engine.fsWrite('ovr', 'notes/a.txt', 'hello', wsRoot);
+    expect(readFileSync(join(wsRoot, 'notes', 'a.txt'), 'utf8')).toBe('hello');
+    expect(engine.fsRead('ovr', 'notes/a.txt', wsRoot).content).toBe('hello');
+    expect(engine.fsList('ovr', undefined, wsRoot).map((e) => e.name)).toEqual(
+      expect.arrayContaining(['from-exec.txt', 'notes']),
+    );
+    // internal 目录（.coding）落在工作区根下且对 fsList 不可见
+    expect(existsSync(join(wsRoot, '.coding'))).toBe(true);
+    expect(engine.fsList('ovr', undefined, wsRoot).map((e) => e.name)).not.toContain('.coding');
+
+    // 形状非法的 rootPath 拒绝（相对路径）
+    await expect(codeOfAsync(engine.runInSession('ovr', { cmd: 'echo', rootPath: 'relative/path' }))).resolves.toBe(
+      'HARNESS-1008',
+    );
+
+    // 无 rootPath：会话语义不变，仍落默认 coding-workspaces（mutex 仍按 sessionId）
+    const def = engine.ensureSession('ovr');
+    expect(def.dir).toBe(join(dataDir, 'coding-workspaces', 'ovr'));
+    await expect(engine.runInSession('ovr', { cmd: 'echo', args: ['default-root'], rootPath: undefined })).resolves.toMatchObject(
+      { exitCode: 0 },
+    );
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -511,6 +550,79 @@ describe('coding 桥与工具面', () => {
     const emptyCtx = { kernel: { container: { has: () => false } } } as never;
     const missing = await tools.find((t) => t.name === 'coding_exec')?.execute({ cmd: 'ls' }, emptyCtx);
     expect(missing).toMatchObject({ ok: false, error: { code: 'HARNESS-9001' } });
+  }, 20_000);
+
+  it('createCodingTools：ctx.agentId + 工作区解析成功 → 会话物理目录覆写为对话工作区（真实子进程落盘验证）', async () => {
+    if (!hasNode) return; // skipIf 降级
+    const tools = createCodingTools();
+    const engine = makeEngine();
+    const wsRoot = join(dataDir, 'ws-tool-face');
+    mkdirSync(wsRoot, { recursive: true });
+    const ctx = {
+      kernel: {
+        container: {
+          has: (k: string) => k === 'coding.engine' || k === 'workspace.service',
+          resolve: (k: string) =>
+            k === 'coding.engine'
+              ? engine
+              : {
+                  resolve: async (scopeId: string) => ({
+                    rootSessionId: `root-${scopeId}`,
+                    userId: null,
+                    path: wsRoot,
+                  }),
+                },
+        },
+      },
+      agentId: 'sess-coding-1',
+    } as never;
+
+    // coding_exec 的会话产物直接落对话工作区
+    const exec = await tools.find((t) => t.name === 'coding_exec')?.execute(
+      { cmd: 'node', args: ['-e', 'require("node:fs").writeFileSync("tool-face.txt", "from-workspace")'] },
+      ctx,
+    );
+    expect(exec).toMatchObject({ ok: true, exitCode: 0 });
+    expect(readFileSync(join(wsRoot, 'tool-face.txt'), 'utf8')).toBe('from-workspace');
+
+    // coding_fs_list 列的就是工作区（与 workspace_* 同一物理目录）
+    const list = (await tools.find((t) => t.name === 'coding_fs_list')?.execute({}, ctx)) as {
+      ok: boolean;
+      entries: Array<{ name: string }>;
+    };
+    expect(list.ok).toBe(true);
+    expect(list.entries.map((e) => e.name)).toContain('tool-face.txt');
+
+    // coding_fs_write / coding_fs_read 走同一工作区坐标
+    await tools.find((t) => t.name === 'coding_fs_write')?.execute({ path: 'sub/w.txt', content: 'vv' }, ctx);
+    expect(readFileSync(join(wsRoot, 'sub', 'w.txt'), 'utf8')).toBe('vv');
+    const read = await tools.find((t) => t.name === 'coding_fs_read')?.execute({ path: 'sub/w.txt' }, ctx);
+    expect(read).toMatchObject({ ok: true, content: 'vv' });
+  }, 20_000);
+
+  it('createCodingTools：ctx.agentId 存在但工作区解析失败 → 回退默认 coding-workspaces（不阻断）', async () => {
+    const tools = createCodingTools();
+    const engine = makeEngine();
+    const ctx = {
+      kernel: {
+        container: {
+          has: (k: string) => k === 'coding.engine' || k === 'workspace.service',
+          resolve: (k: string) =>
+            k === 'coding.engine'
+              ? engine
+              : {
+                  resolve: async () => {
+                    throw new Error('scope gone');
+                  },
+                },
+        },
+      },
+      agentId: 'sess-gone',
+    } as never;
+    const exec = await tools.find((t) => t.name === 'coding_exec')?.execute({ cmd: 'echo', args: ['fallback'] }, ctx);
+    expect(exec).toMatchObject({ ok: true, exitCode: 0, stdout: 'fallback\n' });
+    // 落回了默认会话目录（非工作区）
+    expect(existsSync(join(dataDir, 'coding-workspaces', 'default'))).toBe(true);
   }, 20_000);
 });
 

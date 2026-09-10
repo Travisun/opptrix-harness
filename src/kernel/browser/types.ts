@@ -101,12 +101,19 @@ export interface BrowserPressKeyInput {
   key: string;
 }
 
-/** browser_screenshot 入参 */
+/** browser_screenshot 入参（targetDir 为工作区落盘覆写，见 BrowserScreenshotResult） */
 export interface BrowserScreenshotInput {
   fullPage?: boolean;
+  /** 截图落盘目录覆写（绝对路径，通常是 <对话工作区>/screenshots；目录不存在即建） */
+  targetDir?: string;
 }
 
-/** browser_screenshot 结果（path 为数据目录内绝对路径；url 为扩展路由相对地址） */
+/**
+ * browser_screenshot 结果。两种模式：
+ * - 缺省（数据目录）：path 为绝对路径，url 为扩展路由 /ext/browser/screenshots/:file；
+ * - targetDir 覆写（对话工作区）：path 为工作区相对路径 `screenshots/<file>`，
+ *   url 为空串（由工具层按 REST 预览端点拼装，引擎不做 URL 策略）。
+ */
 export interface BrowserScreenshotResult {
   path: string;
   file: string;

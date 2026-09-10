@@ -36,6 +36,7 @@ import {
   createExtractTools,
   createHtmlReportTools,
   createSystemTools,
+  createWorkspaceTools,
   SYSTEM_TOOLS_CONTAINER_KEY,
   type SystemTool,
   type SystemToolContext,
@@ -46,11 +47,14 @@ import type { BrowserEngine } from '../browser/index.js';
 /**
  * 系统工具目录：内置目录 + fileextract 域的 files_extract（容器 'fileextract.service'
  * 懒解析——core-services 已登记该服务，裸装配缺失时工具收敛为 HARNESS-9001 结果对象）
- * + report_ 域的四个报告工具（createHtmlReportTools：容器 'ext.manager' 懒解析，桥接
- * 社区扩展 html-report）+ coding_ 域的六个代码执行工具（createCodingTools：容器
- * 'coding.engine' 懒解析，受内核白名单门约束）+ browser_ 域的八个浏览器工具
- * （createBrowserTools：容器 'browser.engine' 懒解析，Playwright 跑内核主线程）。
- * SystemToolRuntime（执行）与 buildMcpServer（SDK 注册）共用同一清单，防目录漂移。
+ * + report_ 域的四个报告工具（createHtmlReportTools：容器 'ext.manager' 懒解析桥接扩展
+ * html-report，正文经 'workspace.service' 落对话工作区）+ coding_ 域的六个代码执行工具
+ * （createCodingTools：容器 'coding.engine' 懒解析，受内核白名单门约束；会话目录按
+ * ctx.agentId 覆写为对话工作区）+ browser_ 域的八个浏览器工具（createBrowserTools：
+ * 容器 'browser.engine' 懒解析，Playwright 跑内核主线程；截图按 ctx.agentId 落对话工作区）
+ * + workspace_ 域的四个工作区工具（createWorkspaceTools：容器 'workspace.service' 懒解析，
+ * MCP-First 的对话工作区读写面）。SystemToolRuntime（执行）与 buildMcpServer（SDK 注册）
+ * 共用同一清单，防目录漂移。
  */
 function buildSystemToolCatalog(kernel: Kernel): SystemTool[] {
   return createSystemTools(
@@ -66,6 +70,7 @@ function buildSystemToolCatalog(kernel: Kernel): SystemTool[] {
         ? kernel.container.resolve<BrowserEngine>(CONTAINER_KEYS.browserEngine)
         : undefined,
     })),
+    createWorkspaceTools(),
   );
 }
 

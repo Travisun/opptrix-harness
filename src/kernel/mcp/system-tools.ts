@@ -3,7 +3,8 @@
  *
  * 把 Harness OS 的全部系统操作暴露为标准 MCP 工具（按域前缀命名：
  * skills_ / cron_ / notifications_ / extensions_ / files_ / mcp_ / plugins_ /
- * subagents_ / logs_ / update_ / system_ / report_），供两类调用方复用：
+ * subagents_ / logs_ / update_ / system_ / workspace_ / report_ / coding_ / browser_），
+ * 供两类调用方复用：
  * - 外部 LLM/系统：经 `/mcp` 端点（Streamable HTTP，见 system-server.ts）调用；
  * - 内部扩展：经 h.mcp 桥（serverId='system'，见 bridge.ts 的目录合并）调用。
  *
@@ -23,6 +24,9 @@
  * update_apply 刻意不暴露：apply 会切换 A/B slot 并触发进程重启——重启是宿主动作，
  * 交由管理员经 UI/运维链路显式触发，不开放给 LLM/扩展的自动化调用。
  */
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+
 import type { Knex } from 'knex';
 import { z } from 'zod';
 
@@ -334,20 +338,28 @@ export function createExtractTools(getDeps: () => ExtractToolsDeps | undefined):
 /**
  * CodingEngine 的结构视图（src/kernel/coding/engine.ts 的契约面；工具层只依赖此形状）。
  * 安全边界（白名单 / argv 直传 / 路径钉死 / 超时 / 截断 / BUSY）由引擎统一收口，
- * 工具层只做转发与结果归一。
+ * 工具层只做转发与结果归一。`rootPath` 为可选的物理目录覆写：ctx.agentId 可解析出
+ * 对话工作区时由工具层传入（会话产物落对话工作区），解析失败缺省（默认 coding-workspaces）。
  */
 interface CodingEngineLike {
   runInSession(
     sessionId: string,
-    input: { cmd: string; args?: string[]; cwd?: string; timeoutMs?: number; env?: Record<string, string> },
+    input: {
+      cmd: string;
+      args?: string[];
+      cwd?: string;
+      timeoutMs?: number;
+      env?: Record<string, string>;
+      rootPath?: string;
+    },
   ): Promise<Record<string, unknown>>;
   runCode(
     sessionId: string,
-    input: { language: 'node' | 'python'; code: string; timeoutMs?: number },
+    input: { language: 'node' | 'python'; code: string; timeoutMs?: number; rootPath?: string },
   ): Promise<Record<string, unknown>>;
-  fsWrite(sessionId: string, relPath: string, content: string): Promise<unknown>;
-  fsRead(sessionId: string, relPath: string): Promise<unknown>;
-  fsList(sessionId: string, relPath?: string): Promise<unknown>;
+  fsWrite(sessionId: string, relPath: string, content: string, rootPath?: string): Promise<unknown>;
+  fsRead(sessionId: string, relPath: string, rootPath?: string): Promise<unknown>;
+  fsList(sessionId: string, relPath?: string, rootPath?: string): Promise<unknown>;
   listSessions(): Promise<unknown>;
   resetSession(sessionId: string): Promise<unknown>;
   deleteSession(sessionId: string): Promise<unknown>;
@@ -363,18 +375,30 @@ function resolveCodingEngine(ctx: SystemToolContext): CodingEngineLike | undefin
 const codingSessionIdShape = z.string().min(1).max(128).optional();
 
 /**
+ * 会话上下文 → 物理目录覆写（coding_* 工具共用）：ctx.agentId 存在且能解析出
+ * 对话工作区时返回工作区路径（会话产物落对话工作区，coding_fs_* 读写的就是工作区）；
+ * 无会话上下文 / 工作区未装配 / 解析失败 → undefined（引擎回退默认 coding-workspaces）。
+ */
+async function codingRootPathOverride(ctx: SystemToolContext): Promise<{ rootPath: string } | Record<string, never>> {
+  const path = (await tryResolveWorkspace(ctx))?.path;
+  return path === undefined ? {} : { rootPath: path };
+}
+
+/**
  * 构建代码执行工具目录（coding_exec / coding_run_code / coding_fs_write /
  * coding_fs_read / coding_fs_list / coding_sessions；集成方在 buildSystemToolCatalog
  * 合并）。安全红线：不提供任意 shell——命令面受内核引擎白名单门约束（见
  * src/kernel/coding/engine.ts 模块头注释的安全基线与已知局限）。
+ * 会话目录语义：sessionId 仍为并发/mutex 键；ctx.agentId 可解析出对话工作区时物理
+ * 目录覆写为工作区路径（internal 目录在工作区根下），解析失败回退默认 coding-workspaces。
  */
 export function createCodingTools(): SystemTool[] {
   return [
     defineTool(
       'coding_exec',
       '在持久代码会话目录内执行白名单命令（node/python3/pip/npm/npx/git/curl/ls/cat/grep 等；'
-      + '非 shell：args 为 argv 数组，shell 元字符按字面量传递；输出各 256KB 截断；'
-      + '每会话并发 1 进程；超时上限 120s）。',
+        + '非 shell：args 为 argv 数组，shell 元字符按字面量传递；输出各 256KB 截断；'
+        + '每会话并发 1 进程；超时上限 120s）。有会话上下文时会话目录即当前对话工作区。',
       {
         sessionId: codingSessionIdShape,
         cmd: z.string().min(1).max(128),
@@ -402,6 +426,7 @@ export function createCodingTools(): SystemTool[] {
               ...(args['env'] !== undefined && typeof args['env'] === 'object'
                 ? { env: args['env'] as Record<string, string> }
                 : {}),
+              ...(await codingRootPathOverride(ctx)),
             },
           );
           return ok({ ...result });
@@ -410,7 +435,7 @@ export function createCodingTools(): SystemTool[] {
     defineTool(
       'coding_run_code',
       '在持久代码会话内执行一段源码（language: node|python；写入会话临时文件运行后清理；'
-      + '受同一白名单/超时/输出上限约束；stdout/stderr 返回给模型）。',
+        + '受同一白名单/超时/输出上限约束；stdout/stderr 返回给模型）。有会话上下文时会话目录即当前对话工作区。',
       {
         sessionId: codingSessionIdShape,
         language: z.enum(['node', 'python']),
@@ -432,6 +457,7 @@ export function createCodingTools(): SystemTool[] {
               language: args['language'] === 'python' ? 'python' : 'node',
               code: String(args['code']),
               ...(typeof args['timeoutMs'] === 'number' ? { timeoutMs: args['timeoutMs'] as number } : {}),
+              ...(await codingRootPathOverride(ctx)),
             },
           );
           return ok({ ...result });
@@ -439,7 +465,8 @@ export function createCodingTools(): SystemTool[] {
     ),
     defineTool(
       'coding_fs_write',
-      '向代码会话目录写文件（path 为会话内相对路径，绝对路径与 .. 穿越拒绝；content 为 UTF-8 文本，上限 2MB）。',
+      '向代码会话目录写文件（path 为会话内相对路径，绝对路径与 .. 穿越拒绝；content 为 UTF-8 文本，上限 2MB）。'
+        + '有会话上下文时读写的即当前对话工作区（与 workspace_* 同一物理目录）。',
       {
         sessionId: codingSessionIdShape,
         path: z.string().min(1).max(1024),
@@ -458,13 +485,15 @@ export function createCodingTools(): SystemTool[] {
             typeof args['sessionId'] === 'string' ? String(args['sessionId']) : 'default',
             String(args['path']),
             String(args['content'] ?? ''),
+            (await codingRootPathOverride(ctx))['rootPath'],
           );
           return ok({ ...(result as Record<string, unknown>) });
         }),
     ),
     defineTool(
       'coding_fs_read',
-      '读取代码会话目录内文件（path 会话内相对；文本返回，256KB 截断）。',
+      '读取代码会话目录内文件（path 会话内相对；文本返回，256KB 截断）。'
+        + '有会话上下文时读写的即当前对话工作区。',
       {
         sessionId: codingSessionIdShape,
         path: z.string().min(1).max(1024),
@@ -481,13 +510,15 @@ export function createCodingTools(): SystemTool[] {
           const result = await engine.fsRead(
             typeof args['sessionId'] === 'string' ? String(args['sessionId']) : 'default',
             String(args['path']),
+            (await codingRootPathOverride(ctx))['rootPath'],
           );
           return ok({ ...(result as Record<string, unknown>) });
         }),
     ),
     defineTool(
       'coding_fs_list',
-      '列出代码会话目录的一级内容（path 缺省会话根；返回 [{name,size,dir}]）。',
+      '列出代码会话目录的一级内容（path 缺省会话根；返回 [{name,size,dir}]）。'
+        + '有会话上下文时列的即当前对话工作区。',
       {
         sessionId: codingSessionIdShape,
         path: z.string().max(1024).optional(),
@@ -504,6 +535,7 @@ export function createCodingTools(): SystemTool[] {
           const result = await engine.fsList(
             typeof args['sessionId'] === 'string' ? String(args['sessionId']) : 'default',
             typeof args['path'] === 'string' ? String(args['path']) : undefined,
+            (await codingRootPathOverride(ctx))['rootPath'],
           );
           return ok({ entries: result });
         }),
@@ -534,7 +566,8 @@ export function createCodingTools(): SystemTool[] {
 /**
  * BrowserEngine 的结构视图（src/kernel/browser/engine.ts 的契约面；工具层只依赖此形状）。
  * 安全边界（URL 白名单 / 单例 mutex / 空闲回收 / 崩溃恢复 / 截图防穿越）由引擎统一收口，
- * 工具层只做转发与结果归一。
+ * 工具层只做转发与结果归一。`screenshot.targetDir` 为可选落盘目录覆写：传入对话工作区的
+ * screenshots/ 绝对路径时引擎落盘该目录并返回工作区相对 path（url 由工具层拼装 REST 预览端点）。
  */
 interface BrowserEngineLike {
   navigate(url: string): Promise<{ title: string; url: string; status: number }>;
@@ -542,7 +575,7 @@ interface BrowserEngineLike {
   click(input: { selector: string }): Promise<unknown>;
   type(input: { selector: string; text: string }): Promise<unknown>;
   pressKey(input: { key: string }): Promise<unknown>;
-  screenshot(input: { fullPage?: boolean }): Promise<{ path: string; file: string; url: string }>;
+  screenshot(input: { fullPage?: boolean; targetDir?: string }): Promise<{ path: string; file: string; url: string }>;
   close(): Promise<void>;
   status(): Promise<{ installed: boolean; running: boolean; installing: boolean; lastError: string | null }>;
 }
@@ -652,12 +685,23 @@ export function createBrowserTools(getDeps: () => BrowserToolsDeps | undefined):
     ),
     defineTool(
       'browser_screenshot',
-      '对当前页面截图（PNG 落数据目录；fullPage=true 时整页滚动截图），返回 { path, file, url }'
-      + '——url 即扩展路由 GET /ext/browser/screenshots/:file（auth:user）。',
+      '对当前页面截图（PNG；fullPage=true 时整页滚动截图），返回 { path, file, url }。'
+        + '有会话上下文时 PNG 落当前对话工作区 screenshots/（path 为工作区相对路径，'
+        + 'url 指向工作区 REST 预览端点）；无会话上下文或解析失败回退数据目录'
+        + '（url 即扩展路由 GET /ext/browser/screenshots/:file，auth:user）。',
       { fullPage: z.boolean().optional() },
-      (args) =>
-        runBrowserTool(getDeps()?.engine, async (engine) =>
-          ok({ ...(await engine.screenshot({ fullPage: args['fullPage'] === true })) })),
+      (args, ctx) =>
+        runBrowserTool(getDeps()?.engine, async (engine) => {
+          const fullPage = args['fullPage'] === true;
+          // MCP-First：截图默认进对话工作区（path 工作区相对、url 走 REST 预览端点）；
+          // 无会话上下文 / 工作区未装配 / resolve 失败 → 回退既有默认目录，不阻断
+          const ws = await tryResolveWorkspace(ctx);
+          if (ws !== undefined) {
+            const shot = await engine.screenshot({ fullPage, targetDir: join(ws.path, 'screenshots') });
+            return ok({ ...shot, url: workspaceFileUrl(ws.rootSessionId, shot.path) });
+          }
+          return ok({ ...(await engine.screenshot({ fullPage })) });
+        }),
     ),
     defineTool(
       'browser_close',
@@ -683,17 +727,219 @@ export function createBrowserTools(getDeps: () => BrowserToolsDeps | undefined):
 
 
 
+// ---------------------------------------------------------------------------
+// 对话工作区（workspace 域）—— MCP-First 的共享落盘面
+// ---------------------------------------------------------------------------
+
+/**
+ * WorkspaceService 的容器登记键（冻结契约：'workspace.service'；内核侧常量为
+ * CONTAINER_KEYS.workspace）。刻意用字面量而非 import 常量：本模块经
+ * system-server.ts 被 Kernel.ts 循环导入，模块求值期读 CONTAINER_KEYS 会撞上
+ * 未完成初始化（此处工具执行期才经 ctx.kernel.container 查询，无时序问题）。
+ * 工具层只依赖下方 `WorkspaceServiceLike` 结构视图（与内核实现解耦）。
+ */
+export const WORKSPACE_CONTAINER_KEY = 'workspace.service';
+
+/**
+ * WorkspaceService 的结构视图（src/kernel/workspace/index.ts 的冻结契约面）。
+ * - scopeId：工作区作用域 id（chat 会话 id 或子代理 id，resolve 内部归一到根会话）；
+ * - path 语义：全部为工作区内相对路径（穿越/绝对路径由服务侧拒绝）。
+ */
+export interface WorkspaceServiceLike {
+  resolve(scopeId: string): Promise<{ rootSessionId: string; userId: string | null; path: string }>;
+  write(scopeId: string, relPath: string, data: Buffer): Promise<{ path: string; size: number }>;
+  read(scopeId: string, relPath: string): Promise<Buffer>;
+  list(
+    scopeId: string,
+    relPath?: string,
+    recursive?: boolean,
+  ): Promise<Array<{ name: string; path: string; type: 'file' | 'dir'; size: number; mtime: number }>>;
+  delete(scopeId: string, relPath: string): Promise<void>;
+}
+
+/** workspace_write 的内容字节上限（8MB；zod 层为码元上限，execute 内按 UTF-8 字节精确复核） */
+export const WORKSPACE_WRITE_MAX_BYTES = 8 * 1024 * 1024;
+
+/** workspace_read 的文本预览阈值：≤256KB 直接回文本，超限收敛为提示形状（正文走 REST 文件端点） */
+export const WORKSPACE_READ_PREVIEW_MAX_BYTES = 256 * 1024;
+
+/** 超限/二进制正文统一提示（如何取全文：REST 预览端点，见 workspaceFileUrl） */
+export const WORKSPACE_READ_HINT = 'use REST file endpoint';
+
+/**
+ * 工作区文件的 REST 预览端点形状（正文不经工具目录回传全文时的取用通道）：
+ * `GET /api/v1/agents/sessions/{rootSessionId}/workspace/file?path=<relPath>`。
+ */
+export function workspaceFileUrl(rootSessionId: string, relPath: string): string {
+  return `/api/v1/agents/sessions/${rootSessionId}/workspace/file?path=${encodeURIComponent(relPath)}`;
+}
+
+/** 容器懒解析 WorkspaceService（未登记 → undefined；工具收敛为 HARNESS-9001 结果对象） */
+function resolveWorkspaceService(ctx: SystemToolContext): WorkspaceServiceLike | undefined {
+  if (!ctx.kernel.container.has(WORKSPACE_CONTAINER_KEY)) return undefined;
+  return ctx.kernel.container.resolve<WorkspaceServiceLike>(WORKSPACE_CONTAINER_KEY);
+}
+
+/** 工作区服务未登记时的统一失败形状（提示装配缺失，而非裸 TypeError） */
+function workspaceServiceMissing(): Record<string, unknown> {
+  return fail(
+    'HARNESS-9001',
+    `workspace service is not registered in this kernel assembly (expected container key "${WORKSPACE_CONTAINER_KEY}", see src/kernel/workspace)`,
+  );
+}
+
+/** 无会话上下文的统一失败形状（工作区/报告类工具必须有调用方会话 id 才有落盘位置） */
+function noSessionContext(): Record<string, unknown> {
+  return fail('HARNESS-1009', 'no session context');
+}
+
+/** agentId 归一：undefined/空串 → undefined（子代理审计随行；缺省即「无会话上下文」） */
+function agentScopeIdOf(ctx: SystemToolContext): string | undefined {
+  return typeof ctx.agentId === 'string' && ctx.agentId !== '' ? ctx.agentId : undefined;
+}
+
+/**
+ * 「解析当前对话工作区」的组合辅助（browser 截图 / coding 目录覆写共用）：
+ * ctx.agentId 缺席或服务未登记或 resolve 失败 → undefined（调用方回退既有默认行为，
+ * 不阻断工具调用——工作区是增强面而非硬依赖）。
+ */
+async function tryResolveWorkspace(
+  ctx: SystemToolContext,
+): Promise<{ service: WorkspaceServiceLike; scopeId: string; rootSessionId: string; path: string } | undefined> {
+  const scopeId = agentScopeIdOf(ctx);
+  const service = resolveWorkspaceService(ctx);
+  if (scopeId === undefined || service === undefined) return undefined;
+  try {
+    const resolved = await service.resolve(scopeId);
+    return { service, scopeId, rootSessionId: resolved.rootSessionId, path: resolved.path };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 构建工作区工具目录（workspace_write / workspace_read / workspace_list /
+ * workspace_delete；MCP-First：对话工作区是系统工具的一等落盘面）。
+ *
+ * 语义约定：
+ * - ctx.agentId 即工作区 scopeId（chat 会话 id 或子代理 id；resolve 内部归一根会话）；
+ *   缺失（外部 /mcp 直调等无会话场景）→ 收敛 `{ok:false, error:'no session context'}` 形状；
+ * - path 一律「相对当前对话工作区」（zod 描述同步声明）；穿越/绝对路径由
+ *   WorkspaceService 拒绝，工具层忠实透传其错误；
+ * - workspace_read 是**文本预览**：≤256KB 直接回 content；超限/二进制回
+ *   {truncated|binary, size, hint}（全文经 REST 预览端点取，防上下文爆炸）。
+ */
+export function createWorkspaceTools(): SystemTool[] {
+  return [
+    defineTool(
+      'workspace_write',
+      '向当前对话工作区写文件（path 相对当前对话工作区，如 "notes/a.md"；content 为 UTF-8 文本，'
+        + '上限 8MB；父目录自动创建）。会话产物、报告草稿等一切需要跨轮次/跨工具可见的文件都落这里。',
+      {
+        path: z.string().min(1).max(1024).describe('文件路径，相对当前对话工作区'),
+        content: z.string().max(WORKSPACE_WRITE_MAX_BYTES).describe('UTF-8 文本内容（≤8MB）'),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const service = resolveWorkspaceService(ctx);
+          if (service === undefined) return workspaceServiceMissing();
+          const scopeId = agentScopeIdOf(ctx);
+          if (scopeId === undefined) return noSessionContext();
+          const content = String(args['content']);
+          const bytes = Buffer.byteLength(content, 'utf8');
+          if (bytes > WORKSPACE_WRITE_MAX_BYTES) {
+            return fail('HARNESS-1005', `content exceeds ${WORKSPACE_WRITE_MAX_BYTES} bytes`, {
+              bytes,
+              maxBytes: WORKSPACE_WRITE_MAX_BYTES,
+            });
+          }
+          const written = await service.write(scopeId, String(args['path']), Buffer.from(content, 'utf8'));
+          return ok({ path: written.path, size: written.size });
+        }),
+    ),
+    defineTool(
+      'workspace_read',
+      '读取当前对话工作区内文件的文本预览（path 相对当前对话工作区）。≤256KB 直接返回 content；'
+        + '超限或二进制文件返回 {size, hint}（不回正文）——全文经 REST 文件端点取用。',
+      {
+        path: z.string().min(1).max(1024).describe('文件路径，相对当前对话工作区'),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const service = resolveWorkspaceService(ctx);
+          if (service === undefined) return workspaceServiceMissing();
+          const scopeId = agentScopeIdOf(ctx);
+          if (scopeId === undefined) return noSessionContext();
+          const relPath = String(args['path']);
+          const buf = await service.read(scopeId, relPath);
+          const size = buf.byteLength;
+          const text = buf.toString('utf8');
+          // 二进制标记：utf8 解码不可逆（round-trip 不等）即视为二进制
+          const binary = !Buffer.from(text, 'utf8').equals(buf);
+          if (binary) {
+            return ok({ path: relPath, size, binary: true, truncated: false, hint: WORKSPACE_READ_HINT });
+          }
+          if (size > WORKSPACE_READ_PREVIEW_MAX_BYTES) {
+            return ok({ path: relPath, size, binary: false, truncated: true, hint: WORKSPACE_READ_HINT });
+          }
+          return ok({ path: relPath, size, binary: false, truncated: false, content: text });
+        }),
+    ),
+    defineTool(
+      'workspace_list',
+      '列出当前对话工作区的条目（path 缺省=工作区根；recursive=true 递归全树；'
+        + '返回 [{name, path, type, size, mtime}]）。',
+      {
+        path: z.string().max(1024).optional().describe('目录路径，相对当前对话工作区（缺省根目录）'),
+        recursive: z.boolean().optional().describe('是否递归列出子目录'),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const service = resolveWorkspaceService(ctx);
+          if (service === undefined) return workspaceServiceMissing();
+          const scopeId = agentScopeIdOf(ctx);
+          if (scopeId === undefined) return noSessionContext();
+          const entries = await service.list(
+            scopeId,
+            typeof args['path'] === 'string' ? String(args['path']) : undefined,
+            args['recursive'] === true,
+          );
+          return ok({ entries });
+        }),
+    ),
+    defineTool(
+      'workspace_delete',
+      '删除当前对话工作区内文件（path 相对当前对话工作区；目标不存在时幂等成功）。',
+      {
+        path: z.string().min(1).max(1024).describe('文件路径，相对当前对话工作区'),
+      },
+      (args, ctx) =>
+        guard(async () => {
+          const service = resolveWorkspaceService(ctx);
+          if (service === undefined) return workspaceServiceMissing();
+          const scopeId = agentScopeIdOf(ctx);
+          if (scopeId === undefined) return noSessionContext();
+          await service.delete(scopeId, String(args['path']));
+          return ok({ deleted: true });
+        }),
+    ),
+  ];
+}
+
 /**
  * html-report 扩展 id（extensions/html-report；本域工具桥接的唯一目标）。
  *
- * 扩展机制 v1 无工具注册贡献点（贡献点仅 route/cron/event/hook/service/ui），
- * 因此报告工具在内核目录静态登记、执行**桥接到扩展**：读容器 extManager（扩展
- * 注册表）→ 目标扩展已启用 → bridgeFor → host.call('reports.<method>')。扩展侧
- * 逻辑（长度校验/UUID 防穿越/存储/删除）见 extensions/html-report/index.js。
+ * 报告正文与元数据的存储分工（MCP-First 重构）：
+ * - **正文一律落对话工作区**：内核工具经 WorkspaceService.write(session_id,
+ *   `reports/{uuid}.html`, html) 落盘——跨工具/跨轮次可见，经 REST 预览端点取用；
+ * - **索引元数据落扩展自有 SQLite**（extensions/html-report 的 h.expose('reports').index）：
+ *   {reportId, title, path, sessionId, size, createdAt}，扩展不再存正文（扩展沙箱无 fs）。
+ * 工具执行桥接扩展：容器 extManager（扩展注册表）→ 目标扩展已启用 → bridgeFor →
+ * host.call('reports.<method>')。扩展侧逻辑见 extensions/html-report/index.js。
  */
 export const HTML_REPORT_EXT_ID = 'html-report';
 
-/** html-report 扩展暴露的服务名（h.expose('reports', { create/list/get/delete })） */
+/** html-report 扩展暴露的服务名（h.expose('reports', { index/list/get/delete })） */
 const HTML_REPORT_SERVICE = 'reports';
 
 /** report_create 的 HTML 字节上限（2MB；扩展侧以 UTF-8 字节精确复核） */
@@ -745,22 +991,34 @@ function htmlReportCall(ctx: SystemToolContext): (method: string, args: unknown)
 }
 
 /**
- * 构建报告工具目录（html-report 域，桥接社区扩展 html-report；无外部依赖注入，
- * 全部经容器懒解析——与 builtin 工具同款装配方式，由 buildSystemToolCatalog 并表）。
+ * 构建报告工具目录（html-report 域；MCP-First 存储分工见 HTML_REPORT_EXT_ID 的 JSDoc）。
+ *
+ * 契约（对旧版的变化）：
+ * - report_create：**session_id 必填**（无会话上下文不产生报告）——正文经 WorkspaceService
+ *   落对话工作区 `reports/{uuid}.html`，扩展只登记索引；返回 {reportId, path, sessionId,
+ *   size, createdAt, url}，url 为工作区 REST 预览端点形状（正文不再回传/不再存扩展库）；
+ * - report_get：{reportId} → {title, meta, url}，**不再回 html 全文**（正文经 url 端点取）；
+ * - report_list：索引列表（session_id 缺省=全部可见）；
+ * - report_delete：删扩展索引 + 删工作区正文（正文缺失不报错，幂等）。
  */
 export function createHtmlReportTools(): SystemTool[] {
   return [
     defineTool(
       'report_create',
-      '保存一份 LLM 生成的 HTML 报告（≤2MB）供 WebUI 内嵌预览（返回 reportId、path 与预览地址 '
-        + '/ext/html-report/reports/{reportId}；由社区扩展 html-report 存储于数据目录）。',
+      '把一份 LLM 生成的 HTML 报告（≤2MB）落盘到指定会话的工作区并登记索引，供 WebUI 预览。'
+        + '返回 reportId、工作区相对 path 与预览 url（GET /api/v1/agents/sessions/{rootId}/workspace/file?path=…）；'
+        + '正文存对话工作区，索引由 html-report 扩展维护。',
       {
         title: z.string().min(1).max(256),
         html: z.string().min(1).max(HTML_REPORT_MAX_BYTES),
-        session_id: z.string().min(1).max(256).optional(),
+        session_id: z.string().min(1).max(256).describe('目标会话 id（正文落到该会话的工作区 reports/ 下）'),
       },
       (args, ctx) =>
         guard(async () => {
+          const sessionId = args['session_id'];
+          if (typeof sessionId !== 'string' || sessionId === '') {
+            return fail('HARNESS-1009', 'report_create requires session_id (reports always belong to a conversation workspace)');
+          }
           // 字节精确复核（zod max 按 UTF-16 码元计，多字节字符可绕过，此处兜底 2MB）
           const html = String(args['html']);
           const bytes = Buffer.byteLength(html, 'utf8');
@@ -770,18 +1028,46 @@ export function createHtmlReportTools(): SystemTool[] {
               maxBytes: HTML_REPORT_MAX_BYTES,
             });
           }
-          const call = htmlReportCall(ctx);
-          const created = (await call('create', {
+          const service = resolveWorkspaceService(ctx);
+          if (service === undefined) return workspaceServiceMissing();
+          const resolved = await service.resolve(sessionId);
+          const reportId = randomUUID();
+          const relPath = `reports/${reportId}.html`;
+          const createdAt = Date.now();
+          // 1. 正文先落工作区（失败即整体失败，无半态）
+          await service.write(sessionId, relPath, Buffer.from(html, 'utf8'));
+          // 2. 再登记扩展索引；登记失败回滚正文（防索引缺行而正文成孤儿）
+          try {
+            const call = htmlReportCall(ctx);
+            await call('index', {
+              reportId,
+              title: String(args['title']),
+              path: relPath,
+              sessionId,
+              size: bytes,
+              createdAt,
+            });
+          } catch (cause) {
+            await service.delete(sessionId, relPath).catch(() => {
+              // 回滚失败不掩盖原始错误：孤儿正文无索引不可达，可被工作区清理兜底
+            });
+            throw cause;
+          }
+          return ok({
+            reportId,
             title: String(args['title']),
-            html,
-            ...(args['session_id'] !== undefined ? { sessionId: String(args['session_id']) } : {}),
-          })) as Record<string, unknown>;
-          return ok(created);
+            path: relPath,
+            sessionId,
+            size: bytes,
+            createdAt,
+            url: workspaceFileUrl(resolved.rootSessionId, relPath),
+          });
         }),
     ),
     defineTool(
       'report_list',
-      '列出已保存的 HTML 报告（按创建时间降序；可按 session_id 过滤，不含 HTML 正文）。',
+      '列出已保存的 HTML 报告索引（按创建时间降序；可按 session_id 过滤，缺省=全部可见；'
+        + '不含正文，正文经各条目的 url 预览端点取用）。',
       {
         session_id: z.string().min(1).max(256).optional(),
         limit: z.number().int().min(1).max(200).optional(),
@@ -794,30 +1080,76 @@ export function createHtmlReportTools(): SystemTool[] {
             ...(args['session_id'] !== undefined ? { sessionId: String(args['session_id']) } : {}),
             ...(args['limit'] !== undefined ? { limit: Number(args['limit']) } : {}),
             ...(args['offset'] !== undefined ? { offset: Number(args['offset']) } : {}),
-          })) as Record<string, unknown>;
-          return ok(listed);
+          })) as { reports?: Array<Record<string, unknown>> } & Record<string, unknown>;
+          // 每条目补预览 url（rootId 按 sessionId 解析缓存；解析失败 url=null 不影响列表）
+          const service = resolveWorkspaceService(ctx);
+          const rootCache = new Map<string, string | null>();
+          const reports = await Promise.all(
+            (Array.isArray(listed.reports) ? listed.reports : []).map(async (entry) => {
+              const sessionId = typeof entry['sessionId'] === 'string' ? entry['sessionId'] : '';
+              const relPath = typeof entry['path'] === 'string' ? entry['path'] : '';
+              let rootId: string | null = null;
+              if (service !== undefined && sessionId !== '' && relPath !== '') {
+                if (!rootCache.has(sessionId)) {
+                  rootCache.set(
+                    sessionId,
+                    await service.resolve(sessionId).then((r) => r.rootSessionId).catch(() => null),
+                  );
+                }
+                rootId = rootCache.get(sessionId) ?? null;
+              }
+              return {
+                ...entry,
+                url: rootId !== null ? workspaceFileUrl(rootId, relPath) : null,
+              };
+            }),
+          );
+          return ok({ ...listed, reports });
         }),
     ),
     defineTool(
       'report_get',
-      '读取单个 HTML 报告（标题 + HTML 正文 + 元数据；reportId 为 UUID）。',
+      '读取单个 HTML 报告的标题/元数据与预览 url（reportId 为 UUID；不回正文——'
+        + '正文经返回的 url 即 GET /api/v1/agents/sessions/{rootId}/workspace/file?path=… 取用）。',
       { reportId: z.string().regex(HTML_REPORT_ID_RE, 'reportId must be a UUID') },
       (args, ctx) =>
         guard(async () => {
           const call = htmlReportCall(ctx);
           const got = (await call('get', { reportId: String(args['reportId']) })) as Record<string, unknown>;
-          return ok(got);
+          const meta = { ...got };
+          delete meta['html']; // 兼容旧实现残留：索引面永不回正文
+          const sessionId = typeof meta['sessionId'] === 'string' ? meta['sessionId'] : '';
+          const relPath = typeof meta['path'] === 'string' ? meta['path'] : '';
+          const service = resolveWorkspaceService(ctx);
+          let url: string | null = null;
+          if (service !== undefined && sessionId !== '' && relPath !== '') {
+            url = await service
+              .resolve(sessionId)
+              .then((r) => workspaceFileUrl(r.rootSessionId, relPath))
+              .catch(() => null);
+          }
+          return ok({ title: meta['title'], meta, url });
         }),
     ),
     defineTool(
       'report_delete',
-      '删除单个 HTML 报告（存储与预览入口一并失效；reportId 为 UUID）。',
+      '删除单个 HTML 报告：扩展索引 + 工作区正文一并删除（正文已缺失不报错，幂等；reportId 为 UUID）。',
       { reportId: z.string().regex(HTML_REPORT_ID_RE, 'reportId must be a UUID') },
       (args, ctx) =>
         guard(async () => {
           const call = htmlReportCall(ctx);
+          // 扩展删索引并返回被删行的坐标（path/sessionId），供内核删工作区正文
           const removed = (await call('delete', { reportId: String(args['reportId']) })) as Record<string, unknown>;
-          return ok(removed);
+          const sessionId = typeof removed['sessionId'] === 'string' ? removed['sessionId'] : '';
+          const relPath = typeof removed['path'] === 'string' ? removed['path'] : '';
+          if (sessionId !== '' && relPath !== '') {
+            const service = resolveWorkspaceService(ctx);
+            if (service !== undefined) {
+              // 正文缺失（已被手工清理等）不报错：删除语义幂等
+              await service.delete(sessionId, relPath).catch(() => {});
+            }
+          }
+          return ok({ reportId: String(args['reportId']), deleted: true });
         }),
     ),
   ];

@@ -322,6 +322,25 @@ describe('BrowserEngine', () => {
     expect(rig.screenshots).toEqual([{ path: shot.path, fullPage: true }]);
   });
 
+  it('screenshot targetDir 覆写（MCP-First 工作区链路）：落指定目录（不存在即建）并回工作区相对 path', async () => {
+    const rig = makeFakePlaywright();
+    const { engine } = makeEngine(rig);
+    const wsRoot = mkdtempSync(join(tmpdir(), 'browser-ws-'));
+    tempDirs.push(wsRoot);
+    const targetDir = join(wsRoot, 'screenshots');
+
+    const shot = await engine.screenshot({ fullPage: false, targetDir });
+    // path 变为工作区相对路径；url 为空串（由工具层按 REST 预览端点拼装）
+    expect(shot.path).toBe(`screenshots/${shot.file}`);
+    expect(shot.file).toMatch(/^[0-9a-f-]{36}\.png$/i);
+    expect(shot.url).toBe('');
+    // 物理落盘在覆写目录（目录不存在即建）
+    expect(existsSync(join(targetDir, shot.file))).toBe(true);
+    expect(rig.screenshots).toEqual([{ path: join(targetDir, shot.file), fullPage: false }]);
+    // 缺省目录未被动过
+    expect(rig.gotos).toEqual([]);
+  });
+
   it('readScreenshot：uuid 形状校验防穿越；存在返回 base64；不存在 404（HARNESS-3004）', async () => {
     const rig = makeFakePlaywright();
     const { engine } = makeEngine(rig);
@@ -543,6 +562,94 @@ describe('createBrowserTools', () => {
     expect(await tools[5]!.execute({}, fakeCtx)).toMatchObject({ ok: true, url: '/ext/browser/screenshots/x.png' });
     expect(await tools[6]!.execute({}, fakeCtx)).toMatchObject({ ok: true, done: true });
     expect(await tools[7]!.execute({}, fakeCtx)).toMatchObject({ ok: true, installed: true });
+  });
+
+  it('browser_screenshot 工作区链路：有会话上下文且 resolve 成功 → 落工作区 screenshots/ 并回 REST 预览 url', async () => {
+    const seen: Array<{ fullPage?: boolean; targetDir?: string }> = [];
+    const engine = {
+      navigate: async () => ({}),
+      snapshot: async () => ({ snapshot: '', truncated: false }),
+      click: async () => true,
+      type: async () => true,
+      pressKey: async () => true,
+      screenshot: async (input: { fullPage?: boolean; targetDir?: string }) => {
+        seen.push(input);
+        return { path: 'screenshots/ws.png', file: 'ws.png', url: '' };
+      },
+      close: async () => undefined,
+      status: async () => ({ installed: true, running: true, installing: false, lastError: null }),
+    };
+    const ctx = {
+      kernel: {
+        container: {
+          has: (k: string) => k === 'workspace.service',
+          resolve: () => ({
+            resolve: async (scopeId: string) => ({ rootSessionId: `root-${scopeId}`, userId: null, path: `/tmp/ws-${scopeId}` }),
+            write: async () => ({}),
+            read: async () => Buffer.alloc(0),
+            list: async () => [],
+            delete: async () => {},
+          }),
+        },
+      },
+      agentId: 'sess-ws-1',
+      updater: {},
+      cronHistory: async () => [],
+    } as unknown as Parameters<ReturnType<typeof createBrowserTools>[number]['execute']>[1];
+
+    const tools = createBrowserTools(() => ({ engine: engine as unknown as NonNullable<BrowserToolsDeps['engine']> }));
+    const result = await tools[5]!.execute({ fullPage: true }, ctx);
+    expect(result).toMatchObject({
+      ok: true,
+      path: 'screenshots/ws.png',
+      file: 'ws.png',
+      url: '/api/v1/agents/sessions/root-sess-ws-1/workspace/file?path=screenshots%2Fws.png',
+    });
+    // 引擎收到工作区 screenshots/ 绝对路径覆写
+    expect(seen).toEqual([{ fullPage: true, targetDir: '/tmp/ws-sess-ws-1/screenshots' }]);
+  });
+
+  it('browser_screenshot 回退：无会话上下文或 resolve 失败 → 引擎按默认目录落盘（不阻断）', async () => {
+    const calls: Array<{ fullPage?: boolean; targetDir?: string }> = [];
+    const engine = {
+      navigate: async () => ({}),
+      snapshot: async () => ({ snapshot: '', truncated: false }),
+      click: async () => true,
+      type: async () => true,
+      pressKey: async () => true,
+      screenshot: async (input: { fullPage?: boolean; targetDir?: string }) => {
+        calls.push(input);
+        return { path: '/d/fallback.png', file: 'fallback.png', url: '/ext/browser/screenshots/fallback.png' };
+      },
+      close: async () => undefined,
+      status: async () => ({ installed: true, running: true, installing: false, lastError: null }),
+    };
+    const tools = createBrowserTools(() => ({ engine: engine as unknown as NonNullable<BrowserToolsDeps['engine']> }));
+
+    // 无 agentId（外部 /mcp 直调）：不触碰工作区，走默认目录
+    const noAgent = await tools[5]!.execute({}, fakeCtx);
+    expect(noAgent).toMatchObject({ ok: true, url: '/ext/browser/screenshots/fallback.png' });
+
+    // agentId 存在但工作区 resolve 抛错：回退默认目录
+    const ctx = {
+      kernel: {
+        container: {
+          has: (k: string) => k === 'workspace.service',
+          resolve: () => ({
+            resolve: async () => {
+              throw new Error('scope gone');
+            },
+          }),
+        },
+      },
+      agentId: 'sess-gone',
+      updater: {},
+      cronHistory: async () => [],
+    } as unknown as Parameters<ReturnType<typeof createBrowserTools>[number]['execute']>[1];
+    const failed = await tools[5]!.execute({}, ctx);
+    expect(failed).toMatchObject({ ok: true, url: '/ext/browser/screenshots/fallback.png' });
+
+    expect(calls).toEqual([{ fullPage: false }, { fullPage: false }]); // 均无 targetDir
   });
 });
 

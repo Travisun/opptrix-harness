@@ -3,6 +3,11 @@
  *
  * 职责：为 LLM 提供 exec / curl / git / npm 语义的代码执行能力，落在
  * `<dataDir>/coding-workspaces/<sessionId>/` 会话目录内（目录即事实，重启无损）。
+ * MCP-First 工作区链路：runInSession/runCode/fsWrite/fsRead/fsList 均接受可选
+ * `rootPath` 物理目录覆写（工具层在 ctx.agentId 可解析出对话工作区时传入）——
+ * 覆写只改物理位置（会话根=工作区根，internal 目录在覆写目录下，HOME/TMPDIR 同步
+ * 钉在覆写目录），会话语义（mutex 按sessionId、白名单、路径闸）完全不变；解析
+ * 失败时工具层不传 rootPath，自然回退默认目录。
  *
  * 安全基线（纵深防御，逐层收口）：
  * - **命令白名单门**：cmd 必须命中白名单（{@link DEFAULT_ALLOWLIST}，可配置），且为
@@ -198,8 +203,31 @@ export class CodingEngine {
     return sessionId;
   }
 
-  /** 会话目录绝对路径 */
-  #sessionDir(sessionId: string): string {
+  /**
+   * 会话目录物理覆写门（MCP-First 工作区链路）：undefined/null/空串 → 缺省（不覆写）；
+   * 提供时必须是宿主绝对路径（通常为对话工作区路径，来自可信的 WorkspaceService.resolve），
+   * 形状非法（相对路径 / NUL / 超长）→ BAD_REQUEST。
+   */
+  #checkRootPath(rootPath: unknown): string | undefined {
+    if (rootPath === undefined || rootPath === null || rootPath === '') return undefined;
+    if (typeof rootPath !== 'string' || rootPath.length > 1024 || rootPath.includes('\0')) {
+      throw err('BAD_REQUEST', {
+        message: 'rootPath must be an absolute host directory string (at most 1024 chars, no NUL)',
+        detail: { rootPath: String(rootPath).slice(0, 200) },
+      });
+    }
+    if (!rootPath.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(rootPath)) {
+      throw err('BAD_REQUEST', {
+        message: `rootPath must be an absolute path (got "${rootPath.slice(0, 200)}")`,
+        detail: { rootPath: rootPath.slice(0, 200) },
+      });
+    }
+    return rootPath;
+  }
+
+  /** 会话目录绝对路径（rootPath 覆写时即覆写目录本身；缺省落 coding-workspaces/<id>） */
+  #sessionDir(sessionId: string, rootPath?: string): string {
+    if (rootPath !== undefined) return rootPath;
     return join(this.#root(), sessionId);
   }
 
@@ -226,11 +254,12 @@ export class CodingEngine {
   /**
    * 将会话内相对路径解析为宿主绝对路径，并做 realpath 前缀复核（symlink 出逃防线）：
    * 目标存在 → 直接 realpath；不存在 → 对最深存在祖先 realpath 后拼接剩余段。
+   * rootPath 覆写时前缀复核以覆写目录为根（工作区内的穿越/symlink 出逃同样拒绝）。
    * @throws BAD_REQUEST 路径非法；FORBIDDEN realpath 越出会话目录（穿越/symlink 出逃）
    */
-  #resolveWithinSession(sessionId: string, relPath: string, kind: string): string {
+  #resolveWithinSession(sessionId: string, relPath: string, kind: string, rootPath?: string): string {
     const rel = normalizeRelPath(relPath, kind);
-    const sessionDir = this.#sessionDir(sessionId);
+    const sessionDir = this.#sessionDir(sessionId, rootPath);
     const rootReal = realpathSync(sessionDir);
     const target = rel === '.' ? sessionDir : join(sessionDir, rel);
     const suffix: string[] = [];
@@ -255,10 +284,10 @@ export class CodingEngine {
   // 会话生命周期
   // -------------------------------------------------------------------------
 
-  /** 创建/复用会话目录（幂等）：mkdir + meta.json 写入 + 陈旧临时文件清理 */
-  ensureSession(sessionId: string): CodingSessionInfo {
+  /** 创建/复用会话目录（幂等）：mkdir + meta.json 写入 + 陈旧临时文件清理；rootPath 覆写物理目录 */
+  ensureSession(sessionId: string, rootPath?: string): CodingSessionInfo {
     const id = this.#checkSessionId(sessionId);
-    const dir = this.#sessionDir(id);
+    const dir = this.#sessionDir(id, rootPath);
     mkdirSync(dir, { recursive: true });
     const internal = this.#internalDir(dir);
     const metaPath = join(internal, 'meta.json');
@@ -351,12 +380,13 @@ export class CodingEngine {
     const args = this.#checkArgs(input?.args ?? []);
     const timeoutMs = this.#checkTimeout(input?.timeoutMs);
     const extraEnv = this.#checkEnv(input?.env);
-    this.ensureSession(id);
-    const cwdReal = this.#resolveCwd(id, input?.cwd);
+    const rootPath = this.#checkRootPath(input?.rootPath);
+    this.ensureSession(id, rootPath);
+    const cwdReal = this.#resolveCwd(id, input?.cwd, rootPath);
     this.#requireIdle(id);
     this.#busy.add(id);
     try {
-      return await this.#spawnRun({ sessionId: id, cmd, args, cwd: cwdReal, timeoutMs, extraEnv });
+      return await this.#spawnRun({ sessionId: id, cmd, args, cwd: cwdReal, timeoutMs, extraEnv, rootPath });
     } finally {
       this.#busy.delete(id);
     }
@@ -387,8 +417,9 @@ export class CodingEngine {
       });
     }
     const timeoutMs = this.#checkTimeout(input?.timeoutMs);
-    this.ensureSession(id);
-    const tmpDir = join(this.#internalDir(this.#sessionDir(id)), 'tmp');
+    const rootPath = this.#checkRootPath(input?.rootPath);
+    this.ensureSession(id, rootPath);
+    const tmpDir = join(this.#internalDir(this.#sessionDir(id, rootPath)), 'tmp');
     mkdirSync(tmpDir, { recursive: true });
     const file = join(tmpDir, `code-${randomUUID()}.${language === 'node' ? 'mjs' : 'py'}`);
     writeFileSync(file, code, 'utf8');
@@ -398,6 +429,7 @@ export class CodingEngine {
         cmd: language === 'node' ? 'node' : 'python3',
         args: [join(INTERNAL_DIR, 'tmp', basename(file))],
         timeoutMs,
+        ...(rootPath !== undefined ? { rootPath } : {}),
       });
     } finally {
       rmSync(file, { force: true });
@@ -408,10 +440,10 @@ export class CodingEngine {
   // 会话文件面（fs.write / fs.read / fs.list）
   // -------------------------------------------------------------------------
 
-  /** 写文件（UTF-8 文本；父目录自动创建；路径限会话内相对 + realpath 前缀复核） */
-  fsWrite(sessionId: string, relPath: string, content: string): CodingFsWriteResult {
+  /** 写文件（UTF-8 文本；父目录自动创建；路径限会话内相对 + realpath 前缀复核；rootPath 覆写物理目录） */
+  fsWrite(sessionId: string, relPath: string, content: string, rootPath?: string): CodingFsWriteResult {
     const id = this.#checkSessionId(sessionId);
-    this.ensureSession(id);
+    this.ensureSession(id, rootPath);
     if (typeof content !== 'string') {
       throw err('BAD_REQUEST', { message: 'content must be a string' });
     }
@@ -423,17 +455,17 @@ export class CodingEngine {
       });
     }
     const rel = normalizeRelPath(relPath, 'path');
-    const real = this.#resolveWithinSession(id, relPath, 'path');
+    const real = this.#resolveWithinSession(id, relPath, 'path', rootPath);
     mkdirSync(dirname(real), { recursive: true });
     writeFileSync(real, content, 'utf8');
     return { path: rel, size: bytes };
   }
 
-  /** 读文件（文本；封顶 256KB 截断）。不存在 → SANDBOX_NOT_FOUND */
-  fsRead(sessionId: string, relPath: string): CodingFsReadResult {
+  /** 读文件（文本；封顶 256KB 截断）。不存在 → SANDBOX_NOT_FOUND；rootPath 覆写物理目录 */
+  fsRead(sessionId: string, relPath: string, rootPath?: string): CodingFsReadResult {
     const id = this.#checkSessionId(sessionId);
-    this.ensureSession(id);
-    const real = this.#resolveWithinSession(id, relPath, 'path');
+    this.ensureSession(id, rootPath);
+    const real = this.#resolveWithinSession(id, relPath, 'path', rootPath);
     let st;
     try {
       st = statSync(real);
@@ -457,11 +489,11 @@ export class CodingEngine {
     };
   }
 
-  /** 列目录（一级；引擎内部目录 `.coding` 刻意不可见）。不存在 → SANDBOX_NOT_FOUND */
-  fsList(sessionId: string, relPath?: string): CodingFsEntry[] {
+  /** 列目录（一级；引擎内部目录 `.coding` 刻意不可见）。不存在 → SANDBOX_NOT_FOUND；rootPath 覆写物理目录 */
+  fsList(sessionId: string, relPath?: string, rootPath?: string): CodingFsEntry[] {
     const id = this.#checkSessionId(sessionId);
-    this.ensureSession(id);
-    const real = this.#resolveWithinSession(id, relPath ?? '.', 'path');
+    this.ensureSession(id, rootPath);
+    const real = this.#resolveWithinSession(id, relPath ?? '.', 'path', rootPath);
     let names: string[];
     try {
       names = readdirSync(real);
@@ -580,15 +612,15 @@ export class CodingEngine {
     return out;
   }
 
-  /** cwd 解析：缺省会话根；必须为会话内已存在的目录（realpath + 前缀复核） */
-  #resolveCwd(sessionId: string, cwd: unknown): string {
+  /** cwd 解析：缺省会话根；必须为会话内已存在的目录（realpath + 前缀复核）；rootPath 覆写物理目录 */
+  #resolveCwd(sessionId: string, cwd: unknown, rootPath?: string): string {
     if (cwd === undefined || cwd === null || cwd === '') {
-      return realpathSync(this.#sessionDir(sessionId));
+      return realpathSync(this.#sessionDir(sessionId, rootPath));
     }
     if (typeof cwd !== 'string') {
       throw err('BAD_REQUEST', { message: 'cwd must be a session-relative string' });
     }
-    const real = this.#resolveWithinSession(sessionId, cwd, 'cwd');
+    const real = this.#resolveWithinSession(sessionId, cwd, 'cwd', rootPath);
     let st;
     try {
       st = statSync(real);
@@ -640,9 +672,10 @@ export class CodingEngine {
     cwd: string;
     timeoutMs: number;
     extraEnv: Record<string, string>;
+    rootPath?: string;
   }): Promise<CodingRunResult> {
     const binPath = this.#resolveCmdPath(run.cmd);
-    const sessionDir = this.#sessionDir(run.sessionId);
+    const sessionDir = this.#sessionDir(run.sessionId, run.rootPath);
     const env: Record<string, string> = {
       PATH: process.env['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
       HOME: sessionDir,

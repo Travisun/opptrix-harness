@@ -44,6 +44,12 @@ export interface CodingExecInput {
   timeoutMs?: number;
   /** 额外环境变量（键名白名单合并进基线 env；PATH/HOME/TMPDIR 等受保护键拒绝） */
   env?: Record<string, string>;
+  /**
+   * 会话目录物理覆写（MCP-First 工作区链路）：传入对话工作区路径时，会话根即该目录
+   * （internal 目录在工作区根下，HOME/TMPDIR 同步钉在覆写目录）。并发 mutex 仍按
+   * sessionId——覆写只改物理位置，不改会话语义。缺省落 `<dataDir>/coding-workspaces/<id>/`。
+   */
+  rootPath?: string;
 }
 
 /** runCode 入参：源码写入会话内临时文件执行，结束后清理 */
@@ -54,6 +60,8 @@ export interface CodingRunCodeInput {
   code: string;
   /** 超时毫秒（语义同 {@link CodingExecInput.timeoutMs}） */
   timeoutMs?: number;
+  /** 会话目录物理覆写（语义同 {@link CodingExecInput.rootPath}） */
+  rootPath?: string;
 }
 
 /** fs.list 的一级目录项（与沙箱 listFiles 同形状） */
