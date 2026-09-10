@@ -9,7 +9,9 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "dev": "tsx watch src/main.ts",
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "tsx watch src/main.ts",
+    "dev:webui": "npm --prefix extensions/webui/ui-src run build -- --watch",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "typecheck": "tsc --noEmit",

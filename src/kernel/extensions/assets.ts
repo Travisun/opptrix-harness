@@ -61,8 +61,12 @@ export function registerExtAssets(app: FastifyInstance, dirs: ExtAssetDir[]): vo
       prefix: `/ext/${extId}/ui/`,
       decorateReply: false, // 多实例共存：reply decoration 只允许一份
       index: 'index.html', // 目录根回退 index.html（/admin 302 落点 /ext/{id}/ui/ 必须可达）
-      // 缓存头：保持 @fastify/static 默认（etag/last-modified，max-age=0 协商缓存），
-      // 不设长缓存/immutable；统一 no-store 策略由集成方在反代层实现（见模块注释）
+      setHeaders(reply, path) {
+        // index.html 永远协商且不缓存：重编译后产物 hash 变化，旧壳缓存会引用已删除
+        // 的资产文件（404 白屏）。带 hash 的静态资产保持默认 etag 协商即可。
+        // 注意 @fastify/static 传入的是 Fastify Reply（非原生 res），用 reply.header()
+        if (path.endsWith('.html')) reply.header('Cache-Control', 'no-cache');
+      },
     });
   }
 }
