@@ -1,0 +1,10 @@
+{
+  "id": "html-report",
+  "api": 1,
+  "version": "0.1.0",
+  "main": "index.js",
+  "description": "社区扩展：把 LLM 生成的 HTML 报告保存到数据目录并提供 WebUI 预览（系统 MCP 工具 report_create/report_list/report_get/report_delete 桥接至本扩展）。",
+  "permissions": ["http", "db"],
+  "provides": ["reports"],
+  "displayName": "HTML 报告"
+}
