@@ -295,11 +295,11 @@ describe('runAgentLoop — 流式（onDelta）', () => {
     expect(warn).toHaveBeenCalled();
   });
 
-  it('非流式回归：未传 onDelta → gateway 不带 stream 标志、结果形状与既有语义一致（无 reasoningSegments 键）', async () => {
+  it('恒流式：未传 onDelta 也带 stream:true（兼容网关空 body/文本标记规避）；网关违约回非流结果时兜底聚合、形状与既有语义一致（无 reasoningSegments 键）', async () => {
     const tools = stubTools();
     const { gateway, calls } = scriptedGateway([{ text: '技能库共 1 项' }]);
     const out = await runAgentLoop({ gateway, tools, logger, sleep }, BASE_INPUT);
-    expect(calls[0]?.stream).toBeUndefined();
+    expect(calls[0]?.stream).toBe(true);
     expect(out).toEqual({
       finalText: '技能库共 1 项',
       iterations: 1,
@@ -696,7 +696,7 @@ describe('POST /messages/stream — SSE 端点', () => {
     upstream.release(); // 挂起请求应答 → 循环在最近检查点收敛 AbortError
     await waitFor('generation converged after cancel', () => !manager.isGenerating(id));
 
-    // 互斥解除：非流式发送恢复正常（伪上游按全局请求计数应答 回复-N）
+    // 互斥解除：再次发送恢复正常（恒流式下伪上游以流式帧应答）
     upstream.mode = 'text';
     const again = await app.inject({
       method: 'POST',
@@ -705,10 +705,10 @@ describe('POST /messages/stream — SSE 端点', () => {
       payload: { content: '再来一次' },
     });
     expect(again.statusCode).toBe(200);
-    expect(String((again.json() as Record<string, unknown>)['content'])).toMatch(/^回复-\d+$/);
+    expect(String((again.json() as Record<string, unknown>)['content'])).toBe('你好');
   }, 20_000);
 
-  it('非流式 POST messages 回归不变：JSON 应答 → 200 最终 assistant（不产生流式帧）', async () => {
+  it('非流式 POST messages 回归不变：REST 层 JSON 应答 → 200 最终 assistant（不产生流式帧；上游恒流式）', async () => {
     upstream.mode = 'text';
     upstream.requests.length = 0;
     const created = await createSession({});
@@ -721,9 +721,10 @@ describe('POST /messages/stream — SSE 端点', () => {
     });
     expect(res.statusCode).toBe(200);
     const assistant = res.json() as Record<string, unknown>;
-    expect(assistant).toMatchObject({ role: 'assistant', content: '回复-1' });
-    expect(assistant['usage']).toMatchObject({ inputTokens: 12, outputTokens: 7 });
-    expect(upstream.requests[0]?.stream).toBe(false); // 非流式路径显式 stream:false
+    expect(assistant).toMatchObject({ role: 'assistant', content: '你好' });
+    // 恒流式证据：REST 非流式端点对上游也发 stream:true（兼容网关空 body/文本标记规避）
+    expect(upstream.requests[0]?.stream).toBe(true);
+    expect(assistant['usage']).toMatchObject({ inputTokens: 10, outputTokens: 5 });
     const items = await manager.getMessages(id);
     expect(items.map((m) => m.role)).toEqual(['user', 'assistant']);
   }, 20_000);

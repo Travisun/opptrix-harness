@@ -447,9 +447,12 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
       messages: budgetView.messages,
       ...(useTools && schemas.length > 0 ? { tools: schemas } : {}),
     };
+    // 恒走流式聚合：兼容网关（LongCat/Qwen 系）非流式路径会 (a) 间歇回 200 空 body、
+    // (b) 把工具调用写成正文标记而非原生 tool_calls——流式路径两者皆无（实测原生
+    // tool_call deltas）。onDelta 未传时仅不回调节流，聚合语义不变。
+    // 网关违约回了非流结果时兜底原样（isStreamResult 判别）。
     if (onDelta === undefined) {
-      // 非流式（现状语义）；网关违约回了流生成器时兜底按流消费（无增量回调，纯聚合）
-      const out = await deps.gateway.chat(payload);
+      const out = await deps.gateway.chat({ ...payload, stream: true });
       const result = isStreamResult(out)
         ? await consumeStream(out, { logger: deps.logger, throwIfAborted })
         : out;
