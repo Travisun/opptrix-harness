@@ -135,7 +135,13 @@ describe('runAgentLoop — 基本循环', () => {
     expect(calls[1]?.messages).toEqual([
       { role: 'system', content: expect.any(String) },
       { role: 'user', content: '盘点技能库并汇报' },
-      { role: 'assistant', content: { toolCalls: [{ id: 'call_1', name: 'skills_list', arguments: '{}' }] } },
+      {
+        role: 'assistant',
+        content: {
+          toolCalls: [{ id: 'call_1', name: 'skills_list', arguments: '{}' }],
+          reasoning: '', // 无思考轮：恒带空串（DeepSeek 系 tool 轮续写要求 reasoning_content 键存在）
+        },
+      },
       {
         role: 'tool',
         content: { toolCallId: 'call_1', text: JSON.stringify({ tool: 'skills_list', args: {} }) },
@@ -167,6 +173,7 @@ describe('runAgentLoop — 基本循环', () => {
           { id: 'c1', name: 'cron_list', arguments: '{"limit":5}' },
           { id: 'c2', name: 'files_read', arguments: '{"id":"f1"}' },
         ],
+        reasoning: '',
       },
     });
     expect(calls[1]?.messages[3]).toEqual({

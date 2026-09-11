@@ -131,6 +131,8 @@ function makeGateway(
     getProviders: async () => providers,
     resolveSecret: async (ref) => secrets[ref] ?? null,
     logger: pino({ level: 'silent' }),
+    // failover 尝试间退避注入空实现：本文件断言尝试链语义，不测真实等待
+    sleep: async () => {},
     ...(haEnabled !== undefined ? { haEnabled } : {}),
   });
 }
@@ -382,7 +384,8 @@ describe('anthropic-messages adapter — 非流式', () => {
     expect(res.usage).toEqual({ inputTokens: 3, outputTokens: 2 });
 
     expect(calls[0]?.headers.get('x-api-key')).toBe('sk-anthropic-test');
-    expect(calls[0]?.body.system).toBe('be brief');
+    // system 带 ephemeral 缓存断点（块数组形状，见 applyCacheControlEphemeral）
+    expect(calls[0]?.body.system).toEqual([{ type: 'text', text: 'be brief', cache_control: { type: 'ephemeral' } }]);
     const messages = calls[0]?.body.messages as Array<{ role: string }>;
     expect(messages).toHaveLength(1);
     expect(messages[0]?.role).toBe('user');
@@ -444,7 +447,13 @@ describe('anthropic-messages adapter — 非流式', () => {
           { type: 'tool_use', id: 'toolu_1', name: 'weather', input: { city: 'SF' } },
         ],
       },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'sunny 20C' }] },
+      {
+        role: 'user',
+        content: [
+          // 最后一条 user 消息尾部块带 ephemeral 缓存断点
+          { type: 'tool_result', tool_use_id: 'toolu_1', content: 'sunny 20C', cache_control: { type: 'ephemeral' } },
+        ],
+      },
     ]);
   });
 });
@@ -884,6 +893,7 @@ describe('LlmGateway — HA 自动回退（默认关闭）', () => {
       resolveSecret: async (ref) => HA_SECRETS[ref] ?? null,
       logger: { debug: vi.fn(), warn } as unknown as import('pino').Logger,
       haEnabled: async () => true,
+      sleep: async () => {},
     });
     const res = (await gw.chat(HA_INPUT)) as LlmChatResult;
     expect(res.text).toBe('from-p2');

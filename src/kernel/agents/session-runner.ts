@@ -71,6 +71,13 @@ export interface SessionRunnerInput {
   model?: string;
   /** 中断信号（cancelGeneration 的 AbortController） */
   signal?: AbortSignal;
+  /** 会话级 prompt 缓存键（manager 传 sessionId；透传 runner → 网关 → prompt_cache_key） */
+  sessionKey?: string;
+  /**
+   * 会话工作区根目录绝对路径（可选；manager 预解析后传入）。有值时 runner 的超长工具结果
+   * 溢出落盘 `<workspacePath>/tool-outputs/{callId}.json`；缺省 = 直接截断，不落盘。
+   */
+  workspacePath?: string;
   /** 流式增量回调（原样透传 runner；传入即按 stream:true 调用网关） */
   onDelta?: (chunk: AgentLoopDeltaChunk) => void;
   /**
@@ -137,18 +144,25 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
 
   return async (input: SessionRunnerInput): Promise<AgentLoopResult> => {
     const { onDelta, onToolStep } = input;
-    return runAgentLoop(loopDeps, {
-      agentId: input.agentId,
-      depth: input.depth ?? 0,
-      ...(input.systemPrompt !== undefined ? { systemPrompt: input.systemPrompt } : {}),
-      prompt: input.prompt,
-      ...(input.model !== undefined ? { model: input.model } : {}),
-      ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      // runner 侧步骤形状为 unknown（零领域语义）；此处以收窄回调适配
-      ...(onDelta !== undefined ? { onDelta } : {}),
-      ...(onToolStep !== undefined
-        ? { onToolStep: (step: unknown) => onToolStep(step as ChatToolStep) }
-        : {}),
-    });
+    return runAgentLoop(
+      // 工作区路径按次传入（每次 sendMessage 解析一次）：有值时注入 sync getter 供溢出落盘
+      input.workspacePath !== undefined
+        ? { ...loopDeps, workspace: () => ({ path: input.workspacePath as string }) }
+        : loopDeps,
+      {
+        agentId: input.agentId,
+        depth: input.depth ?? 0,
+        ...(input.systemPrompt !== undefined ? { systemPrompt: input.systemPrompt } : {}),
+        prompt: input.prompt,
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        ...(input.sessionKey !== undefined && input.sessionKey !== '' ? { sessionKey: input.sessionKey } : {}),
+        // runner 侧步骤形状为 unknown（零领域语义）；此处以收窄回调适配
+        ...(onDelta !== undefined ? { onDelta } : {}),
+        ...(onToolStep !== undefined
+          ? { onToolStep: (step: unknown) => onToolStep(step as ChatToolStep) }
+          : {}),
+      },
+    );
   };
 }

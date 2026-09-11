@@ -16,6 +16,10 @@
  *   - `result.toolCalls` 非空 → 逐个 `tools.execute(name, JSON.parse(argsJson), ctx)`，
  *     以 `role:'tool'` 富形状消息回填结果文本（JSON 序列化）；**执行异常包装为
  *     `{ isError: true, error }` 结果继续循环**——工具失败是信息，不是终止；
+ *     单条结果 >32KB → 溢出落盘（deps.workspace 有值时写 `<workspace>/tool-outputs/
+ *     {callId}.json` 并以 `{_spilled,path,preview}` 信封替换消息体；无 workspace 截断 32KB）；
+ *   - assistant 富形状消息恒携带该轮 reasoning（空串也带）——openai-chat 回写
+ *     `reasoning_content`，满足 DeepSeek/LongCat 等推理模型 tool 轮续写的硬要求；
  *   - 文本非空且无工具调用 → 该文本即 finalText，循环结束；
  *   - 空文本且无工具调用 → 继续下一轮（迭代上限兜底，防空转收束）；
  *     **但本轮有思考链（reasoning）时判为「思考占满输出」→ 空回复守卫收束**
@@ -31,7 +35,9 @@
  *   tools.execute 实际调用次数（参数 JSON 解析失败未执行的不计）。
  */
 import type { Logger } from 'pino';
-import { applyContextBudget } from './context-budget.js';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ContextBudget } from './context-budget.js';
 import { assembleSystemPrompt } from './skill-catalog.js';
 import { assembleBootstrapPrompt } from './prompts/assemble.js';
 
@@ -81,6 +87,11 @@ export interface AgentLoopDeps {
    * 缺省 setTimeout 实现，测试可注入空实现加速。
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * 会话工作区取值器（可选；工具结果溢出落盘用）。返回工作区根目录视图（path 为绝对路径）
+   * 或 undefined（本次无工作区）。缺省 undefined：超长工具结果直接截断，不落盘。
+   */
+  workspace?: () => { path: string } | undefined;
 }
 
 /** runAgentLoop 输入 */
@@ -106,6 +117,12 @@ export interface AgentLoopInput {
   maxTokens?: number;
   /** 中断信号：aborted 时循环尽快抛 AbortError */
   signal?: AbortSignal;
+  /**
+   * 会话级缓存键（session.ts 传 sessionId）：透传网关 → openai-chat 适配器将其作为
+   * `prompt_cache_key` 下发（provider 侧会话级前缀缓存亲和；provider 可经
+   * promptCacheKey:false 关闭）。缺省不携带。
+   */
+  sessionKey?: string;
   /**
    * 流式增量回调（可选）。传入时每轮 gateway.chat 以 stream:true 调用并消费流事件：
    * 文本增量按估算 token 80ms 节流合并回调、思考链增量每累积 120 字回调一次
@@ -155,7 +172,19 @@ export const TEXT_DELTA_THROTTLE_MS = 80;
 /** 思考链增量回调粒度（每累积约 120 字回调一次；流结束 flush 残余） */
 export const REASONING_DELTA_CHUNK_CHARS = 120;
 
-/** 估算 token 数（chars/4 向上取整；仅用于进度节流/展示，非计费口径） */
+/** 单条工具结果溢出阈值（字符数 ≈32KB）：超过即完整落盘、消息体替换为溢出信封 */
+export const TOOL_RESULT_SPILL_THRESHOLD_CHARS = 32 * 1024;
+
+/** 溢出信封 preview 长度（字符） */
+export const TOOL_RESULT_SPILL_PREVIEW_CHARS = 2048;
+
+/** 溢出落盘目录（会话工作区相对路径；模型可经 workspace_read 按需读回完整结果） */
+export const TOOL_OUTPUTS_DIR = 'tool-outputs';
+
+/** 无 workspace（或落盘失败）时的截断标注（确定性后缀，前缀稳定利于缓存） */
+export const TOOL_RESULT_TRUNCATED_SUFFIX = '\n…[truncated: tool result exceeded 32KB]';
+
+// 估算 token 数（chars/4 向上取整；仅用于进度节流/展示，非计费口径）
 export function estimateLoopTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
@@ -358,6 +387,40 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * 工具结果溢出处理（空间可控 + 模型可按需读回，借鉴 Opptrix spill）：
+ * - 结果 ≤32KB → 原样内联；
+ * - >32KB 且 deps.workspace 有值 → 完整结果写入 `<workspace>/tool-outputs/{callId}.json`，
+ *   消息体替换为 `{"_spilled":true,"path":"tool-outputs/{callId}.json","preview":前2KB}`
+ *   （path 为工作区相对 POSIX 路径，模型可经 workspace_read 读回）；
+ * - 无 workspace 或落盘失败 → 截断 32KB + 确定性标注（循环绝不因溢出处理失败而中断）。
+ */
+async function spillToolResult(
+  deps: AgentLoopDeps,
+  callId: string,
+  text: string,
+): Promise<string> {
+  if (text.length <= TOOL_RESULT_SPILL_THRESHOLD_CHARS) return text;
+  const truncated = text.slice(0, TOOL_RESULT_SPILL_THRESHOLD_CHARS) + TOOL_RESULT_TRUNCATED_SUFFIX;
+  const workspace = deps.workspace?.();
+  if (workspace === undefined) return truncated;
+  // callId 来自 provider 侧（不可信）：收窄为文件名安全字符，防目录穿越
+  const safeCallId = callId.replace(/[^A-Za-z0-9._-]/g, '_');
+  const relPath = `${TOOL_OUTPUTS_DIR}/${safeCallId}.json`;
+  try {
+    await mkdir(join(workspace.path, TOOL_OUTPUTS_DIR), { recursive: true });
+    await writeFile(join(workspace.path, relPath), text, 'utf8');
+    return JSON.stringify({
+      _spilled: true,
+      path: relPath,
+      preview: text.slice(0, TOOL_RESULT_SPILL_PREVIEW_CHARS),
+    });
+  } catch (e) {
+    deps.logger.warn({ err: e, callId }, 'agent loop: tool result spill failed; inlined truncated');
+    return truncated;
+  }
+}
+
 /** 模型请求的工具调用 → 消息流 assistant 富形状的 toolCalls（argsJson → arguments） */
 function toMessageToolCalls(requested: LlmResultToolCall[]): LlmToolCall[] {
   return requested.map((tc) => ({ id: tc.id, name: tc.name, arguments: tc.argsJson }));
@@ -406,6 +469,8 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
   let inputTokens = 0;
   let outputTokens = 0;
   const reasoningSegments: string[] = [];
+  /** 有状态上下文预算（水位线在多次 chatOnce 间保持——压缩边界一旦固定不再漂移） */
+  const budget = new ContextBudget();
   const onDelta = input.onDelta;
   const onToolStep = input.onToolStep;
 
@@ -445,12 +510,15 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
   /** 单次对话 + 计数/用量累计/迭代日志（useTools=false 用于无工具收尾） */
   const chatOnce = async (useTools: boolean): Promise<LlmChatResult> => {
     throwIfAborted();
-    // 上下文预算：超限时对早期轮做 micro 压缩（keepRecent 恒保留；预算内零开销原样返回）
-    const budgetView = applyContextBudget(messages);
+    // 上下文预算：超限时对早期轮做 micro 压缩（有状态水位线：边界一旦压缩即固定，
+    // 后续轮次前缀 append-only 稳定——provider prompt 缓存友好；预算内零开销原样返回）
+    const budgetView = budget.apply(messages);
     const payload: LlmChatInput = {
       // 未指定 model：原样透传 undefined，沿用网关既有路由/回退语义（不可路由 → LLM_MODEL_NOT_FOUND）
       model: input.model as string,
       messages: budgetView.messages,
+      // 会话级 prompt 缓存键（session.ts 传 sessionId；适配器直写 prompt_cache_key，不经参数白名单）
+      ...(input.sessionKey !== undefined && input.sessionKey !== '' ? { sessionKey: input.sessionKey } : {}),
       ...(useTools && schemas.length > 0 ? { tools: schemas } : {}),
     };
     // 恒走流式聚合：兼容网关（LongCat/Qwen 系）非流式路径会 (a) 间歇回 200 空 body、
@@ -474,13 +542,16 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
   };
 
   /** 工具调用执行 + assistant/tool 消息回填（异常包装 isError 继续；参数非法不执行直接 isError） */
-  const executeAndAppend = async (requested: LlmResultToolCall[], assistantText: string): Promise<void> => {
-    // assistant 富形状消息（文本 + 工具调用），回传 provider 时由 adapter 与协议结构互转
+  const executeAndAppend = async (requested: LlmResultToolCall[], assistantText: string, reasoning: string): Promise<void> => {
+    // assistant 富形状消息（文本 + 工具调用 + 本轮思考链），回传 provider 时由 adapter 与
+    // 协议结构互转。reasoning 恒携带（无思考链为空串）——openai-chat 对富形状回写
+    // reasoning_content（DeepSeek/LongCat 等要求 tool 轮续写带该键，丢思考也要带 key）。
     messages.push({
       role: 'assistant',
       content: {
         ...(assistantText !== '' ? { text: assistantText } : {}),
         toolCalls: toMessageToolCalls(requested),
+        reasoning,
       },
     });
       for (const tc of requested) {
@@ -501,7 +572,10 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
         isError = true;
         text = JSON.stringify({ isError: true, error: messageOf(e) });
       }
-      messages.push({ role: 'tool', content: { toolCallId: tc.id, text } });
+      // 溢出治理：单条结果 >32KB → 完整落盘工作区、消息体替换为 {_spilled,path,preview}
+      //（无 workspace/落盘失败 → 截断 32KB；见 spillToolResult）
+      const boundedText = await spillToolResult(deps, tc.id, text);
+      messages.push({ role: 'tool', content: { toolCallId: tc.id, text: boundedText } });
       deps.logger.debug(
         { agentId: input.agentId, depth: input.depth, tool: tc.name, callId: tc.id, isError },
         'agent loop: tool executed',
@@ -532,7 +606,7 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
         finalText = await finalize('已达到 token 用量预算上限');
         break;
       }
-      await executeAndAppend(requested, result.text);
+      await executeAndAppend(requested, result.text, typeof result.reasoning === 'string' ? result.reasoning : '');
       continue;
     }
     if (result.text !== '') {

@@ -117,6 +117,13 @@ export interface ContextBudgetOptions {
   budgetTokens?: number;
   /** 近端保留窗口（条数），缺省 16 */
   keepRecent?: number;
+  /**
+   * 压缩水位线（**缓存友好**）：>0 时压缩边界固定为该索引（不再按 length-keepRecent 重算），
+   * 水位线之前的消息只在其内部继续压缩/丢弃、水位线之后的消息**永不回头压缩**——
+   * 保证一旦压缩发生，后续轮次的消息前缀逐字节稳定（append-only 增长），可被 provider
+   * 侧 prompt 缓存命中。边界由 ContextBudget 类持有并单调推进（见下）。
+   */
+  watermark?: number;
 }
 
 /** applyContextBudget 的结果（messages 为新数组或原数组引用，输入永不被改写） */
@@ -127,6 +134,11 @@ export interface ContextBudgetResult {
   compacted: boolean;
   /** 结果消息的估算 token */
   estimatedTokens: number;
+  /**
+   * 本轮调用后的水位线（调用方回存、下轮透传）：未发生压缩 = 传入值原样（未固定边界）；
+ * 发生压缩 = 本轮压缩边界（丢轮会使边界计数收缩——被丢消息已不存在，冻结前缀条数随之减）。
+   */
+  watermark: number;
 }
 
 /**
@@ -134,22 +146,26 @@ export interface ContextBudgetResult {
  *
  * 保证：
  * - 纯函数：输入数组与其元素永不被改写；未超限时返回原引用；
- * - system 消息与最后 keepRecent 条消息永不压缩/丢弃；
+ * - system 消息与压缩边界之后的消息永不压缩/丢弃（边界 = max(watermark, length-keepRecent)）；
  * - assistant（含 toolCalls）与 tool 消息的配对结构在两个阶段都保持——只摘要内容，
  *   不删结构（丢轮阶段只丢纯文本 user/assistant）；
+ * - micro 摘要**确定性**（同输入同输出：无时间戳/随机）——压缩后前缀稳定可被缓存；
  * - 极端超限（可丢项耗尽仍超限）→ 返回当前最优结果，不抛错。
  */
 export function applyContextBudget(messages: LlmMessage[], opts: ContextBudgetOptions = {}): ContextBudgetResult {
   const budget = opts.budgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
   const keepRecent = Math.max(0, opts.keepRecent ?? DEFAULT_KEEP_RECENT);
+  const passedWatermark = Math.max(0, opts.watermark ?? 0);
 
   const baseline = estimateMessagesTokens(messages);
   if (baseline <= budget) {
-    return { messages, compacted: false, estimatedTokens: baseline };
+    return { messages, compacted: false, estimatedTokens: baseline, watermark: passedWatermark };
   }
 
-  // 受保护集合：system + 末尾 keepRecent 窗口（cut 之前的才是「早期」）
-  const cut = Math.max(0, messages.length - keepRecent);
+  // 压缩边界：水位线优先（已固定即不再漂移），否则按 keepRecent 窗口现算（cut 之前的才是「早期」）
+  const cut = passedWatermark > 0
+    ? Math.min(passedWatermark, messages.length)
+    : Math.max(0, messages.length - keepRecent);
   const isProtected = (message: LlmMessage, index: number): boolean =>
     message.role === 'system' || index >= cut;
 
@@ -164,7 +180,12 @@ export function applyContextBudget(messages: LlmMessage[], opts: ContextBudgetOp
   });
   let estimated = changed ? estimateMessagesTokens(current) : baseline;
   if (estimated <= budget) {
-    return { messages: current, compacted: changed, estimatedTokens: estimated };
+    return {
+      messages: current,
+      compacted: changed,
+      estimatedTokens: estimated,
+      watermark: changed ? cut : passedWatermark,
+    };
   }
 
   // ---- 阶段 2：丢轮（从最旧开始丢早期的 user / assistant 纯文本轮） ----
@@ -185,7 +206,37 @@ export function applyContextBudget(messages: LlmMessage[], opts: ContextBudgetOp
     current = current.filter((_, index) => !dropSet.has(index));
     estimated = estimateMessagesTokens(current); // 删除后精确复核
   }
-  return { messages: current, compacted: changed, estimatedTokens: estimated };
+  return {
+    messages: current,
+    compacted: changed,
+    estimatedTokens: estimated,
+    // 丢轮后冻结前缀条数收缩（被丢消息已不在数组中），水位线单调指「同一批冻结消息」
+    watermark: changed ? Math.max(0, cut - dropSet.size) : passedWatermark,
+  };
+}
+
+// ---------------------------------------------------------------- 有状态预算（水位线持有者）
+
+/**
+ * 有状态上下文预算：持有压缩水位线并单调推进（「一旦压缩即固定边界」的落地形态）。
+ * runner 每轮 `budget.apply(messages)`，水位线在多次调用间保持——避免每轮重算
+ * keepRecent 边界导致已发送前缀被回头改写（provider prompt 缓存失效）。
+ * 实例生命周期 = 一段会话轨迹（runner 每次 runAgentLoop 新建一个）。
+ */
+export class ContextBudget {
+  #watermark = 0;
+
+  /** 压缩并推进水位线（结果.watermark 已回存实例，下轮自动生效） */
+  apply(messages: LlmMessage[], opts: Omit<ContextBudgetOptions, 'watermark'> = {}): ContextBudgetResult {
+    const result = applyContextBudget(messages, { ...opts, watermark: this.#watermark });
+    this.#watermark = result.watermark;
+    return result;
+  }
+
+  /** 当前水位线（冻结前缀条数；0 = 尚未固定边界） */
+  get watermark(): number {
+    return this.#watermark;
+  }
 }
 
 // ---------------------------------------------------------------- 用量报告

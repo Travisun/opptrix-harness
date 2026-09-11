@@ -448,12 +448,25 @@ export class AgentSessionManager {
       // 3. 模型解析链：会话显式 → settings → 第一可用 provider models[0]
       const model = await this.#resolveModel(session);
 
+      // 3.5 会话工作区根路径（best-effort：解析失败/未装配 = 本次无溢出落盘，工具结果截断）
+      let workspacePath: string | undefined;
+      if (this.#deps.workspace !== undefined) {
+        try {
+          workspacePath = (await this.#deps.workspace().resolve(sessionId)).path;
+        } catch {
+          workspacePath = undefined;
+        }
+      }
+
       // 4. Agent 循环（runner.ts 语义：工具调用执行/失败回填/收束；流式透传见上）
       const input: SessionRunnerInput = {
         agentId: sessionId,
         depth: 0,
         prompt,
         signal: controller.signal,
+        // 会话级 prompt 缓存键：openai-chat 适配器作为 prompt_cache_key 下发（缓存亲和）
+        sessionKey: sessionId,
+        ...(workspacePath !== undefined ? { workspacePath } : {}),
         ...(session.systemPrompt !== null ? { systemPrompt: session.systemPrompt } : {}),
         ...(model !== undefined ? { model } : {}),
         ...(onDelta !== undefined ? { onDelta } : {}),

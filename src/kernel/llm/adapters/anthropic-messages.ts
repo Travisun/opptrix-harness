@@ -12,7 +12,7 @@
  * - 错误：SDK 异常统一包装 `LLM_PROVIDER_ERROR`；不做隐藏重试（策略归上层）。
  */
 import Anthropic from '@anthropic-ai/sdk';
-import { err } from '../../errors/index.js';
+import { err, HarnessError } from '../../errors/index.js';
 import {
   assistantTextOf,
   assistantToolCallsOf,
@@ -31,7 +31,10 @@ import {
 
 const DEFAULT_MAX_TOKENS = 4096;
 
+/** SDK 错误统一包装：LLM_PROVIDER_ERROR（原始错误挂 cause）。已是 HarnessError
+ * （空 body 等守卫错误）→ 原样透传，detail.kind 不丢（健康统计归因依赖）。 */
 function wrapProviderError(e: unknown): never {
+  if (e instanceof HarnessError) throw e;
   throw err('LLM_PROVIDER_ERROR', {
     message: e instanceof Error ? e.message : String(e),
     // 提供方侧失败是排障高频点：带 errorKind 与内层 cause 链摘要进 detail
@@ -111,6 +114,35 @@ function baseParams(input: LlmChatInput, system: string | undefined, rest: LlmMe
   };
 }
 
+/**
+ * Anthropic 协议 cache_control 断点（prompt 缓存亲和）：
+ * - 顶层 `system` 参数：字符串 → 单元素 text 块数组并标 `cache_control:{type:'ephemeral'}`；
+ * - 最后一条 user 消息：字符串 content → 包为 text 块；块数组 → 尾部块补标。
+ * 前缀（system）+ 最近的对话断点命中 ephemeral 缓存，长会话显著降本。
+ * SDK 类型未在所有版本面暴露 system 块数组的 cache_control 形状——以 as unknown 包裹
+ * （协议层合法字段，服务端接受；与整个 params 的既有 cast 策略一致）。
+ */
+function applyCacheControlEphemeral(params: Record<string, unknown>): void {
+  const system = params['system'];
+  if (typeof system === 'string' && system !== '') {
+    params['system'] = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }];
+  }
+  const messages = params['messages'];
+  if (!Array.isArray(messages)) return;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: unknown; content?: unknown } | undefined;
+    if (m === undefined || m.role !== 'user') continue;
+    if (typeof m.content === 'string' && m.content !== '') {
+      m.content = [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }];
+    } else if (Array.isArray(m.content) && m.content.length > 0) {
+      const lastIndex = m.content.length - 1;
+      const last = m.content[lastIndex] as Record<string, unknown>;
+      m.content[lastIndex] = { ...last, cache_control: { type: 'ephemeral' } };
+    }
+    break;
+  }
+}
+
 export const anthropicMessagesAdapter: LlmAdapter = {
   protocol: 'anthropic-messages',
 
@@ -121,6 +153,7 @@ export const anthropicMessagesAdapter: LlmAdapter = {
       ...filterProviderParams(input, cfg),
       stream: false,
     }) as unknown as Anthropic.MessageCreateParamsNonStreaming;
+    applyCacheControlEphemeral(params as unknown as Record<string, unknown>);
     try {
       const res = await client.messages.create(params, {
         signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
@@ -159,6 +192,7 @@ export const anthropicMessagesAdapter: LlmAdapter = {
       ...filterProviderParams(input, cfg),
       stream: true,
     }) as unknown as Anthropic.MessageCreateParamsStreaming;
+    applyCacheControlEphemeral(params as unknown as Record<string, unknown>);
     try {
       const stream = await client.messages.create(params, {
         signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),

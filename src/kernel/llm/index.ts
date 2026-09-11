@@ -3,12 +3,14 @@
  * 使用方统一 `import { LlmGateway, ... } from '../llm/index.js'`。
  */
 export {
+  assistantReasoningOf,
   assistantTextOf,
   assistantToolCallsOf,
   DEFAULT_PARAM_ALLOWLIST,
   DEFAULT_TIMEOUT_MS,
   filterProviderParams,
   isRecord,
+  normalizeBaseUrl,
   textOrJson,
   toolContentOf,
   type LlmAdapter,
@@ -24,6 +26,20 @@ export {
   type LlmUsage,
 } from './types.js';
 export { LlmGateway, type LlmGatewayDeps } from './gateway.js';
+export {
+  createThinkStripper,
+  extractThinkContent,
+  type ThinkExtraction,
+  type ThinkStreamStripper,
+} from './think.js';
+export {
+  jitteredFailoverDelayMs,
+  ProviderHealthRegistry,
+  sharedProviderHealth,
+  type ProviderHealthLike,
+  type ProviderHealthOptions,
+  type ProviderHealthStat,
+} from './health.js';
 export { openaiChatAdapter } from './adapters/openai-chat.js';
 export { openaiResponsesAdapter } from './adapters/openai-responses.js';
 export { anthropicMessagesAdapter } from './adapters/anthropic-messages.js';

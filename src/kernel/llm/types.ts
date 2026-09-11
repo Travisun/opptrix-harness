@@ -3,10 +3,14 @@
  *
  * 消息规约（跨协议中间形状，各 adapter 负责与协议结构互转）：
  * - `system` / `user`：content 为字符串（或 provider 原生结构，adapter 尽量直传）。
- * - `assistant`：content 为字符串，或富形状 `{ text?: string; toolCalls: LlmToolCall[] }`。
+ * - `assistant`：content 为字符串，或富形状
+ *   `{ text?: string; toolCalls: LlmToolCall[]; reasoning?: string }`——`reasoning` 为该轮
+ *   思考链（DeepSeek/LongCat 等要求 tool 轮续写时 assistant 富形状回写
+ *   `reasoning_content`；**空串也必须携带**，见 assistantReasoningOf）。
  * - `tool`：content 为字符串（结果文本），或富形状 `{ toolCallId: string; text?: string }`。
  */
 import { err } from '../errors/index.js';
+import type { ProviderHealthLike, ProviderHealthStat } from './health.js';
 
 export type LlmProtocol = 'openai-chat' | 'openai-responses' | 'anthropic-messages';
 
@@ -38,6 +42,12 @@ export interface LlmChatInput {
   topP?: number;
   stop?: string[];
   tools?: unknown[];
+  /**
+   * 会话级缓存键（runner 经 input.sessionKey 传 sessionId）：非空时 openai-chat 适配器在
+   * payload 追加 `prompt_cache_key`（provider 侧前缀缓存亲和）。该键由适配器直写 payload，
+   * **不经 providerParams 白名单**。
+   */
+  sessionKey?: string;
   /** 透传给 provider 的额外参数；键必须命中 provider 的 paramAllowlist */
   providerParams?: Record<string, unknown>;
 }
@@ -55,6 +65,17 @@ export interface LlmProviderConfig {
   timeoutMs?: number;
   /** SDK 传输层重试次数（缺省 2；波动链路/兼容网关建议 ≥1，0 = 关闭） */
   maxRetries?: number;
+  /**
+   * 流式请求是否携带 `stream_options:{include_usage:true}`（缺省 true）。
+   * 部分兼容网关对该键回 400——置 false 时请求不含该键（usage 缺失，done 不带用量）。
+   */
+  streamOptions?: boolean;
+  /**
+   * 是否携带 `prompt_cache_key`（缺省 true；input.sessionKey 非空时生效）。
+   * OpenAI 官方与多数国内网关（DeepSeek 上下文缓存 / Qwen implicit cache）支持该键做
+   * 会话级前缀缓存亲和；个别网关校验未知键回 400 时可显式关闭。
+   */
+  promptCacheKey?: boolean;
 }
 
 export interface LlmUsage {
@@ -107,6 +128,13 @@ export interface LlmGatewayDeps {
    * core-services 装配归集成改动，见 src/api/llm.ts 模块注释的接线说明。
    */
   haEnabled?: () => Promise<boolean>;
+  /**
+   * provider 健康断路器（可选；缺省 = 每网关独立 ProviderHealthRegistry 实例）。
+   * 集成传 `sharedProviderHealth` 即获得进程内全局断路语义（同 provider 跨网关共享冷却）。
+   */
+  health?: ProviderHealthLike;
+  /** HA failover 尝试间退避 sleep（缺省 setTimeout 实现；测试注入记录器/空实现） */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** HA 回退链中的单次尝试记录（gateway LLM_PROVIDER_ERROR 的 detail.attempts 项） */
@@ -163,6 +191,33 @@ export function toolContentOf(content: unknown): { toolCallId: string; text: str
 export function assistantToolCallsOf(content: unknown): LlmToolCall[] | undefined {
   if (isRecord(content) && Array.isArray(content.toolCalls)) return content.toolCalls as LlmToolCall[];
   return undefined;
+}
+
+/**
+ * assistant 富形状中的思考链字段：**键存在且为 string 即返回（含空串）**，键不存在返回
+ * undefined。空串与缺失的区分是刻意的——DeepSeek/LongCat 等推理模型要求 tool 轮续写时
+ * assistant 消息必须带 `reasoning_content` 键（空串也要带），adapter 据此决定是否回写。
+ */
+export function assistantReasoningOf(content: unknown): string | undefined {
+  if (isRecord(content) && typeof content['reasoning'] === 'string') return content['reasoning'];
+  return undefined;
+}
+
+/**
+ * baseUrl 规范化（容错用户常填错的形态；纯字符串操作、不抛错）：
+ * - trim + 去尾部斜杠；
+ * - 无协议前缀（非 `http://` / `https://` 开头）→ 补 `https://`（内网网关普遍 TLS 终止在前端）；
+ * - 以 `/chat/completions` 结尾 → 剥掉（用户常把完整端点当 baseUrl 填，SDK 会再拼一次导致 404）；
+ * - **不自动补 `/v1`**：国内网关路径各异（`/v1`、`/paas/v4`、`/compatible-mode/v1`、`/openai`
+ *   或无版本后缀），自动补齐只会制造另一种错——路径由配置方填写完整根。
+ */
+export function normalizeBaseUrl(url: string): string {
+  let out = url.trim();
+  if (out === '') return '';
+  if (!/^https?:\/\//i.test(out)) out = `https://${out}`;
+  out = out.replace(/\/+$/, '');
+  out = out.replace(/\/chat\/completions$/i, '');
+  return out;
 }
 
 /** assistant 富形状中的文本部分 */

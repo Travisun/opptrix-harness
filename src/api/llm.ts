@@ -81,6 +81,8 @@ export interface LlmRoutesDeps {
    * 未注入时 stream 请求返回 501 NOT_IMPLEMENTED。
    */
   gatewayStream?: (input: unknown) => AsyncGenerator<LlmStreamEvent, void, unknown>;
+  /** provider 健康概要（网络自适应可观测面；缺省 → /llm/health 返回 501） */
+  healthSnapshot?: () => Array<Record<string, unknown>>;
   /**
    * 供应商配置管理（可选）：list 返回持久化的供应商配置数组；
    * set 由集成方持久化 settings（apiKey 以 secret ref 存储，天然脱敏）。
@@ -383,11 +385,19 @@ export function registerLlmRoutes(app: FastifyInstance, deps: LlmRoutesDeps): vo
   // GET/PUT /api/v1/llm/providers — 供应商配置管理（admin）
   // -------------------------------------------------------------------------
 
-  // GET providers — 供应商配置清单（原样透传 list() 结果）
+  // GET providers — 供应商配置清单（原样透传 list() 结果；形状不变，前端按裸数组消费）
   app.get('/api/v1/llm/providers', routeOptions, async (request) => {
     await requireAdmin(request);
     if (deps.providersAdmin === undefined) throw notWired('llm providers management');
     return deps.providersAdmin.list();
+  });
+
+  // GET /api/v1/llm/health — provider 健康概要（网络自适应可观测面；网关未装配 → 501）
+  app.get('/api/v1/llm/health', routeOptions, async (request) => {
+    await requireAdmin(request);
+    const snapshot = deps.healthSnapshot?.();
+    if (snapshot === undefined) throw notWired('llm health observability');
+    return { providers: snapshot };
   });
 
   // PUT providers — 覆写供应商配置数组（校验后交集成方持久化并脱敏存储）

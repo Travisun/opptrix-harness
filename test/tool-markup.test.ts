@@ -370,6 +370,7 @@ describe('runAgentLoop — 流式汇总层标记恢复', () => {
     );
     expect(assistantMsg?.content).toEqual({
       toolCalls: [{ id: expect.stringMatching(/^call_[0-9a-f]{8}$/), name: 'workspace_read', arguments: '{"path":"a.md"}' }],
+      reasoning: '', // 无思考轮：恒带空串（适配器回写 reasoning_content 键）
     });
   });
 

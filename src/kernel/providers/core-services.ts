@@ -440,6 +440,8 @@ export function createCoreServices(kernel: Kernel): CoreServices {
     logger,
   });
   kernel.container.instance(CONTAINER_KEYS.llm, gateway);
+  // llm REST 面（src/api/llm.ts）的可观测依赖：provider 健康概要（断路器快照）
+  const llmHealthSnapshot = () => gateway.healthSnapshot() as unknown as Array<Record<string, unknown>>;
 
   // -------------------------------------------------------------------------
   // memory — 全局 LLM 记忆系统（内核全局库 memories 表 + FTS5；LLM 抽取管线走网关）。
@@ -1061,6 +1063,7 @@ export function createCoreServices(kernel: Kernel): CoreServices {
       // LLM 网关 REST（/api/v1/llm/*）：providers 管理的持久化即 settings 读写；
       // secrets 注入使 PUT 支持 apiKey 明文 → 自动转存（键 'llm.<name>'）
       registerLlmRoutes(app, {
+    healthSnapshot: llmHealthSnapshot,
         checker,
         gateway,
         gatewayStream: (input) => gatewayStream(input as LlmChatInput),
