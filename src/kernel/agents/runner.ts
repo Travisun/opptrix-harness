@@ -7,7 +7,7 @@
  * 子代理生命周期管理（manager 层职责）。
  *
  * 循环语义：
- * - 起始消息 = system（input.systemPrompt 或缺省中文系统提示）+ user(input.prompt)；
+ * - 起始消息 = system（input.systemPrompt 或缺省 bootstrap 分层提示）+ user(input.prompt)；
  * - 每轮 `gateway.chat({ model, messages, tools: 白名单 schemas })`：
  *   - **未传 input.onDelta** → 非流式（现状）；
  *   - **传入 input.onDelta** → 以 stream:true 调用并消费流事件（delta/reasoning_delta/
@@ -33,9 +33,10 @@
 import type { Logger } from 'pino';
 import { applyContextBudget } from './context-budget.js';
 import { assembleSystemPrompt } from './skill-catalog.js';
+import { assembleBootstrapPrompt } from './prompts/assemble.js';
 
 import { EMPTY_REPLY_HINT, type AgentLoopDeltaChunk } from './chat-progress.js';
-import type { LlmChatInput, LlmChatResult, LlmMessage, LlmResultToolCall, LlmStreamEvent, LlmToolCall } from '../llm/index.js';
+import { hasToolMarkup, recoverToolCallsFromText, type LlmChatInput, type LlmChatResult, type LlmMessage, type LlmResultToolCall, type LlmStreamEvent, type LlmToolCall } from '../llm/index.js';
 
 // ---------------------------------------------------------------------------
 // 依赖与输入/输出契约
@@ -88,7 +89,7 @@ export interface AgentLoopInput {
   agentId: string;
   /** 嵌套深度（0 = 顶层委派；透传给 tools.execute 的 ctx） */
   depth: number;
-  /** 系统提示（缺省 = 内置中文子代理系统提示，含可用工具名清单） */
+  /** 系统提示（缺省 = bootstrap 分层提示装配，含按域分组的工具目录；传入时整体替换） */
   systemPrompt?: string;
   /** 用户任务提示（首轮 user 消息） */
   prompt: string;
@@ -179,6 +180,8 @@ interface ToolCallDeltaPayload {
  * - tool_call_delta → 按 index 聚合（id 覆盖、name/arguments 拼接）；
  * - done → 捕获 usage；error → 以 Error 抛出（消息原样）；
  * - 流结束 flush 思考链与正文残余片段（先 reasoning 后 text，与产生顺序一致）。
+ * - 流结束聚合点：未收到任何 tool_call_delta 且累积正文含文本内嵌工具标记 → 恢复为
+ *   结构化调用（正文同步清洗，见 tool-markup）。
  * 每个事件前检查中断信号；onDelta 回调抛错只 warn，不中断消费。
  */
 async function consumeStream(
@@ -291,15 +294,34 @@ async function consumeStream(
     .filter((tc) => tc.id !== '' || tc.name !== '')
     .map((tc) => ({ id: tc.id, name: tc.name, argsJson: tc.arguments }));
 
+  // 文本内嵌工具标记恢复（流式汇总层）：整条流未产生任何 tool_call_delta 且累积正文含
+  // `<longcat_tool_call>`/`<tool_call>`/`<|tool_call|>` 等标记块 → 恢复为结构化调用并把
+  // 正文清洗为剥离标记后的文本。已 yield 的增量不追改（进度展示侧可能短暂见过标记原文）；
+  // 原生 tool_call_delta 存在时绝不恢复。恢复的调用与非流式路径的 LlmChatResult.toolCalls 同形状。
+  let finalText = text;
+  let finalToolCalls = aggregated;
+  if (aggregated.length === 0 && hasToolMarkup(text)) {
+    const recovered = recoverToolCallsFromText(text);
+    if (recovered.toolCalls.length > 0) {
+      finalText = recovered.cleanedText;
+      finalToolCalls = recovered.toolCalls.map(({ id, name, argsJson }) => ({ id, name, argsJson }));
+    }
+  }
+
   return {
-    text,
+    text: finalText,
     ...(reasoning !== '' ? { reasoning } : {}),
     ...(usage !== undefined ? { usage } : {}),
-    ...(aggregated.length > 0 ? { toolCalls: aggregated } : {}),
+    ...(finalToolCalls.length > 0 ? { toolCalls: finalToolCalls } : {}),
   };
 }
 
-/** 缺省中文系统提示：列出可用工具名，约定完成即出最终报告 */
+/**
+ * 旧版缺省中文系统提示（**已不是缺省路径**，保留导出仅为兼容既有测试/外部调用）：
+ * 列出可用工具名、约定完成即出最终报告。缺省路径为
+ * `prompts/assemble.assembleBootstrapPrompt`（分层 bootstrap：角色 → 工具总纲 →
+ * 工具目录 → 技能 → 工作区 → 输出 → 安全）。
+ */
 export function defaultAgentSystemPrompt(toolNames: string[]): string {
   const listing = toolNames.length > 0 ? toolNames.join('、') : '（本次未提供任何工具）';
   return (
@@ -367,9 +389,11 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
   const toolNames = schemas.map((s) => s.name);
 
   // ---- 起始消息：system + user ----
+  // 缺省 system prompt = 分层 bootstrap 装配（prompts/assemble：锚点节重组 + 工具目录段 +
+  // #skills 节按能力注入）；会话显式 systemPrompt 仍整体替换（优先级不变）。
   // 技能两层注入：短目录 + 会话级已激活正文（skill-catalog 纯函数；注册表/激活表经 deps 可选注入，
   // 未注入 = 无目录无激活，保持既有语义）
-  const baseSystem = input.systemPrompt ?? defaultAgentSystemPrompt(toolNames);
+  const baseSystem = input.systemPrompt ?? assembleBootstrapPrompt({ toolNames });
   const catalog = deps.skillCatalog ? deps.skillCatalog() : '';
   const activated = deps.activatedSkills ? deps.activatedSkills(input.agentId) : '';
   const messages: LlmMessage[] = [

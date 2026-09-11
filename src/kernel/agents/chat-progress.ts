@@ -144,6 +144,8 @@ const TOOL_LABELS: Readonly<Record<string, string>> = {
   skills_get: '查看技能',
   skills_create: '创建技能',
   skills_refresh: '刷新技能',
+  skill_activate: '激活技能',
+  skill_list_activated: '查看已激活技能',
   cron_list: '列出定时任务',
   cron_create: '创建定时任务',
   cron_update: '更新定时任务',

@@ -74,6 +74,19 @@ export type {
   SystemToolRuntimeLike,
 } from './session-runner.js';
 export {
+  BOOTSTRAP_PROMPT_MAX_CHARS,
+  BOOTSTRAP_SECTION_IDS,
+  SKILL_ACTIVATE_TOOL,
+  TOOL_CATALOG_MAX_LINES,
+  TOOL_CATALOG_PLACEHOLDER,
+  assembleBootstrapPrompt,
+  buildToolCatalogSection,
+  parseBootstrapSections,
+  renderBootstrapSections,
+} from './prompts/assemble.js';
+export { BOOTSTRAP_PROMPT } from './prompts/bootstrap.js';
+export type { AssembleBootstrapPromptOptions, BootstrapExtraSection, BootstrapSection } from './prompts/assemble.js';
+export {
   EMPTY_REPLY_HINT,
   estimateTokens,
   formatArgsPreview,

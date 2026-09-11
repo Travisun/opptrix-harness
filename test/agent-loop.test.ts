@@ -6,7 +6,8 @@
  * 多工具连续执行、工具执行异常 isError 回填不终止、工具参数 JSON 非法不执行、
  * 迭代上限强制收尾（无 tools 收尾对话）、缺省迭代上限 16、token 预算触发收束、
  * 预算未超限不收尾、signal 预先中断与轮间中断（AbortError）、工具白名单过滤与
- * 空白名单不携 tools、systemPrompt 注入与缺省中文系统提示、usage 逐轮累计、
+ * 空白名单不携 tools、systemPrompt 注入与缺省 bootstrap 系统提示、旧版
+ * defaultAgentSystemPrompt 兼容保留、usage 逐轮累计、
  * model 透传/缺省（网关现状语义）、空文本轮询、sleep 让出钩子、
  * deps.maxIterations 被 input.maxIterations 覆盖、缺省常量值。
  */
@@ -22,6 +23,7 @@ import {
   type AgentLoopInput,
   type AgentLoopToolRuntime,
 } from '../src/kernel/agents/runner.js';
+import { assembleBootstrapPrompt } from '../src/kernel/agents/prompts/assemble.js';
 import type { LlmChatInput, LlmChatResult } from '../src/kernel/llm/index.js';
 
 const logger = pino({ level: 'silent' });
@@ -105,13 +107,13 @@ describe('runAgentLoop — 基本循环', () => {
       toolCalls: 0,
       usage: { inputTokens: 0, outputTokens: 0 },
       messages: [
-        { role: 'system', content: defaultAgentSystemPrompt(['skills_list', 'cron_list', 'files_read']) },
+        { role: 'system', content: assembleBootstrapPrompt({ toolNames: ['skills_list', 'cron_list', 'files_read'] }) },
         { role: 'user', content: '盘点技能库并汇报' },
       ],
     });
     expect(calls).toHaveLength(1);
     expect(calls[0]?.messages).toEqual([
-      { role: 'system', content: defaultAgentSystemPrompt(['skills_list', 'cron_list', 'files_read']) },
+      { role: 'system', content: assembleBootstrapPrompt({ toolNames: ['skills_list', 'cron_list', 'files_read'] }) },
       { role: 'user', content: '盘点技能库并汇报' },
     ]);
     expect(calls[0]?.tools).toEqual(SCHEMAS);
@@ -377,13 +379,20 @@ describe('runAgentLoop — 工具白名单与提示组装', () => {
     expect(calls[0]?.messages[0]).toEqual({ role: 'system', content: '你是专项巡检子代理。' });
   });
 
-  it('缺省中文系统提示：含「Opptrix Harness 子代理」、工具清单与最终报告约定', async () => {
+  it('缺省 bootstrap 系统提示：含角色定位首句、工具目录行与最终报告约定', async () => {
     const { deps, calls } = makeDeps([{ text: 'ok' }], stubTools());
     await runAgentLoop(deps, BASE_INPUT);
     const sys = String(calls[0]?.messages[0]?.content);
-    expect(sys).toContain('Opptrix Harness 子代理');
-    expect(sys).toContain('skills_list、cron_list、files_read');
+    expect(sys).toContain('你是 Opptrix Harness 的智能助手');
+    expect(sys).toContain('- skills_list：列出技能');
     expect(sys).toContain('最终报告');
+    expect(sys).not.toContain('{{TOOL_CATALOG}}');
+  });
+
+  it('旧版 defaultAgentSystemPrompt 保留导出（已不是缺省路径）：旧格式文本不变', () => {
+    expect(defaultAgentSystemPrompt(['a', 'b'])).toContain('Opptrix Harness 子代理');
+    expect(defaultAgentSystemPrompt(['a', 'b'])).toContain('a、b');
+    expect(defaultAgentSystemPrompt([])).toContain('未提供任何工具');
   });
 });
 

@@ -5,6 +5,10 @@
  *   assistant 富形状 toolCalls ↔ `tool_calls`（type:function）。
  * - 非流式：`choices[0].message.tool_calls`（type:function）→ `LlmChatResult.toolCalls`
  *   结构化提取（id/name/argsJson）；流式仍以 `tool_call_delta` 增量透传。
+ * - 文本内嵌工具标记恢复（markup recovery）：原生 tool_calls **为空/缺失**且 content 含
+ *   `<longcat_tool_call>`/`<tool_call>`/`<|tool_call|>` 等标记块时（LongCat/Qwen 系兼容网关
+ *   偶发行为），经 tool-markup 解析为等价 toolCalls，text 用剥离标记后的 cleanedText；
+ *   原生优先——原生 tool_calls 存在时绝不恢复、正文原样。
  * - 流式：`stream_options:{ include_usage: true }` 保证最后一个 chunk 携带 usage；
  *   工具调用增量以 `tool_call_delta` 透传（index 取自 chunk 内声明）；
  *   思考链增量解析 `delta.reasoning_content`（兼容 reasoningContent）→ `reasoning_delta` 事件；
@@ -14,6 +18,7 @@
  */
 import OpenAI from 'openai';
 import { err } from '../../errors/index.js';
+import { hasToolMarkup, recoverToolCallsFromText } from '../tool-markup.js';
 import {
   assistantTextOf,
   assistantToolCallsOf,
@@ -144,13 +149,25 @@ export const openaiChatAdapter: LlmAdapter = {
         ? { inputTokens: res.usage.prompt_tokens, outputTokens: res.usage.completion_tokens }
         : undefined;
       // 结构化工具调用提取（function 类型；custom 等其他类型不在 harness 工具规约内，跳过）
-      const toolCalls: LlmResultToolCall[] = (res.choices[0]?.message.tool_calls ?? [])
+      const nativeToolCalls: LlmResultToolCall[] = (res.choices[0]?.message.tool_calls ?? [])
         .filter((tc): tc is OpenAI.Chat.ChatCompletionMessageFunctionToolCall => tc.type === 'function')
         .map((tc) => ({ id: tc.id, name: tc.function.name, argsJson: tc.function.arguments }));
+      // 文本内嵌工具标记恢复（仅原生为空/缺失时；原生优先，绝不在原生存在时叠加）：
+      // LongCat/Qwen 系兼容网关把 tool_calls 以 <longcat_tool_call>{…}</longcat_tool_call>
+      // 等标记写进 content，解析为等价调用，正文用剥离标记后的 cleanedText。
+      let text = res.choices[0]?.message.content ?? '';
+      let toolCalls = nativeToolCalls;
+      if (nativeToolCalls.length === 0 && typeof text === 'string' && hasToolMarkup(text)) {
+        const recovered = recoverToolCallsFromText(text);
+        if (recovered.toolCalls.length > 0) {
+          text = recovered.cleanedText;
+          toolCalls = recovered.toolCalls.map(({ id, name, argsJson }) => ({ id, name, argsJson }));
+        }
+      }
       // 思考链全文（推理模型经 message.reasoning_content 回传；空 = 无思考链，不出现该键）
       const reasoning = reasoningContentOf(res.choices[0]?.message);
       return {
-        text: res.choices[0]?.message.content ?? '',
+        text,
         usage,
         raw: res,
         ...(reasoning !== undefined ? { reasoning } : {}),

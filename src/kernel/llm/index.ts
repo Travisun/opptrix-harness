@@ -27,3 +27,9 @@ export { LlmGateway, type LlmGatewayDeps } from './gateway.js';
 export { openaiChatAdapter } from './adapters/openai-chat.js';
 export { openaiResponsesAdapter } from './adapters/openai-responses.js';
 export { anthropicMessagesAdapter } from './adapters/anthropic-messages.js';
+export {
+  hasToolMarkup,
+  recoverToolCallsFromText,
+  type RecoveredToolCall,
+  type ToolMarkupRecovery,
+} from './tool-markup.js';
