@@ -186,31 +186,44 @@ export const openaiChatAdapter: LlmAdapter = {
       // 让服务端在最后一个 chunk（choices 为空）回传 usage
       stream_options: { include_usage: true },
     } as unknown as OpenAI.Chat.ChatCompletionCreateParamsStreaming;
-    try {
-      const stream = await client.chat.completions.create(params, {
-        signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
-      });
-      let usage: LlmChatResult['usage'] | undefined;
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta;
-        // 思考链增量（reasoning_content 优先，兼容 camelCase reasoningContent）
-        const reasoningText = reasoningContentOf(delta);
-        if (reasoningText !== undefined) {
-          yield { type: 'reasoning_delta', text: reasoningText };
+    // 空 flux 守卫：兼容网关间歇回 200 + 零 chunk 的"空流"（HTTP 层成功，SDK 不重试）
+    // ——检测到零增量流即整段静默重建（最多 3 次 attempt）；已产出的增量绝不重复。
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let chunks = 0;
+      try {
+        const stream = await client.chat.completions.create(params, {
+          signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+        });
+        let usage: LlmChatResult['usage'] | undefined;
+        for await (const chunk of stream) {
+          chunks += 1;
+          // eslint-disable-next-line no-console -- 临时探针
+          if (chunks <= 3) console.error('[probe] chunk', chunks, JSON.stringify(chunk).slice(0, 220));
+          const delta = chunk.choices[0]?.delta;
+          // 思考链增量（reasoning_content 优先，兼容 camelCase reasoningContent）
+          const reasoningText = reasoningContentOf(delta);
+          if (reasoningText !== undefined) {
+            yield { type: 'reasoning_delta', text: reasoningText };
+          }
+          if (typeof delta?.content === 'string' && delta.content.length > 0) {
+            yield { type: 'delta', text: delta.content };
+          }
+          for (const tc of delta?.tool_calls ?? []) {
+            yield { type: 'tool_call_delta', index: tc.index, payload: tc };
+          }
+          if (chunk.usage) {
+            usage = { inputTokens: chunk.usage.prompt_tokens, outputTokens: chunk.usage.completion_tokens };
+          }
         }
-        if (typeof delta?.content === 'string' && delta.content.length > 0) {
-          yield { type: 'delta', text: delta.content };
+        if (chunks === 0 && attempt < 3) {
+          continue; // 空流：本轮未 yield 任何增量，重建下一 attempt 安全
         }
-        for (const tc of delta?.tool_calls ?? []) {
-          yield { type: 'tool_call_delta', index: tc.index, payload: tc };
-        }
-        if (chunk.usage) {
-          usage = { inputTokens: chunk.usage.prompt_tokens, outputTokens: chunk.usage.completion_tokens };
-        }
+        yield usage ? { type: 'done', usage } : { type: 'done' };
+        return;
+      } catch (e) {
+        // 传输层异常：本轮未产出增量时静默重试（增量已出则上抛，绝不重复/拼接错乱）
+        if (chunks > 0 || attempt >= 3) wrapProviderError(e);
       }
-      yield usage ? { type: 'done', usage } : { type: 'done' };
-    } catch (e) {
-      wrapProviderError(e);
     }
   },
 };

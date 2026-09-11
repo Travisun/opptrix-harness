@@ -414,8 +414,14 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
   };
 
   /** 轮结果记账：迭代/用量累计 + 有思考链则收一段 */
+  let consecutiveEmpty = 0;
   const accountRound = (result: LlmChatResult): LlmChatResult => {
     iterations += 1;
+    const isEmptyRound =
+      (result.toolCalls?.length ?? 0) === 0 &&
+      (result.text ?? '') === '' &&
+      (result.reasoning ?? '') === '';
+    consecutiveEmpty = isEmptyRound ? consecutiveEmpty + 1 : 0;
     inputTokens += result.usage?.inputTokens ?? 0;
     outputTokens += result.usage?.outputTokens ?? 0;
     if (typeof result.reasoning === 'string' && result.reasoning.trim() !== '') {
@@ -537,6 +543,12 @@ export async function runAgentLoop(deps: AgentLoopDeps, input: AgentLoopInput): 
     //（避免对推理模型的无效轮询；无思考链时维持现状继续轮询）
     if (typeof result.reasoning === 'string' && result.reasoning.trim() !== '') {
       finalText = EMPTY_REPLY_HINT;
+      break;
+    }
+    // 全空结果连续多次 = 上游网关空响应/断流（链路问题），提前收束——避免空转到迭代
+    // 上限后让模型产出误导性的「迭代耗尽」报告
+    if (consecutiveEmpty >= 3) {
+      finalText = await finalize('上游服务连续多次返回空响应（网络或模型服务临时异常），请稍后重试或检查模型服务连通性');
       break;
     }
     // 空文本且无工具调用：继续下一轮（迭代上限兜底防空转）

@@ -123,8 +123,9 @@ export function createSessionRunner(deps: SessionRunnerDeps): SessionRunner {
   const loopDeps = {
     gateway: {
       chat: (input: LlmChatInput): Promise<LlmChatResult | AsyncGenerator<LlmStreamEvent>> =>
-        // 非流式保持现状显式 stream:false；onDelta 传入时透传 stream:true（runner 消费流事件）
-        deps.gateway.chat(input.stream === true ? input : { ...input, stream: false }),
+        // stream 策略完全由 runner 自决（恒流式：兼容网关非流式路径有空 body/文本标记问题），
+        // 本层只做结果形状透传，不再覆写 stream 标志
+        deps.gateway.chat(input),
     },
     tools,
     logger: deps.logger,
