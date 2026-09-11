@@ -37,7 +37,36 @@ const silentLogger = pino({ level: 'silent' });
 
 interface RecordedRequest {
   model: string;
-  messages: Array<{ role: string; content: unknown }>;
+  stream?: boolean;
+    messages: Array<{ role: string; content: unknown }>;
+}
+
+/** SSE 帧应答：工具调用增量（恒流式下以 delta 帧发送原生 tool_calls） */
+function respondSseToolCall(res: ServerResponse, n: number): void {
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  const frame = {
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [{ index: 0, id: `call_${n}`, type: 'function', function: { name: 'system_info', arguments: '{}' } }],
+        },
+      },
+    ],
+  };
+  res.write(`data: ${JSON.stringify(frame)}\n\n`);
+  res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24 } })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+/** SSE 帧应答（恒流式契约：runner 未传外部 onDelta 时也对上游发 stream:true） */
+function respondSseText(res: ServerResponse, text: string): void {
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: text } }] })}\n\n`);
+  res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 } })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
 }
 
 class FakeUpstream {
@@ -61,24 +90,36 @@ class FakeUpstream {
         body += String(chunk);
       });
       req.on('end', () => {
-        const parsed = JSON.parse(body) as { model: string; messages: RecordedRequest['messages'] };
-        this.requests.push({ model: parsed.model, messages: parsed.messages });
+        const self = this;
+        const parsed = JSON.parse(body) as { model: string; messages: RecordedRequest['messages']; stream?: boolean };
+        this.requests.push({ model: parsed.model, messages: parsed.messages, stream: parsed.stream === true });
         const n = this.requests.length;
-        if (this.mode === 'tool-once' && n === 1) {
-          this.respondToolCall(res, parsed.model, n);
+        const asSse = this.requests[n - 1]?.stream === true;
+        if (self.mode === 'tool-once' && n === 1) {
+          if (asSse) respondSseToolCall(res, n);
+          else self.respondToolCall(res, parsed.model, n);
           return;
         }
-        if (this.mode === 'tool-loop') {
-          if (n === 1) this.respondToolCall(res, parsed.model, n);
-          else this.pendingRelease = () => this.respondToolCall(res, parsed.model, n);
+        if (self.mode === 'tool-loop') {
+          if (n === 1) {
+            if (asSse) respondSseToolCall(res, n);
+            else self.respondToolCall(res, parsed.model, n);
+          } else {
+            self.pendingRelease = () => {
+              const m = self.requests.length;
+              if (self.requests[m - 1]?.stream === true) respondSseToolCall(res, m);
+              else self.respondToolCall(res, parsed.model, m);
+            };
+          }
           return;
         }
-        if (this.mode === 'hang-first' && !this.hungFirst) {
-          this.hungFirst = true;
-          this.pendingRelease = () => this.respondText(res, parsed.model, '挂起已释放');
+        if (self.mode === 'hang-first' && !self.hungFirst) {
+          self.hungFirst = true;
+          self.pendingRelease = () => respondSseText(res, '挂起已释放');
           return;
         }
-        this.respondText(res, parsed.model, `回复-${n}`);
+        if (asSse) respondSseText(res, `回复-${n}`);
+        else self.responseText(res, parsed.model, `回复-${n}`);
       });
     });
   }
@@ -94,6 +135,9 @@ class FakeUpstream {
   }
 
   close(): Promise<void> {
+    // 显式销毁存活连接：undici fetch 的预连接套接字（零请求、半开）会让 close 的
+    // 优雅等待挂起（agents-stream 同款修法）
+    this.server.closeAllConnections?.();
     return new Promise((resolve) => this.server.close(() => resolve()));
   }
 
@@ -103,7 +147,16 @@ class FakeUpstream {
     this.pendingRelease = null;
   }
 
-  private respondText(res: ServerResponse, model: string, text: string): void {
+  private respondText(res: ServerResponse, model: string, text: string, asSse = false): void {
+    if (asSse) {
+      // 恒流式契约：runner 未传外部 onDelta 时也对上游发 stream:true
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: text } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 } })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(
       JSON.stringify({
